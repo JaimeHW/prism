@@ -176,7 +176,9 @@ impl OptimizationPass for Gvn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::builder::GraphBuilder;
+    use crate::ir::builder::{
+        ArithmeticBuilder, ContainerBuilder, ControlBuilder, GraphBuilder, ObjectBuilder,
+    };
 
     #[test]
     fn test_gvn_duplicate_constants() {

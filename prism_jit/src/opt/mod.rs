@@ -17,8 +17,20 @@
 //! The pipeline runs until a fixed point is reached (no more changes).
 
 pub mod dce;
+pub mod escape;
 pub mod gvn;
+pub mod inline;
+pub mod licm;
+pub mod loop_analyzer;
+pub mod pipeline;
 pub mod simplify;
+
+// Re-export key types
+pub use escape::{Escape, EscapeAnalysis, EscapeState};
+pub use inline::{Inline, InlineConfig};
+pub use licm::Licm;
+pub use loop_analyzer::LoopInvariantAnalysis;
+pub use pipeline::{OptPipeline, PipelineConfig};
 
 use crate::ir::graph::Graph;
 
@@ -127,7 +139,9 @@ pub fn optimize(graph: &mut Graph, config: &OptConfig) -> OptStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::builder::GraphBuilder;
+    use crate::ir::builder::{
+        ArithmeticBuilder, ContainerBuilder, ControlBuilder, GraphBuilder, ObjectBuilder,
+    };
 
     #[test]
     fn test_default_config() {
