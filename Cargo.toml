@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "prism_core",
+    "prism_parser",
+    "prism_compiler",
+    "prism_vm",
+    "prism_jit",
+    "prism_runtime",
+    "prism_builtins",
+    "prism_cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Prism Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/prism-lang/prism"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates
+prism_core = { path = "prism_core" }
+prism_parser = { path = "prism_parser" }
+prism_compiler = { path = "prism_compiler" }
+prism_vm = { path = "prism_vm" }
+prism_jit = { path = "prism_jit" }
+prism_runtime = { path = "prism_runtime" }
+prism_builtins = { path = "prism_builtins" }
+
+# External dependencies
+thiserror = "2.0"
+rustc-hash = "2.1"
+bumpalo = "3.16"
+bitflags = "2.6"
+parking_lot = "0.12"
+memmap2 = "0.9"
+num-bigint = "0.4"
+num-traits = "0.2"
+unicode-xid = "0.2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true
