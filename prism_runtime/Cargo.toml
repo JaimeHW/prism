@@ -1,0 +1,9 @@
+[package]
+name = "prism_runtime"
+description = "Runtime system for Prism (GC, objects)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+prism_core.workspace = true
+parking_lot.workspace = true
