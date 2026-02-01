@@ -10,3 +10,12 @@ pub mod range;
 pub mod set;
 pub mod string;
 pub mod tuple;
+
+// Re-export commonly used types
+pub use dict::DictObject;
+pub use function::FunctionObject;
+pub use list::ListObject;
+pub use range::RangeObject;
+pub use set::SetObject;
+pub use string::{SSO_MAX_LEN, StringObject, empty_string};
+pub use tuple::TupleObject;

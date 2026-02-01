@@ -21,9 +21,13 @@
 pub mod emit;
 pub mod lower;
 pub mod osr;
+pub mod osr_stub;
+pub mod safepoint_placement;
 pub mod state_points;
 
 pub use emit::CodeEmitter;
 pub use lower::{InstructionSelector, MachineInst, MachineOp};
 pub use osr::{DeoptInfo, DeoptReason, OsrCompiledCode, OsrEntry, ValueLocation};
+pub use osr_stub::{OsrExitBuilder, OsrStubCache, OsrStubInfo};
+pub use safepoint_placement::{SafepointAnalyzer, SafepointEmitter, SafepointPlacement};
 pub use state_points::{StatePoint, StatePointBuilder, StatePointTable};

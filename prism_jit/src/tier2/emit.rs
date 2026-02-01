@@ -15,11 +15,12 @@
 //! ready to be called.
 
 use super::lower::{CondCode, MachineFunction, MachineInst, MachineOp, MachineOperand};
+use super::safepoint_placement::{SafepointAnalyzer, SafepointEmitter};
 use crate::backend::x64::encoder::Condition;
 use crate::backend::x64::registers::{Gpr, MemOperand, Xmm};
 use crate::backend::x64::{Assembler, ExecutableBuffer, Label};
 use crate::regalloc::PReg;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // =============================================================================
 // Condition Code Conversion
@@ -102,6 +103,10 @@ pub struct CodeEmitter<'a> {
     labels: HashMap<u32, Label>,
     /// Stack maps generated.
     stack_maps: Vec<StackMapEntry>,
+    /// Safepoint emitter for poll insertion.
+    safepoint_emitter: Option<SafepointEmitter>,
+    /// Set of instruction indices where polls are needed.
+    poll_indices: HashSet<usize>,
 }
 
 impl<'a> CodeEmitter<'a> {
@@ -112,12 +117,36 @@ impl<'a> CodeEmitter<'a> {
             asm: Assembler::new(),
             labels: HashMap::new(),
             stack_maps: Vec::new(),
+            safepoint_emitter: None,
+            poll_indices: HashSet::new(),
         }
     }
 
     /// Emit code for the machine function.
     pub fn emit(mfunc: &'a MachineFunction) -> Result<CompiledCode, String> {
+        Self::emit_with_safepoint(mfunc, None)
+    }
+
+    /// Emit code with safepoint support.
+    ///
+    /// If `safepoint_page_addr` is provided, safepoint polls will be emitted
+    /// at loop back-edges and long straight-line code sections.
+    pub fn emit_with_safepoint(
+        mfunc: &'a MachineFunction,
+        safepoint_page_addr: Option<usize>,
+    ) -> Result<CompiledCode, String> {
         let mut emitter = CodeEmitter::new(mfunc);
+
+        // Analyze and set up safepoint emission if page address provided
+        if let Some(page_addr) = safepoint_page_addr {
+            let analyzer = SafepointAnalyzer::new();
+            let placement = analyzer.analyze(mfunc);
+            if placement.needs_safepoint_register {
+                emitter.poll_indices = placement.poll_indices.iter().copied().collect();
+                emitter.safepoint_emitter = Some(SafepointEmitter::new(placement, page_addr));
+            }
+        }
+
         emitter.emit_all()?;
         emitter.finalize()
     }
@@ -159,6 +188,11 @@ impl<'a> CodeEmitter<'a> {
 
         for i in 0..self.mfunc.insts.len() {
             self.emit_inst(&self.mfunc.insts[i])?;
+
+            // Emit safepoint poll if needed after this instruction
+            if self.poll_indices.contains(&i) {
+                self.emit_safepoint_poll();
+            }
         }
 
         Ok(())
@@ -176,6 +210,15 @@ impl<'a> CodeEmitter<'a> {
             // Align to 16 bytes
             let aligned_size = (self.mfunc.frame_size + 15) & !15;
             self.asm.sub_ri(Gpr::Rsp, aligned_size as i32);
+        }
+
+        // Load safepoint page address into R15 if needed
+        if let Some(ref emitter) = self.safepoint_emitter {
+            if emitter.needs_safepoint_register() {
+                let page_addr = emitter.safepoint_page_addr();
+                // R15 is the dedicated safepoint register
+                self.asm.mov_ri64(Gpr::R15, page_addr as i64);
+            }
         }
     }
 
@@ -612,6 +655,23 @@ impl<'a> CodeEmitter<'a> {
         });
     }
 
+    /// Emit a safepoint poll instruction.
+    ///
+    /// This emits `test [r15], al` which is a 3-byte memory read.
+    /// When the safepoint page is protected, this will fault and trigger
+    /// the signal/exception handler which will stop the thread for GC.
+    fn emit_safepoint_poll(&mut self) {
+        // test byte ptr [r15], al
+        // Encoding: 41 84 07
+        //   41 = REX.B prefix (R15 is an extended register)
+        //   84 = TEST r/m8, r8 opcode
+        //   07 = ModR/M: mod=00 (memory), reg=000 (AL), r/m=111 (R15)
+        self.asm.emit_bytes(&[0x41, 0x84, 0x07]);
+
+        // Record this as a safepoint for stack map generation
+        self.record_safepoint();
+    }
+
     /// Finalize and produce executable code.
     fn finalize(self) -> Result<CompiledCode, String> {
         let code = self.asm.finalize_executable()?;
@@ -631,7 +691,9 @@ impl<'a> CodeEmitter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::builder::GraphBuilder;
+    use crate::ir::builder::{
+        ArithmeticBuilder, ContainerBuilder, ControlBuilder, GraphBuilder, ObjectBuilder,
+    };
     use crate::regalloc::AllocationMap;
     use crate::tier2::lower::InstructionSelector;
 
