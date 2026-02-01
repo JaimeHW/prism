@@ -317,6 +317,274 @@ impl OpcodeTemplate for IsNotTemplate {
 }
 
 // =============================================================================
+// Float Comparisons
+// =============================================================================
+
+/// Emit float comparison using SSE2 ucomisd instruction.
+///
+/// The ucomisd instruction sets flags as follows:
+/// - ZF=1, PF=0, CF=0: EQUAL
+/// - ZF=0, PF=0, CF=1: LESS THAN
+/// - ZF=0, PF=0, CF=0: GREATER THAN
+/// - ZF=1, PF=1, CF=1: UNORDERED (one or both are NaN)
+///
+/// For NaN handling: Python comparisons with NaN always return False
+/// (except != which returns True).
+fn emit_float_compare(
+    ctx: &mut TemplateContext,
+    lhs_reg: u8,
+    rhs_reg: u8,
+    dst_reg: u8,
+    condition: FloatCondition,
+) {
+    let lhs_slot = ctx.frame.register_slot(lhs_reg as u16);
+    let rhs_slot = ctx.frame.register_slot(rhs_reg as u16);
+    let dst_slot = ctx.frame.register_slot(dst_reg as u16);
+
+    let xmm0 = ctx.regs.xmm0;
+    let xmm1 = ctx.regs.xmm1;
+    let acc = ctx.regs.accumulator;
+    let scratch1 = ctx.regs.scratch1;
+
+    // Load floats into XMM registers
+    ctx.asm.movsd_rm(xmm0, &lhs_slot);
+    ctx.asm.movsd_rm(xmm1, &rhs_slot);
+
+    let true_val = value_tags::true_value() as i64;
+    let false_val = value_tags::false_value() as i64;
+
+    match condition {
+        FloatCondition::Lt => {
+            // a < b: Compare b to a, then check if b > a (CF=0 && ZF=0)
+            // Using ucomisd xmm1, xmm0 (compare b, a)
+            // If b > a, then a < b
+            ctx.asm.ucomisd(xmm1, xmm0);
+            // seta: Set if CF=0 AND ZF=0 (above)
+            ctx.asm.xor_rr(scratch1, scratch1);
+            ctx.asm.setcc(Condition::Above, scratch1);
+        }
+        FloatCondition::Le => {
+            // a <= b: Compare b to a, check if b >= a
+            ctx.asm.ucomisd(xmm1, xmm0);
+            // setae: Set if CF=0 (above or equal)
+            ctx.asm.xor_rr(scratch1, scratch1);
+            ctx.asm.setcc(Condition::AboveEqual, scratch1);
+        }
+        FloatCondition::Gt => {
+            // a > b: Compare a to b, check if a > b
+            ctx.asm.ucomisd(xmm0, xmm1);
+            ctx.asm.xor_rr(scratch1, scratch1);
+            ctx.asm.setcc(Condition::Above, scratch1);
+        }
+        FloatCondition::Ge => {
+            // a >= b: Compare a to b, check if a >= b
+            ctx.asm.ucomisd(xmm0, xmm1);
+            ctx.asm.xor_rr(scratch1, scratch1);
+            ctx.asm.setcc(Condition::AboveEqual, scratch1);
+        }
+        FloatCondition::Eq => {
+            // a == b: Must be ordered AND equal
+            // ucomisd sets ZF=1 and PF=0 for equal
+            ctx.asm.ucomisd(xmm0, xmm1);
+
+            // Check for unordered first (NaN case) - if PF=1, result is false
+            ctx.asm.xor_rr(scratch1, scratch1);
+            let nan_label = ctx.asm.create_label();
+            ctx.asm.jcc(Condition::Parity, nan_label); // Jump if parity (unordered/NaN)
+
+            // Not unordered, check if equal
+            ctx.asm.setcc(Condition::Equal, scratch1);
+            ctx.asm.bind_label(nan_label);
+        }
+        FloatCondition::Ne => {
+            // a != b: Unordered OR not equal
+            // Returns true if PF=1 OR ZF=0
+            ctx.asm.ucomisd(xmm0, xmm1);
+            ctx.asm.xor_rr(scratch1, scratch1);
+
+            // Check if unordered (PF=1) - if so, result is true
+            let true_label = ctx.asm.create_label();
+            ctx.asm.jcc(Condition::Parity, true_label); // Jump if parity (unordered/NaN)
+
+            // Not unordered, check if not equal
+            ctx.asm.setcc(Condition::NotEqual, scratch1);
+            let done = ctx.asm.create_label();
+            ctx.asm.jmp(done);
+
+            ctx.asm.bind_label(true_label);
+            ctx.asm.mov_ri32(scratch1, 1);
+            ctx.asm.bind_label(done);
+        }
+    }
+
+    // Convert 0/1 to False/True boxed boolean
+    ctx.asm.test_rr(scratch1, scratch1);
+    ctx.asm.mov_ri64(acc, false_val);
+    let done_label = ctx.asm.create_label();
+    ctx.asm.jz(done_label);
+    ctx.asm.mov_ri64(acc, true_val);
+    ctx.asm.bind_label(done_label);
+
+    // Store result
+    ctx.asm.mov_mr(&dst_slot, acc);
+}
+
+/// Float comparison condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloatCondition {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+/// Template for float less-than comparison.
+pub struct FloatLtTemplate {
+    pub dst_reg: u8,
+    pub lhs_reg: u8,
+    pub rhs_reg: u8,
+}
+
+impl OpcodeTemplate for FloatLtTemplate {
+    fn emit(&self, ctx: &mut TemplateContext) {
+        emit_float_compare(
+            ctx,
+            self.lhs_reg,
+            self.rhs_reg,
+            self.dst_reg,
+            FloatCondition::Lt,
+        );
+    }
+
+    #[inline]
+    fn estimated_size(&self) -> usize {
+        64
+    }
+}
+
+/// Template for float less-than-or-equal comparison.
+pub struct FloatLeTemplate {
+    pub dst_reg: u8,
+    pub lhs_reg: u8,
+    pub rhs_reg: u8,
+}
+
+impl OpcodeTemplate for FloatLeTemplate {
+    fn emit(&self, ctx: &mut TemplateContext) {
+        emit_float_compare(
+            ctx,
+            self.lhs_reg,
+            self.rhs_reg,
+            self.dst_reg,
+            FloatCondition::Le,
+        );
+    }
+
+    #[inline]
+    fn estimated_size(&self) -> usize {
+        64
+    }
+}
+
+/// Template for float greater-than comparison.
+pub struct FloatGtTemplate {
+    pub dst_reg: u8,
+    pub lhs_reg: u8,
+    pub rhs_reg: u8,
+}
+
+impl OpcodeTemplate for FloatGtTemplate {
+    fn emit(&self, ctx: &mut TemplateContext) {
+        emit_float_compare(
+            ctx,
+            self.lhs_reg,
+            self.rhs_reg,
+            self.dst_reg,
+            FloatCondition::Gt,
+        );
+    }
+
+    #[inline]
+    fn estimated_size(&self) -> usize {
+        64
+    }
+}
+
+/// Template for float greater-than-or-equal comparison.
+pub struct FloatGeTemplate {
+    pub dst_reg: u8,
+    pub lhs_reg: u8,
+    pub rhs_reg: u8,
+}
+
+impl OpcodeTemplate for FloatGeTemplate {
+    fn emit(&self, ctx: &mut TemplateContext) {
+        emit_float_compare(
+            ctx,
+            self.lhs_reg,
+            self.rhs_reg,
+            self.dst_reg,
+            FloatCondition::Ge,
+        );
+    }
+
+    #[inline]
+    fn estimated_size(&self) -> usize {
+        64
+    }
+}
+
+/// Template for float equality comparison.
+pub struct FloatEqTemplate {
+    pub dst_reg: u8,
+    pub lhs_reg: u8,
+    pub rhs_reg: u8,
+}
+
+impl OpcodeTemplate for FloatEqTemplate {
+    fn emit(&self, ctx: &mut TemplateContext) {
+        emit_float_compare(
+            ctx,
+            self.lhs_reg,
+            self.rhs_reg,
+            self.dst_reg,
+            FloatCondition::Eq,
+        );
+    }
+
+    #[inline]
+    fn estimated_size(&self) -> usize {
+        80 // Slightly larger due to NaN handling
+    }
+}
+
+/// Template for float not-equal comparison.
+pub struct FloatNeTemplate {
+    pub dst_reg: u8,
+    pub lhs_reg: u8,
+    pub rhs_reg: u8,
+}
+
+impl OpcodeTemplate for FloatNeTemplate {
+    fn emit(&self, ctx: &mut TemplateContext) {
+        emit_float_compare(
+            ctx,
+            self.lhs_reg,
+            self.rhs_reg,
+            self.dst_reg,
+            FloatCondition::Ne,
+        );
+    }
+
+    #[inline]
+    fn estimated_size(&self) -> usize {
+        80 // Slightly larger due to NaN handling
+    }
+}
+
+// =============================================================================
 // Membership (in/not in) - Deopt to interpreter
 // =============================================================================
 
@@ -439,5 +707,103 @@ mod tests {
         template.emit(&mut ctx);
 
         assert!(ctx.asm.offset() > 20);
+    }
+
+    #[test]
+    fn test_float_lt_template() {
+        let mut asm = Assembler::new();
+        let frame = FrameLayout::minimal(4);
+        let mut ctx = TemplateContext::new(&mut asm, &frame);
+
+        let template = FloatLtTemplate {
+            dst_reg: 2,
+            lhs_reg: 0,
+            rhs_reg: 1,
+        };
+        template.emit(&mut ctx);
+
+        assert!(ctx.asm.offset() > 20);
+    }
+
+    #[test]
+    fn test_float_le_template() {
+        let mut asm = Assembler::new();
+        let frame = FrameLayout::minimal(4);
+        let mut ctx = TemplateContext::new(&mut asm, &frame);
+
+        let template = FloatLeTemplate {
+            dst_reg: 2,
+            lhs_reg: 0,
+            rhs_reg: 1,
+        };
+        template.emit(&mut ctx);
+
+        assert!(ctx.asm.offset() > 20);
+    }
+
+    #[test]
+    fn test_float_gt_template() {
+        let mut asm = Assembler::new();
+        let frame = FrameLayout::minimal(4);
+        let mut ctx = TemplateContext::new(&mut asm, &frame);
+
+        let template = FloatGtTemplate {
+            dst_reg: 2,
+            lhs_reg: 0,
+            rhs_reg: 1,
+        };
+        template.emit(&mut ctx);
+
+        assert!(ctx.asm.offset() > 20);
+    }
+
+    #[test]
+    fn test_float_ge_template() {
+        let mut asm = Assembler::new();
+        let frame = FrameLayout::minimal(4);
+        let mut ctx = TemplateContext::new(&mut asm, &frame);
+
+        let template = FloatGeTemplate {
+            dst_reg: 2,
+            lhs_reg: 0,
+            rhs_reg: 1,
+        };
+        template.emit(&mut ctx);
+
+        assert!(ctx.asm.offset() > 20);
+    }
+
+    #[test]
+    fn test_float_eq_template() {
+        let mut asm = Assembler::new();
+        let frame = FrameLayout::minimal(4);
+        let mut ctx = TemplateContext::new(&mut asm, &frame);
+
+        let template = FloatEqTemplate {
+            dst_reg: 2,
+            lhs_reg: 0,
+            rhs_reg: 1,
+        };
+        template.emit(&mut ctx);
+
+        // Equality has extra NaN handling - should be larger
+        assert!(ctx.asm.offset() > 30);
+    }
+
+    #[test]
+    fn test_float_ne_template() {
+        let mut asm = Assembler::new();
+        let frame = FrameLayout::minimal(4);
+        let mut ctx = TemplateContext::new(&mut asm, &frame);
+
+        let template = FloatNeTemplate {
+            dst_reg: 2,
+            lhs_reg: 0,
+            rhs_reg: 1,
+        };
+        template.emit(&mut ctx);
+
+        // Not-equal has extra NaN handling - should be larger
+        assert!(ctx.asm.offset() > 30);
     }
 }
