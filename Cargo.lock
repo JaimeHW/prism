@@ -409,7 +409,9 @@ dependencies = [
  "bitflags",
  "libc",
  "memmap2",
+ "prism_compiler",
  "prism_core",
+ "smallvec",
  "windows-sys",
 ]
 
@@ -446,6 +448,7 @@ dependencies = [
  "prism_parser",
  "prism_runtime",
  "rustc-hash",
+ "smallvec",
 ]
 
 [[package]]

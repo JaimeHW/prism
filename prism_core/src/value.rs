@@ -49,6 +49,23 @@ const TAG_INT: u64 = 2;
 const TAG_OBJECT: u64 = 3;
 const TAG_STRING: u64 = 4;
 
+// =============================================================================
+// Public Tag Patterns (for branchless speculation)
+// =============================================================================
+
+/// Combined QNAN + TAG pattern for string values.
+/// Use with `value.raw_bits() & STRING_TAG_MASK == STRING_TAG_PATTERN` for branchless checks.
+pub const STRING_TAG_PATTERN: u64 = QNAN | (TAG_STRING << TAG_SHIFT);
+
+/// Combined QNAN + TAG pattern for int values.
+pub const INT_TAG_PATTERN: u64 = QNAN | (TAG_INT << TAG_SHIFT);
+
+/// Mask for extracting the type tag portion (QNAN + tag bits).
+pub const TYPE_TAG_MASK: u64 = QNAN | TAG_MASK;
+
+/// Payload mask for extracting pointer/value from tagged values.
+pub const VALUE_PAYLOAD_MASK: u64 = PAYLOAD_MASK;
+
 /// Maximum small integer (47-bit signed)
 pub const SMALL_INT_MAX: i64 = (1_i64 << 47) - 1;
 /// Minimum small integer (47-bit signed)
@@ -303,6 +320,46 @@ impl Value {
         } else {
             None
         }
+    }
+
+    /// Try to extract as a string object pointer.
+    ///
+    /// Returns a raw pointer to the string data. For interned strings,
+    /// this points to the Arc's data buffer. For heap-allocated StringObjects,
+    /// this points to the StringObject in the GC heap.
+    ///
+    /// # Performance
+    ///
+    /// This is a branchless const operation after the type check.
+    /// The returned pointer is suitable for direct string operations.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is valid as long as:
+    /// - For interned strings: the InternedString is not dropped (they're leaked)
+    /// - For heap strings: the StringObject is reachable by the GC
+    #[inline]
+    #[must_use]
+    pub const fn as_string_object_ptr(&self) -> Option<*const ()> {
+        if self.is_string() {
+            Some(self.payload() as *const ())
+        } else {
+            None
+        }
+    }
+
+    /// Get raw bits (for speculation optimizations).
+    ///
+    /// # Performance
+    ///
+    /// Enables branchless type checking in speculation code:
+    /// ```ignore
+    /// let is_string = (value.raw_bits() >> 48) == STRING_TAG_PATTERN;
+    /// ```
+    #[inline(always)]
+    #[must_use]
+    pub const fn raw_bits(&self) -> u64 {
+        self.bits
     }
 
     // =========================================================================

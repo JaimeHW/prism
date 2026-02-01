@@ -19,12 +19,14 @@
 pub mod error;
 pub mod intern;
 pub mod span;
+pub mod speculation;
 pub mod value;
 
 pub use error::{PrismError, PrismResult};
 pub use intern::{InternedString, StringInterner};
 pub use span::Span;
-pub use value::Value;
+pub use speculation::{SpeculationProvider, TypeHint};
+pub use value::{INT_TAG_PATTERN, STRING_TAG_PATTERN, TYPE_TAG_MASK, VALUE_PAYLOAD_MASK, Value};
 
 /// Prism runtime version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
