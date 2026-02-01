@@ -1,0 +1,9 @@
+[package]
+name = "prism_compiler"
+description = "Bytecode compiler for Prism"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+prism_core.workspace = true
+prism_parser.workspace = true
