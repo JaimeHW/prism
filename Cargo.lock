@@ -391,9 +391,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "prism_gc"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "criterion",
+ "crossbeam-utils",
+ "parking_lot",
+ "prism_core",
+ "rustc-hash",
+]
+
+[[package]]
 name = "prism_jit"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
+ "libc",
  "memmap2",
  "prism_core",
  "windows-sys",
@@ -412,8 +426,12 @@ dependencies = [
 name = "prism_runtime"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "parking_lot",
+ "prism_compiler",
  "prism_core",
+ "prism_gc",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -423,6 +441,9 @@ dependencies = [
  "criterion",
  "prism_compiler",
  "prism_core",
+ "prism_gc",
+ "prism_jit",
+ "prism_parser",
  "prism_runtime",
  "rustc-hash",
 ]

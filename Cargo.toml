@@ -4,6 +4,7 @@ members = [
     "prism_core",
     "prism_parser",
     "prism_compiler",
+    "prism_gc",
     "prism_vm",
     "prism_jit",
     "prism_runtime",
@@ -22,6 +23,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 # Internal crates
 prism_core = { path = "prism_core" }
+prism_gc = { path = "prism_gc" }
 prism_parser = { path = "prism_parser" }
 prism_compiler = { path = "prism_compiler" }
 prism_vm = { path = "prism_vm" }
