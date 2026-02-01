@@ -2,10 +2,17 @@
 //!
 //! Provides type-specialized fast paths for int/float operations,
 //! with fallback to generic polymorphic operations.
+//!
+//! # Type Feedback Integration
+//!
+//! Generic handlers collect type feedback via `BinaryOpFeedback` for JIT
+//! specialization. After sufficient observations, the JIT can emit
+//! specialized code paths.
 
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::type_feedback::BinaryOpFeedback;
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
 
@@ -320,11 +327,80 @@ pub fn neg_float(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 // Generic Arithmetic (Polymorphic - Slower)
 // =============================================================================
 
-/// Add: dst = src1 + src2 (generic)
+/// Add: dst = src1 + src2 (generic with speculative fast-path)
+///
+/// Uses O(1) speculation cache lookup to select optimized code path.
+/// Records type feedback on slow path for future specialization.
 #[inline(always)]
 pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    use crate::ic_manager::ICSiteId;
+    use crate::speculative::{
+        SpecResult, Speculation, spec_add_float, spec_add_int, spec_str_concat,
+    };
+    use crate::type_feedback::OperandPair;
+
     let frame = vm.current_frame_mut();
     let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+    let code_id = frame.code_id();
+    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let site = ICSiteId::new(code_id, bc_offset);
+
+    // =========================================================================
+    // Speculative Fast Path (O(1) cache lookup)
+    // =========================================================================
+    if let Some(spec) = vm.speculation_cache.get(site) {
+        match spec {
+            Speculation::IntInt => {
+                let (result, value) = spec_add_int(a, b);
+                if result == SpecResult::Success {
+                    let frame = vm.current_frame_mut();
+                    frame.set_reg(inst.dst().0, value);
+                    return ControlFlow::Continue;
+                }
+                // Deopt: invalidate cache and fall through to slow path
+                vm.speculation_cache.invalidate(site);
+            }
+            Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
+                let (result, value) = spec_add_float(a, b);
+                if result == SpecResult::Success {
+                    let frame = vm.current_frame_mut();
+                    frame.set_reg(inst.dst().0, value);
+                    return ControlFlow::Continue;
+                }
+                vm.speculation_cache.invalidate(site);
+            }
+            Speculation::StrStr => {
+                // String concatenation fast path
+                let (result, value) = spec_str_concat(a, b);
+                if result == SpecResult::Success {
+                    let frame = vm.current_frame_mut();
+                    frame.set_reg(inst.dst().0, value);
+                    return ControlFlow::Continue;
+                }
+                vm.speculation_cache.invalidate(site);
+            }
+            Speculation::None | Speculation::StrInt | Speculation::IntStr => {
+                // StrInt/IntStr don't apply to addition (only mul for repetition)
+            }
+        }
+    }
+
+    // =========================================================================
+    // Slow Path: Full type check + feedback recording
+    // =========================================================================
+
+    // Record type feedback for future speculation
+    let pair = OperandPair::from_values(a, b);
+    let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
+    feedback.record(&mut vm.ic_manager);
+
+    // Update speculation cache for next time
+    let spec = Speculation::from_operand_pair(pair);
+    if spec != Speculation::None {
+        vm.speculation_cache.insert(site, spec);
+    }
+
+    let frame = vm.current_frame_mut();
 
     // Try int + int
     if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
@@ -357,11 +433,59 @@ pub fn add(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     ControlFlow::Continue
 }
 
-/// Sub: dst = src1 - src2 (generic)
+/// Sub: dst = src1 - src2 (generic with speculative fast-path)
+///
+/// Uses O(1) speculation cache lookup to select optimized code path.
+/// Records type feedback on slow path for future specialization.
 #[inline(always)]
 pub fn sub(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    use crate::ic_manager::ICSiteId;
+    use crate::speculative::{SpecResult, Speculation, spec_sub_float, spec_sub_int};
+    use crate::type_feedback::OperandPair;
+
     let frame = vm.current_frame_mut();
     let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+    let code_id = frame.code_id();
+    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let site = ICSiteId::new(code_id, bc_offset);
+
+    // Speculative Fast Path
+    if let Some(spec) = vm.speculation_cache.get(site) {
+        match spec {
+            Speculation::IntInt => {
+                let (result, value) = spec_sub_int(a, b);
+                if result == SpecResult::Success {
+                    let frame = vm.current_frame_mut();
+                    frame.set_reg(inst.dst().0, value);
+                    return ControlFlow::Continue;
+                }
+                vm.speculation_cache.invalidate(site);
+            }
+            Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
+                let (result, value) = spec_sub_float(a, b);
+                if result == SpecResult::Success {
+                    let frame = vm.current_frame_mut();
+                    frame.set_reg(inst.dst().0, value);
+                    return ControlFlow::Continue;
+                }
+                vm.speculation_cache.invalidate(site);
+            }
+            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
+            }
+        }
+    }
+
+    // Slow Path
+    let pair = OperandPair::from_values(a, b);
+    let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
+    feedback.record(&mut vm.ic_manager);
+
+    let spec = Speculation::from_operand_pair(pair);
+    if spec != Speculation::None {
+        vm.speculation_cache.insert(site, spec);
+    }
+
+    let frame = vm.current_frame_mut();
 
     if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
         if let Some(result) = x.checked_sub(y) {
@@ -392,11 +516,80 @@ pub fn sub(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     ControlFlow::Continue
 }
 
-/// Mul: dst = src1 * src2 (generic)
+/// Mul: dst = src1 * src2 (generic with speculative fast-path)
+///
+/// Uses O(1) speculation cache lookup to select optimized code path.
 #[inline(always)]
 pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    use crate::ic_manager::ICSiteId;
+    use crate::speculative::{
+        SpecResult, Speculation, spec_mul_float, spec_mul_int, spec_str_repeat,
+    };
+    use crate::type_feedback::OperandPair;
+
     let frame = vm.current_frame_mut();
     let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+    let code_id = frame.code_id();
+    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let site = ICSiteId::new(code_id, bc_offset);
+
+    // Speculative Fast Path
+    if let Some(spec) = vm.speculation_cache.get(site) {
+        match spec {
+            Speculation::IntInt => {
+                let (result, value) = spec_mul_int(a, b);
+                if result == SpecResult::Success {
+                    let frame = vm.current_frame_mut();
+                    frame.set_reg(inst.dst().0, value);
+                    return ControlFlow::Continue;
+                }
+                vm.speculation_cache.invalidate(site);
+            }
+            Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
+                let (result, value) = spec_mul_float(a, b);
+                if result == SpecResult::Success {
+                    let frame = vm.current_frame_mut();
+                    frame.set_reg(inst.dst().0, value);
+                    return ControlFlow::Continue;
+                }
+                vm.speculation_cache.invalidate(site);
+            }
+            Speculation::StrInt | Speculation::IntStr => {
+                // String repetition fast path (str * int or int * str)
+                let (result, value) = spec_str_repeat(a, b);
+                match result {
+                    SpecResult::Success => {
+                        let frame = vm.current_frame_mut();
+                        frame.set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                    SpecResult::Overflow => {
+                        // Negative repetition count: Python returns empty string
+                        // This is handled in spec_str_repeat, so we shouldn't reach here
+                        // But for safety, fall through to slow path
+                    }
+                    SpecResult::Deopt => {
+                        vm.speculation_cache.invalidate(site);
+                    }
+                }
+            }
+            Speculation::None | Speculation::StrStr => {
+                // StrStr doesn't apply to multiplication
+            }
+        }
+    }
+
+    // Slow Path
+    let pair = OperandPair::from_values(a, b);
+    let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
+    feedback.record(&mut vm.ic_manager);
+
+    let spec = Speculation::from_operand_pair(pair);
+    if spec != Speculation::None {
+        vm.speculation_cache.insert(site, spec);
+    }
+
+    let frame = vm.current_frame_mut();
 
     if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
         if let Some(result) = x.checked_mul(y) {
@@ -427,11 +620,49 @@ pub fn mul(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     ControlFlow::Continue
 }
 
-/// TrueDiv: dst = src1 / src2 (always returns float)
+/// TrueDiv: dst = src1 / src2 (always returns float, with speculative fast-path)
+///
+/// Uses O(1) speculation cache lookup to select optimized code path.
 #[inline(always)]
 pub fn true_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    use crate::ic_manager::ICSiteId;
+    use crate::speculative::{SpecResult, Speculation, spec_div_float};
+    use crate::type_feedback::OperandPair;
+
     let frame = vm.current_frame_mut();
     let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+    let code_id = frame.code_id();
+    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let site = ICSiteId::new(code_id, bc_offset);
+
+    // Speculative Fast Path (true_div always returns float)
+    if let Some(spec) = vm.speculation_cache.get(site) {
+        if spec.is_float() || spec == Speculation::IntInt {
+            let (result, value) = spec_div_float(a, b);
+            if result == SpecResult::Success {
+                let frame = vm.current_frame_mut();
+                frame.set_reg(inst.dst().0, value);
+                return ControlFlow::Continue;
+            }
+            // Division by zero or type mismatch
+            if result == SpecResult::Overflow {
+                return ControlFlow::Error(RuntimeError::zero_division());
+            }
+            vm.speculation_cache.invalidate(site);
+        }
+    }
+
+    // Slow Path
+    let pair = OperandPair::from_values(a, b);
+    let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
+    feedback.record(&mut vm.ic_manager);
+
+    let spec = Speculation::from_operand_pair(pair);
+    if spec != Speculation::None {
+        vm.speculation_cache.insert(site, spec);
+    }
+
+    let frame = vm.current_frame_mut();
 
     let x = if let Some(f) = a.as_float() {
         f
@@ -456,11 +687,78 @@ pub fn true_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     ControlFlow::Continue
 }
 
-/// FloorDiv: dst = src1 // src2 (generic)
+/// FloorDiv: dst = src1 // src2 (generic with speculative fast-path)
+///
+/// Int // int returns int. Float // float returns float.
+/// Uses O(1) speculation cache lookup to select optimized code path.
 #[inline(always)]
 pub fn floor_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    use crate::ic_manager::ICSiteId;
+    use crate::speculative::{SpecResult, Speculation, spec_floor_div_float, spec_floor_div_int};
+    use crate::type_feedback::OperandPair;
+
     let frame = vm.current_frame_mut();
     let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+    let code_id = frame.code_id();
+    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let site = ICSiteId::new(code_id, bc_offset);
+
+    // =========================================================================
+    // Speculative Fast Path (O(1) cache lookup)
+    // =========================================================================
+    if let Some(spec) = vm.speculation_cache.get(site) {
+        match spec {
+            Speculation::IntInt => {
+                let (result, value) = spec_floor_div_int(a, b);
+                match result {
+                    SpecResult::Success => {
+                        let frame = vm.current_frame_mut();
+                        frame.set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                    SpecResult::Overflow => {
+                        // Division by zero
+                        return ControlFlow::Error(RuntimeError::zero_division());
+                    }
+                    SpecResult::Deopt => {
+                        vm.speculation_cache.invalidate(site);
+                    }
+                }
+            }
+            Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
+                let (result, value) = spec_floor_div_float(a, b);
+                match result {
+                    SpecResult::Success => {
+                        let frame = vm.current_frame_mut();
+                        frame.set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                    SpecResult::Overflow => {
+                        return ControlFlow::Error(RuntimeError::zero_division());
+                    }
+                    SpecResult::Deopt => {
+                        vm.speculation_cache.invalidate(site);
+                    }
+                }
+            }
+            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
+            }
+        }
+    }
+
+    // =========================================================================
+    // Slow Path: Full type check + feedback recording
+    // =========================================================================
+    let pair = OperandPair::from_values(a, b);
+    let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
+    feedback.record(&mut vm.ic_manager);
+
+    let spec = Speculation::from_operand_pair(pair);
+    if spec != Speculation::None {
+        vm.speculation_cache.insert(site, spec);
+    }
+
+    let frame = vm.current_frame_mut();
 
     // Int // int returns int
     if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
@@ -502,11 +800,77 @@ pub fn floor_div(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     ControlFlow::Continue
 }
 
-/// Mod: dst = src1 % src2 (generic)
+/// Mod: dst = src1 % src2 (generic with speculative fast-path)
+///
+/// Int % int returns int. Float % float returns float.
+/// Uses O(1) speculation cache lookup to select optimized code path.
 #[inline(always)]
 pub fn modulo(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    use crate::ic_manager::ICSiteId;
+    use crate::speculative::{SpecResult, Speculation, spec_mod_float, spec_mod_int};
+    use crate::type_feedback::OperandPair;
+
     let frame = vm.current_frame_mut();
     let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+    let code_id = frame.code_id();
+    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let site = ICSiteId::new(code_id, bc_offset);
+
+    // =========================================================================
+    // Speculative Fast Path (O(1) cache lookup)
+    // =========================================================================
+    if let Some(spec) = vm.speculation_cache.get(site) {
+        match spec {
+            Speculation::IntInt => {
+                let (result, value) = spec_mod_int(a, b);
+                match result {
+                    SpecResult::Success => {
+                        let frame = vm.current_frame_mut();
+                        frame.set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                    SpecResult::Overflow => {
+                        return ControlFlow::Error(RuntimeError::zero_division());
+                    }
+                    SpecResult::Deopt => {
+                        vm.speculation_cache.invalidate(site);
+                    }
+                }
+            }
+            Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
+                let (result, value) = spec_mod_float(a, b);
+                match result {
+                    SpecResult::Success => {
+                        let frame = vm.current_frame_mut();
+                        frame.set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                    SpecResult::Overflow => {
+                        return ControlFlow::Error(RuntimeError::zero_division());
+                    }
+                    SpecResult::Deopt => {
+                        vm.speculation_cache.invalidate(site);
+                    }
+                }
+            }
+            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
+            }
+        }
+    }
+
+    // =========================================================================
+    // Slow Path: Full type check + feedback recording
+    // =========================================================================
+    let pair = OperandPair::from_values(a, b);
+    let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
+    feedback.record(&mut vm.ic_manager);
+
+    let spec = Speculation::from_operand_pair(pair);
+    if spec != Speculation::None {
+        vm.speculation_cache.insert(site, spec);
+    }
+
+    let frame = vm.current_frame_mut();
 
     if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
         if y == 0 {
@@ -543,11 +907,71 @@ pub fn modulo(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     ControlFlow::Continue
 }
 
-/// Pow: dst = src1 ** src2 (generic)
+/// Pow: dst = src1 ** src2 (generic with speculative fast-path)
+///
+/// Int ** positive int returns int (if no overflow). Otherwise float.
+/// Uses O(1) speculation cache lookup to select optimized code path.
 #[inline(always)]
 pub fn pow(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    use crate::ic_manager::ICSiteId;
+    use crate::speculative::{SpecResult, Speculation, spec_pow_float, spec_pow_int};
+    use crate::type_feedback::OperandPair;
+
     let frame = vm.current_frame_mut();
     let (a, b) = frame.get_regs2(inst.src1().0, inst.src2().0);
+    let code_id = frame.code_id();
+    let bc_offset = frame.ip.saturating_sub(1) as u32;
+    let site = ICSiteId::new(code_id, bc_offset);
+
+    // =========================================================================
+    // Speculative Fast Path (O(1) cache lookup)
+    // =========================================================================
+    if let Some(spec) = vm.speculation_cache.get(site) {
+        match spec {
+            Speculation::IntInt => {
+                let (result, value) = spec_pow_int(a, b);
+                match result {
+                    SpecResult::Success => {
+                        let frame = vm.current_frame_mut();
+                        frame.set_reg(inst.dst().0, value);
+                        return ControlFlow::Continue;
+                    }
+                    SpecResult::Overflow => {
+                        // Overflow: fall through to slow path which converts to float
+                        // Don't invalidate - this is expected behavior
+                    }
+                    SpecResult::Deopt => {
+                        vm.speculation_cache.invalidate(site);
+                    }
+                }
+            }
+            Speculation::FloatFloat | Speculation::IntFloat | Speculation::FloatInt => {
+                let (result, value) = spec_pow_float(a, b);
+                if result == SpecResult::Success {
+                    let frame = vm.current_frame_mut();
+                    frame.set_reg(inst.dst().0, value);
+                    return ControlFlow::Continue;
+                }
+                vm.speculation_cache.invalidate(site);
+            }
+            Speculation::None | Speculation::StrStr | Speculation::StrInt | Speculation::IntStr => {
+            }
+        }
+    }
+
+    // =========================================================================
+    // Slow Path: Full type check + feedback recording
+    // =========================================================================
+    let pair = OperandPair::from_values(a, b);
+    let feedback = BinaryOpFeedback::new(code_id, bc_offset, a, b);
+    feedback.record(&mut vm.ic_manager);
+
+    let spec = Speculation::from_operand_pair(pair);
+    if spec != Speculation::None {
+        vm.speculation_cache.insert(site, spec);
+    }
+
+    let frame = vm.current_frame_mut();
 
     // int ** positive int returns int
     if let (Some(base), Some(exp)) = (a.as_int(), b.as_int()) {
