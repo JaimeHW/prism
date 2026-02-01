@@ -56,12 +56,18 @@ pub mod vm;
 // Execution infrastructure
 pub mod builtins;
 pub mod dispatch;
+pub mod ic_manager;
 pub mod inline_cache;
+pub mod osr_trigger;
 pub mod profiler;
+pub mod speculative;
+pub mod type_feedback;
 
 // JIT integration
+pub mod deopt;
 pub mod jit_bridge;
 pub mod jit_context;
+pub mod jit_dispatch;
 pub mod jit_executor;
 
 // Opcode handlers (organized by category)
@@ -74,10 +80,13 @@ pub use error::{RuntimeError, RuntimeErrorKind, VmResult};
 pub use frame::{ClosureEnv, Frame, MAX_RECURSION_DEPTH};
 pub use gc_integration::{ManagedHeap, RootProvider, SafePoint, StackRoots};
 pub use globals::GlobalScope;
+pub use ic_manager::{ICAccessResult, ICClassification, ICEntry, ICManager, ICSiteId, ICStats};
 pub use inline_cache::{CallIC, InlineCacheStore, MonoIC, PolyIC};
 pub use jit_bridge::{BridgeConfig, JitBridge};
 pub use jit_context::{JitConfig, JitContext, JitStats, ProcessedResult};
+pub use jit_dispatch::{DispatchResult, DispatchStats};
 pub use jit_executor::{DeoptReason, ExecutionResult, JitExecutor};
+pub use osr_trigger::{LoopInfo, OsrDecision, OsrTrigger};
 pub use profiler::{CodeId, Profiler, TierUpDecision};
 pub use vm::VirtualMachine;
 

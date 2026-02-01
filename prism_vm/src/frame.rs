@@ -187,6 +187,14 @@ impl Frame {
     pub fn get_local_name(&self, idx: u16) -> &Arc<str> {
         unsafe { self.code.locals.get_unchecked(idx as usize) }
     }
+
+    /// Get the unique CodeId for this frame's code object.
+    ///
+    /// This is used for IC site identification and type feedback collection.
+    #[inline(always)]
+    pub fn code_id(&self) -> crate::profiler::CodeId {
+        crate::profiler::CodeId::from_ptr(std::sync::Arc::as_ptr(&self.code) as *const ())
+    }
 }
 
 impl ClosureEnv {

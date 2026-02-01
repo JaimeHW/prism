@@ -6,6 +6,7 @@
 //! - **Heap Strings**: Arc-backed for longer strings with zero-copy cloning
 //! - **Cached Hash**: ObjectHeader.hash for O(1) repeated lookups
 //! - **UTF-8 Native**: All strings are valid UTF-8
+//! - **Static Empty String**: Zero-allocation access via `empty_string()`
 
 use crate::object::type_obj::TypeId;
 use crate::object::{HASH_NOT_COMPUTED, ObjectHeader, PyObject};
@@ -14,20 +15,44 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 // =============================================================================
 // Constants
 // =============================================================================
 
 /// Maximum inline storage for SSO (24 bytes total, 1 for discriminant/len)
-const SSO_MAX_LEN: usize = 23;
+pub const SSO_MAX_LEN: usize = 23;
 
 /// Empty string constant for zero-allocation empty string creation.
 const EMPTY_INLINE: InlineString = InlineString {
     len: 0,
     data: [0u8; SSO_MAX_LEN],
 };
+
+// =============================================================================
+// Static Empty String Singleton
+// =============================================================================
+
+/// Thread-safe static empty string singleton.
+///
+/// Returns a reference to a pre-allocated empty StringObject.
+/// Used for zero-allocation empty string operations like `str * 0`.
+static STATIC_EMPTY_STRING: LazyLock<StringObject> = LazyLock::new(StringObject::empty);
+
+/// Get a reference to the static empty string (zero allocation).
+///
+/// # Performance
+///
+/// This returns a static reference, avoiding any allocation.
+/// Use this for operations that would return an empty string:
+/// - String multiplication by zero: `s * 0`
+/// - Empty concatenation results
+/// - Empty slices
+#[inline(always)]
+pub fn empty_string() -> &'static StringObject {
+    &STATIC_EMPTY_STRING
+}
 
 // =============================================================================
 // Inline String Storage (SSO)
@@ -283,50 +308,153 @@ impl StringObject {
     // String Operations
     // =========================================================================
 
-    /// Concatenate two strings.
+    /// Concatenate two strings with maximum performance.
+    ///
+    /// # Performance Optimizations
+    ///
+    /// 1. **Identity Fast-Path (Empty LHS)**: If `self` is empty, returns clone of `other`
+    /// 2. **Identity Fast-Path (Empty RHS)**: If `other` is empty, returns clone of `self`
+    /// 3. **SSO Direct Copy**: Results ≤23 bytes use `ptr::copy_nonoverlapping`
+    /// 4. **Pre-Sized Heap Allocation**: Heap path pre-allocates exact capacity
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use prism_runtime::types::StringObject;
+    /// let a = StringObject::new("hello");
+    /// let b = StringObject::new(" world");
+    /// let result = a.concat(&b);
+    /// assert_eq!(result.as_str(), "hello world");
+    /// ```
+    #[inline(always)]
     pub fn concat(&self, other: &StringObject) -> StringObject {
+        // FAST PATH 1: Empty lhs → return other (zero copy for common case)
+        if self.is_empty() {
+            return other.clone();
+        }
+
+        // FAST PATH 2: Empty rhs → return self (zero copy)
+        if other.is_empty() {
+            return self.clone();
+        }
+
         let self_str = self.as_str();
         let other_str = other.as_str();
-        let total_len = self_str.len() + other_str.len();
+        let self_len = self_str.len();
+        let other_len = other_str.len();
+        let total_len = self_len + other_len;
 
         if total_len <= SSO_MAX_LEN {
-            // Result fits in inline storage
-            let mut data = [0u8; SSO_MAX_LEN];
-            data[..self_str.len()].copy_from_slice(self_str.as_bytes());
-            data[self_str.len()..total_len].copy_from_slice(other_str.as_bytes());
-            StringObject {
-                header: ObjectHeader::new(TypeId::STR),
-                repr: StringRepr::Inline(InlineString {
-                    len: total_len as u8,
-                    data,
-                }),
-            }
+            // SSO path: Direct copy into inline storage, no intermediate allocation
+            Self::concat_sso_direct(self_str, other_str, self_len, other_len, total_len)
         } else {
-            // Heap allocate
-            let mut result = String::with_capacity(total_len);
-            result.push_str(self_str);
-            result.push_str(other_str);
-            StringObject::from_string(result)
+            // Heap path: Pre-sized allocation
+            Self::concat_heap(self_str, other_str, total_len)
         }
     }
 
-    /// Repeat the string n times.
-    pub fn repeat(&self, n: usize) -> StringObject {
-        if n == 0 {
-            return StringObject::empty();
+    /// SSO concatenation using direct pointer copies.
+    ///
+    /// # Safety
+    /// Caller must ensure `total_len <= SSO_MAX_LEN`.
+    #[inline(always)]
+    fn concat_sso_direct(
+        a: &str,
+        b: &str,
+        a_len: usize,
+        b_len: usize,
+        total_len: usize,
+    ) -> StringObject {
+        debug_assert!(total_len <= SSO_MAX_LEN);
+
+        let mut data = [0u8; SSO_MAX_LEN];
+
+        // SAFETY: We've verified total_len <= SSO_MAX_LEN, so these copies are in-bounds.
+        // Using ptr::copy_nonoverlapping is faster than slice copy for small fixed buffers.
+        unsafe {
+            std::ptr::copy_nonoverlapping(a.as_ptr(), data.as_mut_ptr(), a_len);
+            std::ptr::copy_nonoverlapping(b.as_ptr(), data.as_mut_ptr().add(a_len), b_len);
         }
+
+        StringObject {
+            header: ObjectHeader::new(TypeId::STR),
+            repr: StringRepr::Inline(InlineString {
+                len: total_len as u8,
+                data,
+            }),
+        }
+    }
+
+    /// Heap concatenation with pre-sized allocation.
+    #[inline(never)] // Cold path, don't pollute instruction cache
+    fn concat_heap(a: &str, b: &str, total_len: usize) -> StringObject {
+        let mut result = String::with_capacity(total_len);
+        result.push_str(a);
+        result.push_str(b);
+        StringObject::from_string(result)
+    }
+
+    /// Repeat the string n times with maximum performance.
+    ///
+    /// # Performance Optimizations
+    ///
+    /// 1. **Zero Return**: `n == 0` returns static empty string (zero allocation)
+    /// 2. **Identity Return**: `n == 1` returns clone of self
+    /// 3. **Single-Byte ASCII**: Single ASCII char uses optimized byte fill
+    /// 4. **SSO Path**: Results ≤23 bytes use inline storage
+    /// 5. **Pre-Sized Heap**: Larger results use pre-allocated String
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.len() * n` overflows `usize`.
+    #[inline(always)]
+    pub fn repeat(&self, n: usize) -> StringObject {
+        // FAST PATH 1: n == 0 → return empty (zero allocation via static)
+        if n == 0 {
+            return empty_string().clone();
+        }
+
+        // FAST PATH 2: n == 1 → return clone (avoid all computation)
         if n == 1 {
             return self.clone();
         }
 
         let s = self.as_str();
-        let total_len = s.len().checked_mul(n).expect("string repeat overflow");
+        let s_len = s.len();
+
+        // Check for overflow using checked multiplication
+        let Some(total_len) = s_len.checked_mul(n) else {
+            panic!("string repeat overflow: {} * {} overflows", s_len, n);
+        };
+
+        // FAST PATH 3: Single ASCII byte → use optimized fill
+        if s_len == 1 {
+            let byte = s.as_bytes()[0];
+            // For single-byte strings, use memset-style optimization
+            return Self::repeat_single_byte(byte, n, total_len);
+        }
 
         if total_len <= SSO_MAX_LEN {
-            let mut data = [0u8; SSO_MAX_LEN];
-            for i in 0..n {
-                let start = i * s.len();
-                data[start..start + s.len()].copy_from_slice(s.as_bytes());
+            // SSO path with unrolled copy
+            Self::repeat_sso(s, s_len, n, total_len)
+        } else {
+            // Heap path
+            Self::repeat_heap(s, n)
+        }
+    }
+
+    /// Optimized single-byte repetition.
+    ///
+    /// For single-character strings, we can use a highly optimized byte fill
+    /// which the compiler often vectorizes using SIMD instructions.
+    #[inline(always)]
+    fn repeat_single_byte(byte: u8, n: usize, total_len: usize) -> StringObject {
+        if total_len <= SSO_MAX_LEN {
+            // Fill SSO buffer with single byte - compiler can use SIMD
+            let mut data = [byte; SSO_MAX_LEN];
+            // Zero out unused portion (not strictly necessary but safe)
+            for i in total_len..SSO_MAX_LEN {
+                data[i] = 0;
             }
             StringObject {
                 header: ObjectHeader::new(TypeId::STR),
@@ -336,8 +464,45 @@ impl StringObject {
                 }),
             }
         } else {
-            StringObject::from_string(s.repeat(n))
+            // Heap path for large single-byte repetition
+            // Use vec! macro which is highly optimized for fills
+            let bytes = vec![byte; n];
+            // SAFETY: Single ASCII byte repeated is always valid UTF-8
+            let s = unsafe { String::from_utf8_unchecked(bytes) };
+            StringObject::from_string(s)
         }
+    }
+
+    /// SSO repetition with direct copies.
+    #[inline(always)]
+    fn repeat_sso(s: &str, s_len: usize, n: usize, total_len: usize) -> StringObject {
+        debug_assert!(total_len <= SSO_MAX_LEN);
+
+        let mut data = [0u8; SSO_MAX_LEN];
+        let src = s.as_bytes();
+
+        // Copy each repetition directly using pointer arithmetic
+        for i in 0..n {
+            let start = i * s_len;
+            // SAFETY: total_len <= SSO_MAX_LEN guarantees we're in bounds
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), data.as_mut_ptr().add(start), s_len);
+            }
+        }
+
+        StringObject {
+            header: ObjectHeader::new(TypeId::STR),
+            repr: StringRepr::Inline(InlineString {
+                len: total_len as u8,
+                data,
+            }),
+        }
+    }
+
+    /// Heap repetition (cold path).
+    #[inline(never)]
+    fn repeat_heap(s: &str, n: usize) -> StringObject {
+        StringObject::from_string(s.repeat(n))
     }
 
     /// Get a character by index (0-based, supports negative indexing).

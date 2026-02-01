@@ -8,9 +8,12 @@ use crate::dispatch::{ControlFlow, get_handler};
 use crate::error::{RuntimeError, VmResult};
 use crate::frame::{Frame, MAX_RECURSION_DEPTH};
 use crate::globals::GlobalScope;
+use crate::ic_manager::ICManager;
 use crate::inline_cache::InlineCacheStore;
 use crate::jit_context::{JitConfig, JitContext};
+use crate::jit_executor::ExecutionResult;
 use crate::profiler::{CodeId, Profiler, TierUpDecision};
+use crate::speculative::SpeculationCache;
 use prism_compiler::bytecode::CodeObject;
 use prism_core::{PrismResult, Value};
 use std::sync::Arc;
@@ -37,8 +40,14 @@ pub struct VirtualMachine {
     pub inline_caches: InlineCacheStore,
     /// Execution profiler.
     pub profiler: Profiler,
+    /// IC Manager for centralized type profiling.
+    pub ic_manager: ICManager,
+    /// Speculation cache for O(1) fast-path lookup.
+    pub speculation_cache: SpeculationCache,
     /// JIT context (None when JIT is disabled).
     jit: Option<JitContext>,
+    /// Temporary storage for JIT return value when root frame executes via JIT.
+    jit_return_value: Option<Value>,
 }
 
 impl VirtualMachine {
@@ -51,7 +60,10 @@ impl VirtualMachine {
             builtins: BuiltinRegistry::with_standard_builtins(),
             inline_caches: InlineCacheStore::default(),
             profiler: Profiler::new(),
+            ic_manager: ICManager::new(),
+            speculation_cache: SpeculationCache::new(),
             jit: None,
+            jit_return_value: None,
         }
     }
 
@@ -64,7 +76,10 @@ impl VirtualMachine {
             builtins: BuiltinRegistry::with_standard_builtins(),
             inline_caches: InlineCacheStore::default(),
             profiler: Profiler::new(),
+            ic_manager: ICManager::new(),
+            speculation_cache: SpeculationCache::new(),
             jit: Some(JitContext::with_defaults()),
+            jit_return_value: None,
         }
     }
 
@@ -82,7 +97,10 @@ impl VirtualMachine {
             builtins: BuiltinRegistry::with_standard_builtins(),
             inline_caches: InlineCacheStore::default(),
             profiler: Profiler::new(),
+            ic_manager: ICManager::new(),
+            speculation_cache: SpeculationCache::new(),
             jit,
+            jit_return_value: None,
         }
     }
 
@@ -95,7 +113,10 @@ impl VirtualMachine {
             builtins: BuiltinRegistry::with_standard_builtins(),
             inline_caches: InlineCacheStore::default(),
             profiler: Profiler::new(),
+            ic_manager: ICManager::new(),
+            speculation_cache: SpeculationCache::new(),
             jit: None,
+            jit_return_value: None,
         }
     }
 
@@ -105,8 +126,16 @@ impl VirtualMachine {
 
     /// Execute a code object and return the result.
     pub fn execute(&mut self, code: Arc<CodeObject>) -> PrismResult<Value> {
-        // Push the initial frame
+        // Push the initial frame (may execute via JIT)
         self.push_frame(code, 0)?;
+
+        // If JIT handled everything and no frame was pushed, return the result
+        // from the JIT return value register (which is stored in our temp location)
+        if self.frames.is_empty() {
+            // JIT executed successfully without pushing a frame
+            // The return value was stored in jit_return_value by push_frame
+            return Ok(self.jit_return_value.take().unwrap_or_else(Value::none));
+        }
 
         // Run the main dispatch loop
         self.run_loop()
@@ -172,6 +201,13 @@ impl VirtualMachine {
     // =========================================================================
 
     /// Push a new frame for calling a function.
+    ///
+    /// This method implements a JIT-first dispatch strategy:
+    /// 1. Profile the call and handle tier-up decisions
+    /// 2. If compiled code exists, execute it directly
+    /// 3. On JIT return, propagate value to caller
+    /// 4. On deopt, create frame and resume interpreter
+    /// 5. On miss, fall through to interpreter
     pub fn push_frame(&mut self, code: Arc<CodeObject>, return_reg: u8) -> VmResult<()> {
         // Check recursion limit
         if self.frames.len() >= MAX_RECURSION_DEPTH {
@@ -182,20 +218,67 @@ impl VirtualMachine {
         let code_id = CodeId::from_ptr(Arc::as_ptr(&code) as *const ());
         let tier_decision = self.profiler.record_call(code_id);
 
-        // Handle JIT: check for compiled code and handle tier-up
+        // Handle JIT: check for compiled code, handle tier-up, and try execution
         if let Some(jit) = &mut self.jit {
             // Handle tier-up decision (may trigger compilation)
             if tier_decision != TierUpDecision::None {
                 jit.handle_tier_up(&code, tier_decision);
             }
 
-            // Note: Actual JIT execution dispatch will be added in a future phase
-            // when execute_jit method is implemented. For now, we fall through
-            // to interpreter execution after handling tier-up.
-            jit.record_miss();
+            // Get code pointer ID for cache lookup
+            let code_ptr_id = Arc::as_ptr(&code) as u64;
+
+            // Try to execute compiled code if available
+            if jit.lookup(code_ptr_id).is_some() {
+                // Create temporary frame for JIT execution
+                let return_frame_idx = if self.frames.is_empty() {
+                    None
+                } else {
+                    Some(self.current_frame_idx as u32)
+                };
+                let mut jit_frame = Frame::new(Arc::clone(&code), return_frame_idx, return_reg);
+
+                // Execute compiled code
+                match jit.try_execute(code_ptr_id, &mut jit_frame) {
+                    Some(ExecutionResult::Return(value)) => {
+                        // JIT completed successfully - handle return value
+                        if self.frames.is_empty() {
+                            // Root frame execution - store value for execute() to retrieve
+                            self.jit_return_value = Some(value);
+                        } else {
+                            // Nested call - store return value in caller's register
+                            self.frames[self.current_frame_idx].set_reg(return_reg, value);
+                        }
+                        // Don't push a frame - JIT handled everything
+                        return Ok(());
+                    }
+                    Some(ExecutionResult::Deopt { bc_offset, reason }) => {
+                        // Deoptimization - resume interpreter at bc_offset
+                        jit.handle_deopt(code_ptr_id, reason);
+                        jit_frame.ip = bc_offset;
+                        self.frames.push(jit_frame);
+                        self.current_frame_idx = self.frames.len() - 1;
+                        return Ok(());
+                    }
+                    Some(ExecutionResult::Exception(err)) => {
+                        return Err(err);
+                    }
+                    Some(ExecutionResult::TailCall { .. }) => {
+                        // Tail call - fall through to interpreter for now
+                        // TODO: Implement tail call optimization
+                        jit.record_miss();
+                    }
+                    None => {
+                        // Execution didn't happen - fall through
+                        jit.record_miss();
+                    }
+                }
+            } else {
+                jit.record_miss();
+            }
         }
 
-        // Create new frame
+        // Fall through to interpreter - push frame normally
         let return_frame = if self.frames.is_empty() {
             None
         } else {
