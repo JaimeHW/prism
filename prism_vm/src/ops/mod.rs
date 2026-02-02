@@ -8,6 +8,8 @@ pub mod calls;
 pub mod comparison;
 pub mod containers;
 pub mod control;
+pub mod exception;
+pub mod generator;
 pub mod load_store;
 pub mod objects;
 

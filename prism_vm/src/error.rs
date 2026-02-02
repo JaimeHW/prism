@@ -88,6 +88,8 @@ pub enum RuntimeErrorKind {
     InternalError { message: Arc<str> },
     /// Import error
     ImportError { module: Arc<str>, message: Arc<str> },
+    /// Python exception raised
+    Exception { type_id: u16, message: Arc<str> },
 }
 
 /// A single entry in the traceback.
@@ -211,6 +213,15 @@ impl RuntimeError {
             message: message.into(),
         })
     }
+
+    /// Create an exception error for propagation.
+    #[inline]
+    pub fn exception(type_id: u16, message: impl Into<Arc<str>>) -> Self {
+        Self::new(RuntimeErrorKind::Exception {
+            type_id,
+            message: message.into(),
+        })
+    }
 }
 
 impl fmt::Display for RuntimeError {
@@ -290,6 +301,9 @@ impl fmt::Display for RuntimeError {
             RuntimeErrorKind::ImportError { module, message } => {
                 write!(f, "ImportError: cannot import '{}': {}", module, message)
             }
+            RuntimeErrorKind::Exception { type_id, message } => {
+                write!(f, "Exception(type_id={}): {}", type_id, message)
+            }
         }
     }
 }
@@ -329,6 +343,7 @@ impl From<RuntimeError> for PrismError {
             RuntimeErrorKind::ImportError { module, message } => {
                 PrismError::import(format!("cannot import '{}': {}", module, message))
             }
+            RuntimeErrorKind::Exception { message, .. } => PrismError::internal(&**message),
         }
     }
 }

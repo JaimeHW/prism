@@ -10,20 +10,104 @@ use prism_core::Value;
 use std::sync::Arc;
 
 /// Control flow result from opcode execution.
+///
+/// This enum represents all possible control flow outcomes from executing
+/// a bytecode instruction. The VM dispatch loop uses this to determine
+/// what action to take next.
 #[derive(Debug, Clone)]
 pub enum ControlFlow {
+    // =========================================================================
+    // Normal Execution
+    // =========================================================================
     /// Continue to next instruction.
     Continue,
+
     /// Relative jump by signed offset.
     Jump(i16),
+
     /// Push new frame and call function.
     Call {
         code: Arc<CodeObject>,
         return_reg: u8,
     },
+
     /// Return value and pop frame.
     Return(Value),
-    /// Runtime error occurred.
+
+    // =========================================================================
+    // Exception Handling
+    // =========================================================================
+    /// Raise an exception.
+    ///
+    /// Triggers exception propagation: the VM will search for a handler,
+    /// unwind the stack as needed, and either jump to a handler or
+    /// propagate to the caller.
+    Exception {
+        /// Exception type ID for fast matching.
+        type_id: u16,
+        /// Handler PC if already located (0 if unknown).
+        handler_pc: u32,
+    },
+
+    /// Re-raise the current exception.
+    ///
+    /// Used in except blocks to propagate an exception after partial handling.
+    Reraise,
+
+    /// Jump to exception handler.
+    ///
+    /// Called after handler lookup succeeds. Restores stack depth and
+    /// transfers control to the handler code.
+    EnterHandler {
+        /// Handler bytecode address.
+        handler_pc: u32,
+        /// Stack depth to restore.
+        stack_depth: u16,
+    },
+
+    /// Enter a finally block.
+    ///
+    /// Finally blocks execute unconditionally and may reraise after completion.
+    EnterFinally {
+        /// Finally block bytecode address.
+        finally_pc: u32,
+        /// Stack depth to restore.
+        stack_depth: u16,
+        /// Whether to reraise after finally completes.
+        reraise: bool,
+    },
+
+    /// Exit exception handler.
+    ///
+    /// Pops the handler from the stack and resumes normal execution.
+    ExitHandler,
+
+    // =========================================================================
+    // Generator Protocol
+    // =========================================================================
+    /// Yield a value from a generator.
+    ///
+    /// Suspends execution and returns the yielded value to the caller.
+    /// The resume point is stored for later continuation.
+    Yield {
+        /// The value being yielded.
+        value: Value,
+        /// Bytecode offset to resume at when send() is called.
+        resume_point: u32,
+    },
+
+    /// Resume a suspended generator.
+    ///
+    /// Continues execution from the saved resume point with the sent value.
+    Resume {
+        /// Value sent into the generator (or None for __next__).
+        send_value: Value,
+    },
+
+    // =========================================================================
+    // Error Handling
+    // =========================================================================
+    /// Runtime error occurred (non-exception error).
     Error(RuntimeError),
 }
 
@@ -204,5 +288,227 @@ mod tests {
     fn test_get_handler() {
         let handler = get_handler(Opcode::LoadConst as u8);
         // Just verify it doesn't panic
+    }
+
+    // =========================================================================
+    // ControlFlow Tests
+    // =========================================================================
+
+    #[test]
+    fn test_control_flow_continue() {
+        let cf = ControlFlow::Continue;
+        assert!(matches!(cf, ControlFlow::Continue));
+    }
+
+    #[test]
+    fn test_control_flow_jump() {
+        let cf = ControlFlow::Jump(10);
+        if let ControlFlow::Jump(offset) = cf {
+            assert_eq!(offset, 10);
+        } else {
+            panic!("Expected Jump");
+        }
+
+        // Negative jump
+        let cf = ControlFlow::Jump(-5);
+        if let ControlFlow::Jump(offset) = cf {
+            assert_eq!(offset, -5);
+        } else {
+            panic!("Expected Jump");
+        }
+    }
+
+    #[test]
+    fn test_control_flow_return() {
+        let cf = ControlFlow::Return(Value::int(42).unwrap());
+        if let ControlFlow::Return(v) = cf {
+            assert_eq!(v.as_int(), Some(42));
+        } else {
+            panic!("Expected Return");
+        }
+    }
+
+    #[test]
+    fn test_control_flow_exception() {
+        let cf = ControlFlow::Exception {
+            type_id: 5,
+            handler_pc: 100,
+        };
+        if let ControlFlow::Exception {
+            type_id,
+            handler_pc,
+        } = cf
+        {
+            assert_eq!(type_id, 5);
+            assert_eq!(handler_pc, 100);
+        } else {
+            panic!("Expected Exception");
+        }
+    }
+
+    #[test]
+    fn test_control_flow_exception_unknown_handler() {
+        let cf = ControlFlow::Exception {
+            type_id: 1,
+            handler_pc: 0, // Unknown handler
+        };
+        if let ControlFlow::Exception { handler_pc, .. } = cf {
+            assert_eq!(handler_pc, 0);
+        } else {
+            panic!("Expected Exception");
+        }
+    }
+
+    #[test]
+    fn test_control_flow_reraise() {
+        let cf = ControlFlow::Reraise;
+        assert!(matches!(cf, ControlFlow::Reraise));
+    }
+
+    #[test]
+    fn test_control_flow_enter_handler() {
+        let cf = ControlFlow::EnterHandler {
+            handler_pc: 50,
+            stack_depth: 3,
+        };
+        if let ControlFlow::EnterHandler {
+            handler_pc,
+            stack_depth,
+        } = cf
+        {
+            assert_eq!(handler_pc, 50);
+            assert_eq!(stack_depth, 3);
+        } else {
+            panic!("Expected EnterHandler");
+        }
+    }
+
+    #[test]
+    fn test_control_flow_enter_finally() {
+        let cf = ControlFlow::EnterFinally {
+            finally_pc: 75,
+            stack_depth: 2,
+            reraise: true,
+        };
+        if let ControlFlow::EnterFinally {
+            finally_pc,
+            stack_depth,
+            reraise,
+        } = cf
+        {
+            assert_eq!(finally_pc, 75);
+            assert_eq!(stack_depth, 2);
+            assert!(reraise);
+        } else {
+            panic!("Expected EnterFinally");
+        }
+    }
+
+    #[test]
+    fn test_control_flow_enter_finally_no_reraise() {
+        let cf = ControlFlow::EnterFinally {
+            finally_pc: 80,
+            stack_depth: 1,
+            reraise: false,
+        };
+        if let ControlFlow::EnterFinally { reraise, .. } = cf {
+            assert!(!reraise);
+        } else {
+            panic!("Expected EnterFinally");
+        }
+    }
+
+    #[test]
+    fn test_control_flow_exit_handler() {
+        let cf = ControlFlow::ExitHandler;
+        assert!(matches!(cf, ControlFlow::ExitHandler));
+    }
+
+    #[test]
+    fn test_control_flow_yield() {
+        let cf = ControlFlow::Yield {
+            value: Value::int(100).unwrap(),
+            resume_point: 25,
+        };
+        if let ControlFlow::Yield {
+            value,
+            resume_point,
+        } = cf
+        {
+            assert_eq!(value.as_int(), Some(100));
+            assert_eq!(resume_point, 25);
+        } else {
+            panic!("Expected Yield");
+        }
+    }
+
+    #[test]
+    fn test_control_flow_resume() {
+        let cf = ControlFlow::Resume {
+            send_value: Value::none(),
+        };
+        if let ControlFlow::Resume { send_value } = cf {
+            assert!(send_value.is_none());
+        } else {
+            panic!("Expected Resume");
+        }
+    }
+
+    #[test]
+    fn test_control_flow_resume_with_value() {
+        let cf = ControlFlow::Resume {
+            send_value: Value::int(42).unwrap(),
+        };
+        if let ControlFlow::Resume { send_value } = cf {
+            assert_eq!(send_value.as_int(), Some(42));
+        } else {
+            panic!("Expected Resume");
+        }
+    }
+
+    #[test]
+    fn test_control_flow_error() {
+        let err = RuntimeError::internal("test error");
+        let cf = ControlFlow::Error(err);
+        assert!(matches!(cf, ControlFlow::Error(_)));
+    }
+
+    #[test]
+    fn test_control_flow_size() {
+        // Ensure ControlFlow remains reasonably sized
+        // Note: The Error variant contains RuntimeError which includes a Vec<TracebackEntry>
+        // making it the largest variant. On 64-bit systems the size is ~88 bytes.
+        let size = std::mem::size_of::<ControlFlow>();
+        assert!(
+            size <= 104,
+            "ControlFlow size is {} bytes, expected <= 104",
+            size
+        );
+    }
+
+    #[test]
+    fn test_control_flow_clone() {
+        let cf = ControlFlow::Exception {
+            type_id: 5,
+            handler_pc: 100,
+        };
+        let cloned = cf.clone();
+        if let ControlFlow::Exception {
+            type_id,
+            handler_pc,
+        } = cloned
+        {
+            assert_eq!(type_id, 5);
+            assert_eq!(handler_pc, 100);
+        } else {
+            panic!("Clone failed");
+        }
+    }
+
+    #[test]
+    fn test_control_flow_debug() {
+        let cf = ControlFlow::Continue;
+        let debug = format!("{:?}", cf);
+        assert!(debug.contains("Continue"));
     }
 }

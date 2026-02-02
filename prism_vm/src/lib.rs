@@ -73,6 +73,9 @@ pub mod jit_executor;
 // Opcode handlers (organized by category)
 pub mod ops;
 
+// Exception and generator runtime
+pub mod exception;
+
 // Standard library modules
 pub mod stdlib;
 
