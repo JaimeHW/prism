@@ -111,13 +111,24 @@ impl Value {
 
     /// Create an integer value.
     ///
-    /// If the integer fits in 48 bits, it's stored inline.
-    /// Otherwise, returns None (caller should allocate a big int object).
+    /// If the integer is in the small int cache range [-5, 256], returns
+    /// a pre-computed cached value. Otherwise, if it fits in 48 bits,
+    /// it's stored inline. Returns None if the integer is too large.
+    ///
+    /// # Performance
+    ///
+    /// For cached integers: O(1) array lookup (< 1ns)
+    /// For uncached small ints: O(1) bit manipulation
     #[inline]
     #[must_use]
-    pub const fn int(i: i64) -> Option<Self> {
+    pub fn int(i: i64) -> Option<Self> {
+        // Fast path: check small int cache first
+        if let Some(cached) = crate::small_int_cache::SmallIntCache::get(i) {
+            return Some(cached);
+        }
+
+        // Slow path: construct inline if it fits
         if i >= SMALL_INT_MIN && i <= SMALL_INT_MAX {
-            // Store as small int
             let payload = (i as u64) & PAYLOAD_MASK;
             Some(Self {
                 bits: QNAN | (TAG_INT << TAG_SHIFT) | payload,

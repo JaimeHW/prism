@@ -18,12 +18,14 @@
 
 pub mod error;
 pub mod intern;
+pub mod small_int_cache;
 pub mod span;
 pub mod speculation;
 pub mod value;
 
 pub use error::{PrismError, PrismResult};
 pub use intern::{InternedString, StringInterner};
+pub use small_int_cache::SmallIntCache;
 pub use span::Span;
 pub use speculation::{SpeculationProvider, TypeHint};
 pub use value::{INT_TAG_PATTERN, STRING_TAG_PATTERN, TYPE_TAG_MASK, VALUE_PAYLOAD_MASK, Value};
