@@ -3,7 +3,7 @@
 //! The `FunctionBuilder` provides a high-level API for constructing bytecode
 //! with automatic register allocation and label resolution.
 
-use super::code_object::{CodeFlags, CodeObject, LineTableEntry};
+use super::code_object::{CodeFlags, CodeObject, ExceptionEntry, LineTableEntry};
 use super::instruction::{ConstIndex, Instruction, LocalSlot, Opcode, Register};
 use prism_core::Value;
 use std::collections::HashMap;
@@ -105,6 +105,8 @@ pub struct FunctionBuilder {
     line_table: Vec<LineTableEntry>,
     /// Start PC for current line.
     line_start_pc: u32,
+    /// Exception table entries.
+    exception_entries: Vec<ExceptionEntry>,
 }
 
 /// Key type for constant deduplication.
@@ -169,6 +171,7 @@ impl FunctionBuilder {
             forward_refs: Vec::new(),
             line_table: Vec::new(),
             line_start_pc: 0,
+            exception_entries: Vec::new(),
         }
     }
 
@@ -186,10 +189,21 @@ impl FunctionBuilder {
         self.filename = filename.into();
     }
 
+    /// Get the filename.
+    #[inline]
+    pub fn get_filename(&self) -> Arc<str> {
+        self.filename.clone()
+    }
+
     /// Set the first line number.
     pub fn set_first_lineno(&mut self, line: u32) {
         self.first_lineno = line;
         self.current_line = line;
+    }
+
+    /// Add a flag to the code object.
+    pub fn add_flag(&mut self, flag: CodeFlags) {
+        self.flags = self.flags | flag;
     }
 
     /// Set the current line number for subsequent instructions.
@@ -549,6 +563,28 @@ impl FunctionBuilder {
         !self.cellvars.is_empty() || !self.freevars.is_empty()
     }
 
+    // --- Class Construction ---
+
+    /// Emit BUILD_CLASS instruction.
+    ///
+    /// Creates a class object from a class body code object and base classes.
+    ///
+    /// # Parameters
+    /// - `dst`: Register to store the resulting class object
+    /// - `code_idx`: Constant index of the class body code object
+    /// - `base_count`: Number of base classes (stored in consecutive registers starting at dst+1)
+    ///
+    /// # Encoding
+    /// Uses DstSrcSrc format: dst = class, src1 = code_idx as u8, src2 = base_count
+    pub fn emit_build_class(&mut self, dst: Register, code_idx: u16, base_count: u8) {
+        self.emit(Instruction::op_dss(
+            Opcode::BuildClass,
+            dst,
+            Register::new(code_idx as u8), // code object index (low byte)
+            Register::new(base_count),
+        ));
+    }
+
     /// Move value between registers.
     pub fn emit_move(&mut self, dst: Register, src: Register) {
         if dst != src {
@@ -826,6 +862,41 @@ impl FunctionBuilder {
     }
 
     // =========================================================================
+    // Exception Handling
+    // =========================================================================
+
+    /// Adds an exception entry to the exception table.
+    ///
+    /// This is used by the exception compiler to build the zero-cost exception
+    /// table. Entries should be added in order of start_pc for efficient binary
+    /// search during runtime exception handling.
+    ///
+    /// # Arguments
+    /// * `entry` - The exception entry describing a try block and its handlers
+    #[inline]
+    pub fn add_exception_entry(&mut self, entry: ExceptionEntry) {
+        self.exception_entries.push(entry);
+    }
+
+    /// Returns the current instruction count (program counter).
+    ///
+    /// This is used during exception compilation to record PC values for
+    /// exception table entries.
+    #[inline]
+    pub fn current_pc(&self) -> u32 {
+        self.instructions.len() as u32
+    }
+
+    /// Returns the current stack depth for exception handling.
+    ///
+    /// This is used to record the stack depth at try block entry for proper
+    /// stack unwinding during exception handling.
+    #[inline]
+    pub fn current_stack_depth(&self) -> u8 {
+        self.next_register
+    }
+
+    // =========================================================================
     // Finalization
     // =========================================================================
 
@@ -888,6 +959,7 @@ impl FunctionBuilder {
             register_count: self.max_registers as u16,
             flags: self.flags,
             line_table: self.line_table.into_boxed_slice(),
+            exception_table: self.exception_entries.into_boxed_slice(),
         }
     }
 }
