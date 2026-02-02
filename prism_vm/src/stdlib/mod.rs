@@ -1,0 +1,145 @@
+//! Python stdlib module implementations.
+//!
+//! This module provides implementations of Python's standard library modules
+//! with maximum performance through direct hardware intrinsics and zero-allocation
+//! algorithms.
+//!
+//! # Modules
+//!
+//! - `math` - Mathematical functions (sin, cos, sqrt, etc.)
+//! - `os` - Operating system interface
+//! - `sys` - System-specific parameters and functions
+
+pub mod math;
+pub mod os;
+pub mod sys;
+
+use prism_core::Value;
+use std::sync::Arc;
+
+/// Result type for module attribute lookup.
+pub type ModuleResult = Result<Value, ModuleError>;
+
+/// Errors that can occur during module operations.
+#[derive(Debug, Clone)]
+pub enum ModuleError {
+    /// Attribute not found in module.
+    AttributeError(String),
+    /// Invalid argument for function.
+    ValueError(String),
+    /// Type mismatch.
+    TypeError(String),
+    /// Domain error (e.g., sqrt of negative).
+    MathDomainError(String),
+    /// Range error (e.g., result too large).
+    MathRangeError(String),
+    /// OS error (e.g., file not found).
+    OSError(String),
+}
+
+impl std::fmt::Display for ModuleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModuleError::AttributeError(msg) => write!(f, "AttributeError: {}", msg),
+            ModuleError::ValueError(msg) => write!(f, "ValueError: {}", msg),
+            ModuleError::TypeError(msg) => write!(f, "TypeError: {}", msg),
+            ModuleError::MathDomainError(msg) => write!(f, "math domain error: {}", msg),
+            ModuleError::MathRangeError(msg) => write!(f, "math range error: {}", msg),
+            ModuleError::OSError(msg) => write!(f, "OSError: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ModuleError {}
+
+/// Trait for Python module implementations.
+pub trait Module {
+    /// Get the module name.
+    fn name(&self) -> &str;
+
+    /// Get an attribute from the module.
+    fn get_attr(&self, name: &str) -> ModuleResult;
+
+    /// List all attribute names.
+    fn dir(&self) -> Vec<Arc<str>> {
+        Vec::new() // Default empty impl
+    }
+}
+
+/// Registry of all stdlib modules.
+pub struct StdlibRegistry {
+    modules: std::collections::HashMap<Arc<str>, Box<dyn Module + Send + Sync>>,
+}
+
+impl StdlibRegistry {
+    /// Create a new registry with all stdlib modules.
+    pub fn new() -> Self {
+        let mut modules: std::collections::HashMap<Arc<str>, Box<dyn Module + Send + Sync>> =
+            std::collections::HashMap::new();
+
+        // Register math module
+        modules.insert(Arc::from("math"), Box::new(math::MathModule::new()));
+
+        // Register os module
+        modules.insert(Arc::from("os"), Box::new(os::OsModule::new()));
+
+        // Register sys module
+        modules.insert(Arc::from("sys"), Box::new(sys::SysModule::new()));
+
+        Self { modules }
+    }
+
+    /// Get a module by name.
+    pub fn get(&self, name: &str) -> Option<&(dyn Module + Send + Sync)> {
+        self.modules.get(name).map(|m| m.as_ref())
+    }
+
+    /// Check if a module exists.
+    pub fn contains(&self, name: &str) -> bool {
+        self.modules.contains_key(name)
+    }
+
+    /// List all available module names.
+    pub fn list_modules(&self) -> Vec<&str> {
+        self.modules.keys().map(|k| k.as_ref()).collect()
+    }
+}
+
+impl Default for StdlibRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_registry_creation() {
+        let registry = StdlibRegistry::new();
+        assert!(registry.contains("math"));
+    }
+
+    #[test]
+    fn test_registry_get_math() {
+        let registry = StdlibRegistry::new();
+        let math = registry.get("math");
+        assert!(math.is_some());
+        assert_eq!(math.unwrap().name(), "math");
+    }
+
+    #[test]
+    fn test_registry_unknown_module() {
+        let registry = StdlibRegistry::new();
+        assert!(!registry.contains("nonexistent"));
+        assert!(registry.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_list_modules() {
+        let registry = StdlibRegistry::new();
+        let modules = registry.list_modules();
+        assert!(modules.contains(&"math"));
+    }
+}
