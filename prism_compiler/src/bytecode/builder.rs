@@ -298,6 +298,69 @@ impl FunctionBuilder {
         self.add_constant(Value::float(value))
     }
 
+    /// Add a string constant with automatic interning and deduplication.
+    ///
+    /// This method:
+    /// 1. Interns the string using the global string interner for O(1) equality
+    /// 2. Deduplicates identical strings in the constant pool
+    /// 3. Returns an index suitable for LoadConst instruction
+    ///
+    /// # Performance
+    ///
+    /// - O(1) lookup for already-added strings via ConstantKey::String deduplication
+    /// - Interned strings enable pointer equality at runtime
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let idx = builder.add_string("hello");
+    /// builder.emit_load_const(dst, idx);
+    /// ```
+    pub fn add_string(&mut self, s: impl AsRef<str>) -> ConstIndex {
+        let s_str = s.as_ref();
+        let arc_str: Arc<str> = Arc::from(s_str);
+        let key = ConstantKey::String(arc_str.clone());
+
+        // Deduplication: return existing index if this string was already added
+        if let Some(&idx) = self.constant_map.get(&key) {
+            return idx;
+        }
+
+        // Intern the string for runtime O(1) equality checks
+        let interned = prism_core::intern::intern(s_str);
+        let value = Value::string(interned);
+
+        let idx = ConstIndex::new(self.constants.len() as u16);
+        self.constants.push(value);
+        self.constant_map.insert(key, idx);
+        idx
+    }
+
+    /// Add a nested code object constant.
+    ///
+    /// Code objects are stored in the constant pool for MakeFunction/MakeClosure
+    /// to create function objects at runtime.
+    ///
+    /// Returns the constant index that can be used with MakeFunction/MakeClosure opcodes.
+    pub fn add_code_object(&mut self, code: Arc<CodeObject>) -> u16 {
+        // Store code object reference as a constant
+        // We use the name for deduplication key
+        let name = code.name.clone();
+        let key = ConstantKey::Code(name);
+
+        if let Some(&idx) = self.constant_map.get(&key) {
+            return idx.0;
+        }
+
+        // Store the Arc<CodeObject> as an object pointer constant
+        // At runtime, the VM will interpret this as a code object reference
+        let code_ptr = Arc::into_raw(code) as *const ();
+        let idx = ConstIndex::new(self.constants.len() as u16);
+        self.constants.push(Value::object_ptr(code_ptr));
+        self.constant_map.insert(key, idx);
+        idx.0
+    }
+
     // =========================================================================
     // Local Variables
     // =========================================================================
@@ -412,6 +475,78 @@ impl FunctionBuilder {
     /// Store a register into a global variable.
     pub fn emit_store_global(&mut self, name_idx: u16, src: Register) {
         self.emit(Instruction::op_di(Opcode::StoreGlobal, src, name_idx));
+    }
+
+    // --- Closure Variables ---
+
+    /// Load a closure variable (cell or free) into a register.
+    ///
+    /// Closure slot indices are determined by scope analysis:
+    /// - Cell variables (captured by inner scopes) come first
+    /// - Free variables (captured from outer scopes) follow
+    #[inline]
+    pub fn emit_load_closure(&mut self, dst: Register, slot: u16) {
+        self.emit(Instruction::op_di(Opcode::LoadClosure, dst, slot));
+    }
+
+    /// Store a register into a closure variable.
+    ///
+    /// Uses Cell interior mutability for proper closure semantics.
+    #[inline]
+    pub fn emit_store_closure(&mut self, slot: u16, src: Register) {
+        self.emit(Instruction::op_di(Opcode::StoreClosure, src, slot));
+    }
+
+    /// Delete (mark as unbound) a closure variable.
+    ///
+    /// Subsequent reads will raise UnboundLocalError.
+    #[inline]
+    pub fn emit_delete_closure(&mut self, slot: u16) {
+        self.emit(Instruction::op_di(
+            Opcode::DeleteClosure,
+            Register::new(0),
+            slot,
+        ));
+    }
+
+    /// Add a cell variable (captured by inner scopes).
+    ///
+    /// Returns the closure slot index for this cell.
+    pub fn add_cellvar(&mut self, name: impl Into<Arc<str>>) -> u16 {
+        let name = name.into();
+        let slot = self.cellvars.len() as u16;
+        self.cellvars.push(name);
+        slot
+    }
+
+    /// Add a free variable (captured from outer scope).
+    ///
+    /// Returns the closure slot index for this freevar.
+    /// Note: Free variables are indexed after all cell variables.
+    pub fn add_freevar(&mut self, name: impl Into<Arc<str>>) -> u16 {
+        let name = name.into();
+        // Free vars come after cell vars in the closure environment
+        let slot = (self.cellvars.len() + self.freevars.len()) as u16;
+        self.freevars.push(name);
+        slot
+    }
+
+    /// Get the number of cell variables.
+    #[inline]
+    pub fn cellvar_count(&self) -> usize {
+        self.cellvars.len()
+    }
+
+    /// Get the number of free variables.
+    #[inline]
+    pub fn freevar_count(&self) -> usize {
+        self.freevars.len()
+    }
+
+    /// Check if this function has any closure variables.
+    #[inline]
+    pub fn has_closure(&self) -> bool {
+        !self.cellvars.is_empty() || !self.freevars.is_empty()
     }
 
     /// Move value between registers.
@@ -636,6 +771,61 @@ impl FunctionBuilder {
     }
 
     // =========================================================================
+    // Import Operations
+    // =========================================================================
+
+    /// Import a module by name index.
+    ///
+    /// Emits ImportName opcode: dst = import(names[name_idx])
+    ///
+    /// # Arguments
+    /// * `dst` - Register to store the imported module object
+    /// * `name_idx` - Index into the names table for the module name
+    #[inline]
+    pub fn emit_import_name(&mut self, dst: Register, name_idx: u16) {
+        self.emit(Instruction::op_di(Opcode::ImportName, dst, name_idx));
+    }
+
+    /// Import an attribute from a module.
+    ///
+    /// Emits ImportFrom opcode: dst = from module import names[name_idx]
+    ///
+    /// # Arguments
+    /// * `dst` - Register to store the imported attribute value
+    /// * `module_reg` - Register containing the source module object
+    /// * `name_idx` - Index into the names table for the attribute name
+    ///
+    /// # Instruction Encoding
+    /// Uses extended format: opcode(8) | dst(8) | module_reg(8) | name_idx_lo(8)
+    /// with name_idx_hi packed in a following instruction if needed.
+    /// For simplicity, we use a compact encoding with src1=module_reg, imm8=name_idx_lo.
+    #[inline]
+    pub fn emit_import_from(&mut self, dst: Register, module_reg: Register, name_idx: u8) {
+        // Compact encoding: dst | module_reg | name_idx (8-bit for now)
+        self.emit(Instruction::new(
+            Opcode::ImportFrom,
+            dst.0,
+            module_reg.0,
+            name_idx,
+        ));
+    }
+
+    /// Import all public names from a module.
+    ///
+    /// Emits ImportStar opcode: from module import *
+    ///
+    /// # Arguments
+    /// * `dst` - Unused (set to 0), but required by instruction format
+    /// * `module_reg` - Register containing the source module object
+    ///
+    /// Note: The VM handler will inject all public names from the module
+    /// into the current scope's global namespace.
+    #[inline]
+    pub fn emit_import_star(&mut self, dst: Register, module_reg: Register) {
+        self.emit(Instruction::op_ds(Opcode::ImportStar, dst, module_reg));
+    }
+
+    // =========================================================================
     // Finalization
     // =========================================================================
 
@@ -772,5 +962,414 @@ mod tests {
         assert_eq!(r0.0, 0);
         assert_eq!(r1.0, 1);
         assert_eq!(r2.0, 0); // Reused
+    }
+
+    // =========================================================================
+    // Closure Variable Tests
+    // =========================================================================
+
+    #[test]
+    fn test_cellvar_registration() {
+        let mut builder = FunctionBuilder::new("outer");
+
+        assert!(!builder.has_closure());
+        assert_eq!(builder.cellvar_count(), 0);
+
+        let slot0 = builder.add_cellvar("x");
+        let slot1 = builder.add_cellvar("y");
+        let slot2 = builder.add_cellvar("z");
+
+        assert_eq!(slot0, 0);
+        assert_eq!(slot1, 1);
+        assert_eq!(slot2, 2);
+        assert_eq!(builder.cellvar_count(), 3);
+        assert!(builder.has_closure());
+
+        let code = builder.finish();
+        assert_eq!(code.cellvars.len(), 3);
+        assert_eq!(&*code.cellvars[0], "x");
+        assert_eq!(&*code.cellvars[1], "y");
+        assert_eq!(&*code.cellvars[2], "z");
+    }
+
+    #[test]
+    fn test_freevar_registration() {
+        let mut builder = FunctionBuilder::new("inner");
+
+        let slot0 = builder.add_freevar("captured");
+        let slot1 = builder.add_freevar("outer_var");
+
+        assert_eq!(slot0, 0);
+        assert_eq!(slot1, 1);
+        assert_eq!(builder.freevar_count(), 2);
+        assert!(builder.has_closure());
+
+        let code = builder.finish();
+        assert_eq!(code.freevars.len(), 2);
+        assert_eq!(&*code.freevars[0], "captured");
+        assert_eq!(&*code.freevars[1], "outer_var");
+    }
+
+    #[test]
+    fn test_mixed_cell_and_free_vars() {
+        let mut builder = FunctionBuilder::new("middle");
+
+        let cell0 = builder.add_cellvar("local_captured");
+        let cell1 = builder.add_cellvar("another");
+
+        let free0 = builder.add_freevar("from_outer");
+        let free1 = builder.add_freevar("also_outer");
+
+        assert_eq!(cell0, 0);
+        assert_eq!(cell1, 1);
+        assert_eq!(free0, 2); // After 2 cell vars
+        assert_eq!(free1, 3);
+
+        assert_eq!(builder.cellvar_count(), 2);
+        assert_eq!(builder.freevar_count(), 2);
+    }
+
+    #[test]
+    fn test_emit_load_closure() {
+        let mut builder = FunctionBuilder::new("test");
+        let r0 = builder.alloc_register();
+
+        builder.add_cellvar("x");
+        builder.emit_load_closure(r0, 0);
+
+        let code = builder.finish();
+        assert_eq!(code.instructions.len(), 1);
+
+        let inst = code.instructions[0];
+        assert_eq!(inst.opcode(), Opcode::LoadClosure as u8);
+        assert_eq!(inst.dst().0, r0.0);
+        assert_eq!(inst.imm16(), 0);
+    }
+
+    #[test]
+    fn test_emit_store_closure() {
+        let mut builder = FunctionBuilder::new("test");
+        let r0 = builder.alloc_register();
+
+        builder.add_cellvar("x");
+        builder.emit_store_closure(0, r0);
+
+        let code = builder.finish();
+        assert_eq!(code.instructions.len(), 1);
+
+        let inst = code.instructions[0];
+        assert_eq!(inst.opcode(), Opcode::StoreClosure as u8);
+        assert_eq!(inst.imm16(), 0);
+    }
+
+    #[test]
+    fn test_emit_delete_closure() {
+        let mut builder = FunctionBuilder::new("test");
+
+        builder.add_cellvar("x");
+        builder.emit_delete_closure(0);
+
+        let code = builder.finish();
+        assert_eq!(code.instructions.len(), 1);
+
+        let inst = code.instructions[0];
+        assert_eq!(inst.opcode(), Opcode::DeleteClosure as u8);
+        assert_eq!(inst.imm16(), 0);
+    }
+
+    #[test]
+    fn test_closure_function_pattern() {
+        let mut outer = FunctionBuilder::new("make_counter");
+        outer.set_arg_count(1);
+
+        let count_slot = outer.add_cellvar("count");
+        assert_eq!(count_slot, 0);
+
+        let r0 = outer.alloc_register();
+        outer.emit_load_local(r0, LocalSlot::new(0));
+        outer.emit_store_closure(count_slot, r0);
+        outer.emit_return_none();
+
+        let outer_code = outer.finish();
+        assert_eq!(outer_code.cellvars.len(), 1);
+        assert_eq!(&*outer_code.cellvars[0], "count");
+        assert_eq!(outer_code.instructions.len(), 3);
+    }
+
+    #[test]
+    fn test_closure_instruction_sequence() {
+        let mut builder = FunctionBuilder::new("increment_closure");
+
+        builder.add_cellvar("counter");
+        let r0 = builder.alloc_register();
+        let r1 = builder.alloc_register();
+
+        builder.emit_load_closure(r0, 0);
+        let one_idx = builder.add_int(1);
+        builder.emit_load_const(r1, one_idx);
+        builder.emit_add(r0, r0, r1);
+        builder.emit_store_closure(0, r0);
+        builder.emit_return(r0);
+
+        let code = builder.finish();
+        assert_eq!(code.instructions.len(), 5);
+
+        assert_eq!(code.instructions[0].opcode(), Opcode::LoadClosure as u8);
+        assert_eq!(code.instructions[1].opcode(), Opcode::LoadConst as u8);
+        assert_eq!(code.instructions[2].opcode(), Opcode::Add as u8);
+        assert_eq!(code.instructions[3].opcode(), Opcode::StoreClosure as u8);
+        assert_eq!(code.instructions[4].opcode(), Opcode::Return as u8);
+    }
+
+    #[test]
+    fn test_multiple_closure_slots() {
+        let mut builder = FunctionBuilder::new("multi_closure");
+
+        for i in 0..8 {
+            let slot = builder.add_cellvar(format!("var{}", i));
+            assert_eq!(slot, i as u16);
+        }
+
+        let r0 = builder.alloc_register();
+
+        for i in 0..8u16 {
+            builder.emit_load_closure(r0, i);
+        }
+
+        let code = builder.finish();
+        assert_eq!(code.cellvars.len(), 8);
+        assert_eq!(code.instructions.len(), 8);
+
+        for i in 0..8 {
+            let inst = code.instructions[i];
+            assert_eq!(inst.opcode(), Opcode::LoadClosure as u8);
+            assert_eq!(inst.imm16(), i as u16);
+        }
+    }
+
+    #[test]
+    fn test_no_closure_by_default() {
+        let builder = FunctionBuilder::new("simple");
+        assert!(!builder.has_closure());
+        assert_eq!(builder.cellvar_count(), 0);
+        assert_eq!(builder.freevar_count(), 0);
+
+        let code = builder.finish();
+        assert!(code.cellvars.is_empty());
+        assert!(code.freevars.is_empty());
+    }
+
+    // =========================================================================
+    // String Constant Tests
+    // =========================================================================
+
+    #[test]
+    fn test_add_string_basic() {
+        let mut builder = FunctionBuilder::new("test");
+        let idx = builder.add_string("hello");
+        assert_eq!(idx.0, 0);
+    }
+
+    #[test]
+    fn test_add_string_deduplication() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let idx1 = builder.add_string("hello");
+        let idx2 = builder.add_string("hello");
+        let idx3 = builder.add_string("world");
+
+        // Same string should return same index
+        assert_eq!(idx1.0, idx2.0);
+        // Different strings should have different indices
+        assert_ne!(idx1.0, idx3.0);
+    }
+
+    #[test]
+    fn test_add_string_empty() {
+        let mut builder = FunctionBuilder::new("test");
+        let idx1 = builder.add_string("");
+        let idx2 = builder.add_string("");
+
+        assert_eq!(idx1.0, idx2.0);
+    }
+
+    #[test]
+    fn test_add_string_unicode() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let idx1 = builder.add_string("こんにちは");
+        let idx2 = builder.add_string("こんにちは");
+        let idx3 = builder.add_string("世界");
+
+        assert_eq!(idx1.0, idx2.0);
+        assert_ne!(idx1.0, idx3.0);
+    }
+
+    #[test]
+    fn test_add_string_emoji() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let idx1 = builder.add_string("🦀🐍💻");
+        let idx2 = builder.add_string("🦀🐍💻");
+
+        assert_eq!(idx1.0, idx2.0);
+    }
+
+    #[test]
+    fn test_add_string_escape_sequences() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let idx1 = builder.add_string("line1\nline2\ttab");
+        let idx2 = builder.add_string("line1\nline2\ttab");
+        let idx3 = builder.add_string("line1\\nline2\\ttab"); // Different: escaped
+
+        assert_eq!(idx1.0, idx2.0);
+        assert_ne!(idx1.0, idx3.0);
+    }
+
+    #[test]
+    fn test_add_string_whitespace_significant() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let idx1 = builder.add_string("hello");
+        let idx2 = builder.add_string("hello ");
+        let idx3 = builder.add_string(" hello");
+        let idx4 = builder.add_string("hello");
+
+        // Whitespace matters
+        assert_ne!(idx1.0, idx2.0);
+        assert_ne!(idx1.0, idx3.0);
+        assert_ne!(idx2.0, idx3.0);
+        // Same string should deduplicate
+        assert_eq!(idx1.0, idx4.0);
+    }
+
+    #[test]
+    fn test_add_string_case_sensitive() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let idx1 = builder.add_string("Hello");
+        let idx2 = builder.add_string("hello");
+        let idx3 = builder.add_string("HELLO");
+
+        assert_ne!(idx1.0, idx2.0);
+        assert_ne!(idx1.0, idx3.0);
+        assert_ne!(idx2.0, idx3.0);
+    }
+
+    #[test]
+    fn test_add_string_long() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let long_string = "x".repeat(10000);
+        let idx1 = builder.add_string(&long_string);
+        let idx2 = builder.add_string(&long_string);
+
+        assert_eq!(idx1.0, idx2.0);
+    }
+
+    #[test]
+    fn test_add_string_multiple_distinct() {
+        let mut builder = FunctionBuilder::new("test");
+
+        for i in 0..100 {
+            let s = format!("string_{}", i);
+            let idx = builder.add_string(&s);
+            assert_eq!(idx.0, i as u16);
+        }
+    }
+
+    #[test]
+    fn test_add_string_with_load_const() {
+        let mut builder = FunctionBuilder::new("test");
+        let r0 = builder.alloc_register();
+
+        let str_idx = builder.add_string("test_string");
+        builder.emit_load_const(r0, str_idx);
+        builder.emit_return_none();
+
+        let code = builder.finish();
+        assert_eq!(code.instructions.len(), 2);
+        assert_eq!(code.constants.len(), 1);
+
+        let inst = code.instructions[0];
+        assert_eq!(inst.opcode(), Opcode::LoadConst as u8);
+        assert_eq!(inst.dst().0, r0.0);
+        assert_eq!(inst.imm16(), str_idx.0);
+    }
+
+    #[test]
+    fn test_add_string_constant_value_is_string() {
+        let mut builder = FunctionBuilder::new("test");
+        builder.add_string("hello");
+
+        let code = builder.finish();
+        assert_eq!(code.constants.len(), 1);
+
+        // The constant should be a string value
+        let val = code.constants[0];
+        assert!(val.is_string());
+    }
+
+    #[test]
+    fn test_mixed_constant_types() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let int_idx = builder.add_int(42);
+        let str_idx = builder.add_string("hello");
+        let float_idx = builder.add_float(3.14);
+        let str_idx2 = builder.add_string("world");
+
+        // All should have unique indices
+        assert_ne!(int_idx.0, str_idx.0);
+        assert_ne!(str_idx.0, float_idx.0);
+        assert_ne!(float_idx.0, str_idx2.0);
+
+        let code = builder.finish();
+        assert_eq!(code.constants.len(), 4);
+    }
+
+    #[test]
+    fn test_string_dedup_does_not_affect_other_types() {
+        let mut builder = FunctionBuilder::new("test");
+
+        // Add string "42" and int 42 - should not deduplicate
+        let str_idx = builder.add_string("42");
+        let int_idx = builder.add_int(42);
+
+        assert_ne!(str_idx.0, int_idx.0);
+
+        let code = builder.finish();
+        assert_eq!(code.constants.len(), 2);
+    }
+
+    #[test]
+    fn test_add_string_from_string_type() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let owned_string = String::from("owned_string");
+        let idx1 = builder.add_string(&owned_string);
+        let idx2 = builder.add_string("owned_string");
+
+        // Should deduplicate even when coming from different source types
+        assert_eq!(idx1.0, idx2.0);
+    }
+
+    #[test]
+    fn test_string_constant_pool_ordering() {
+        let mut builder = FunctionBuilder::new("test");
+
+        let idx_a = builder.add_string("aaa");
+        let idx_b = builder.add_string("bbb");
+        let idx_c = builder.add_string("ccc");
+
+        assert_eq!(idx_a.0, 0);
+        assert_eq!(idx_b.0, 1);
+        assert_eq!(idx_c.0, 2);
+
+        // Re-adding should return original indices
+        assert_eq!(builder.add_string("bbb").0, 1);
+        assert_eq!(builder.add_string("aaa").0, 0);
+        assert_eq!(builder.add_string("ccc").0, 2);
     }
 }
