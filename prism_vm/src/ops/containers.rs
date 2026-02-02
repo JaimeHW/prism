@@ -355,7 +355,7 @@ pub fn import_star(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     // Get all public names from the module
     // If __all__ is defined, use it; otherwise use all non-underscore names
-    for (name, value) in module.public_items() {
+    for (name, value) in module.public_attrs() {
         vm.globals.set((*name).into(), value);
     }
 
