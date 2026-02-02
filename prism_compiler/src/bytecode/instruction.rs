@@ -265,6 +265,10 @@ pub enum Opcode {
     Yield = 0x0C,
     /// Yield from (generator delegation).
     YieldFrom = 0x0D,
+    /// Check if exception matches type: dst = isinstance(exc, type).
+    ExceptionMatch = 0x0E,
+    /// Load current exception into register: dst = current_exception.
+    LoadException = 0x0F,
 
     // =========================================================================
     // Load/Store (0x10-0x1F)
@@ -482,6 +486,23 @@ pub enum Opcode {
     ImportFrom = 0x91,
     /// Import star: from module import *.
     ImportStar = 0x92,
+
+    // =========================================================================
+    // Extended Exception Handling (0x93-0x9F)
+    // =========================================================================
+    /// Raise exception with chained cause: raise exc from cause.
+    /// Format: DstSrc (dst=exc_reg, src=cause_reg).
+    /// Sets exception.__cause__ = cause and __suppress_context__ = True.
+    RaiseFrom = 0x93,
+    /// Push current exception info to exc_info stack for finally preservation.
+    /// Used at finally block entry to preserve pending exception state.
+    PushExcInfo = 0x94,
+    /// Pop exception info from exc_info stack.
+    /// Restores exception state after finally block executes.
+    PopExcInfo = 0x95,
+    /// Check if there's a pending exception (for finally block logic).
+    /// dst = True if exception is pending, False otherwise.
+    HasExcInfo = 0x96,
 }
 
 impl Opcode {
@@ -504,6 +525,8 @@ impl Opcode {
             0x0B => Some(Opcode::EndFinally),
             0x0C => Some(Opcode::Yield),
             0x0D => Some(Opcode::YieldFrom),
+            0x0E => Some(Opcode::ExceptionMatch),
+            0x0F => Some(Opcode::LoadException),
 
             0x10 => Some(Opcode::LoadConst),
             0x11 => Some(Opcode::LoadNone),
@@ -602,6 +625,11 @@ impl Opcode {
             0x91 => Some(Opcode::ImportFrom),
             0x92 => Some(Opcode::ImportStar),
 
+            0x93 => Some(Opcode::RaiseFrom),
+            0x94 => Some(Opcode::PushExcInfo),
+            0x95 => Some(Opcode::PopExcInfo),
+            0x96 => Some(Opcode::HasExcInfo),
+
             _ => None,
         }
     }
@@ -620,7 +648,8 @@ impl Opcode {
             LoadNone | LoadTrue | LoadFalse => Dst,
 
             // Jump/return with source
-            Return | Raise | Yield | YieldFrom => DstSrc,
+            Return | Raise | Yield | YieldFrom | ExceptionMatch => DstSrc,
+            LoadException => Dst,
 
             // Jumps with 16-bit offset
             Jump => Imm16,
@@ -666,6 +695,11 @@ impl Opcode {
             // Import
             ImportName | ImportFrom => DstImm16,
             ImportStar => DstSrc,
+
+            // Extended exception handling
+            RaiseFrom => DstSrc,              // dst = exc_reg, src = cause_reg
+            PushExcInfo | PopExcInfo => NoOp, // No operands, operates on exception stack
+            HasExcInfo => Dst,                // dst = bool result
         }
     }
 }
