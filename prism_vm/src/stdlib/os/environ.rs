@@ -299,13 +299,13 @@ mod tests {
 
     #[test]
     fn test_environ_get_existing() {
-        // PATH is typically set on all systems
+        // Set a test variable we know exists
+        test_set_var("__TEST_GET_EXISTING__", "test_value");
         let env = Environ::new();
-        let path = env.get("PATH");
-        // PATH should exist on most systems, but don't fail if not
-        if std::env::var("PATH").is_ok() {
-            assert!(path.is_some());
-        }
+        let result = env.get("__TEST_GET_EXISTING__");
+        assert!(result.is_some());
+        assert_eq!(&*result.unwrap(), "test_value");
+        test_remove_var("__TEST_GET_EXISTING__");
     }
 
     #[test]
