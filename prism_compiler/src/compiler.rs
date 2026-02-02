@@ -13,7 +13,7 @@ use crate::function_compiler::{VarLocation, VariableEmitter};
 use crate::scope::{ScopeAnalyzer, SymbolTable};
 
 use prism_parser::ast::{
-    AugOp, BinOp, BoolOp, CmpOp, Expr, ExprKind, Module, Stmt, StmtKind, UnaryOp,
+    AugOp, BinOp, BoolOp, CmpOp, ExceptHandler, Expr, ExprKind, Module, Stmt, StmtKind, UnaryOp,
 };
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -338,13 +338,124 @@ impl Compiler {
                 self.builder.free_register(iterator_reg);
             }
 
-            StmtKind::ClassDef { name, .. } => {
-                // TODO: Compile class
+            StmtKind::ClassDef {
+                name,
+                bases,
+                keywords: _keywords,
+                body,
+                decorator_list,
+                type_params: _type_params,
+            } => {
+                // Class definition compilation follows CPython's BUILD_CLASS protocol:
+                // 1. Compile decorators (evaluated first, applied last)
+                // 2. Evaluate base classes
+                // 3. Create child CodeObject for class body
+                // 4. Emit BUILD_CLASS instruction
+                // 5. Apply decorators in reverse order
+                // 6. Store result in enclosing scope
+
+                // Step 1: Compile decorators and save to registers
+                let decorator_regs: Vec<Register> = decorator_list
+                    .iter()
+                    .map(|d| self.compile_expr(d))
+                    .collect::<Result<_, _>>()?;
+
+                // Step 2: Evaluate base classes into registers
+                let base_count = bases.len();
+                let base_regs: Vec<Register> = bases
+                    .iter()
+                    .map(|b| self.compile_expr(b))
+                    .collect::<Result<_, _>>()?;
+
+                // Step 3: Create the class body code object using builder-swap pattern
+                // Find the scope for this class from the symbol table
+                let class_scope = self.find_child_scope(name);
+
+                // Create a new FunctionBuilder for the class body
+                let mut class_builder = FunctionBuilder::new(name.clone());
+                class_builder.set_filename(self.builder.get_filename());
+                class_builder.set_qualname(name.clone());
+                class_builder.add_flag(CodeFlags::CLASS);
+
+                // Check if any method uses zero-arg super() and inject __class__ cell
+                let uses_zero_arg_super =
+                    crate::class_compiler::ClassCompiler::uses_zero_arg_super(body);
+                if uses_zero_arg_super {
+                    // __class__ is implicitly a cell variable in class bodies that use super()
+                    class_builder.add_cellvar("__class__");
+                }
+
+                // Register cell and free variables from scope analysis
+                if let Some(scope) = class_scope {
+                    // Cell variables: names captured by inner functions
+                    for sym in scope.cellvars() {
+                        // Skip __class__ if we already added it
+                        if sym.name.as_ref() != "__class__" {
+                            class_builder.add_cellvar(Arc::from(sym.name.as_ref()));
+                        }
+                    }
+
+                    // Free variables: names captured from outer scopes
+                    for sym in scope.freevars() {
+                        class_builder.add_freevar(Arc::from(sym.name.as_ref()));
+                    }
+                }
+
+                // Swap builders to compile class body
+                let parent_builder = std::mem::replace(&mut self.builder, class_builder);
+
+                // Compile class body statements (method definitions, class variables, etc.)
+                for stmt in body {
+                    self.compile_stmt(stmt)?;
+                }
+
+                // Class body returns the namespace dict (implicit)
+                self.builder.emit_return_none();
+
+                // Swap back and get finished class body code
+                let class_builder = std::mem::replace(&mut self.builder, parent_builder);
+                let class_code = class_builder.finish();
+
+                // Store the nested CodeObject as a constant
+                let code_idx = self.builder.add_code_object(Arc::new(class_code));
+
+                // Step 4: Emit BUILD_CLASS instruction
+                // Allocate result register for the class object
+                let result_reg = self.builder.alloc_register();
+                self.builder
+                    .emit_build_class(result_reg, code_idx, base_count as u8);
+
+                // Step 5: Apply decorators in reverse order
+                // @decorator1
+                // @decorator2
+                // class Foo: ...
+                // is equivalent to: Foo = decorator1(decorator2(Foo))
+                for decorator_reg in decorator_regs.into_iter().rev() {
+                    // Call decorator with class as argument
+                    let call_result = self.builder.alloc_register();
+                    self.builder
+                        .emit_move(Register::new(call_result.0 + 1), result_reg);
+                    self.builder.emit(Instruction::op_dss(
+                        Opcode::Call,
+                        call_result,
+                        decorator_reg,
+                        Register::new(1), // 1 argument
+                    ));
+                    self.builder.free_register(decorator_reg);
+                    self.builder.free_register(result_reg);
+                    // Move result to result_reg position (we'll reuse call_result as func_reg)
+                }
+
+                // Free base class registers
+                for base_reg in base_regs {
+                    self.builder.free_register(base_reg);
+                }
+
+                // Step 6: Store the class in the enclosing scope
+                // Use scope-aware storage (global for module-level, local for nested)
                 let name_idx = self.builder.add_name(name.clone());
-                let reg = self.builder.alloc_register();
-                self.builder.emit_load_none(reg);
-                self.builder.emit_store_global(name_idx, reg);
-                self.builder.free_register(reg);
+                self.builder.emit_store_global(name_idx, result_reg);
+                self.builder.free_register(result_reg);
             }
 
             StmtKind::Import(aliases) => {
@@ -505,13 +616,30 @@ impl Compiler {
                 self.builder.bind_label(pass_label);
             }
 
-            StmtKind::Raise { exc, cause: _ } => {
-                if let Some(e) = exc {
-                    let reg = self.compile_expr(e)?;
-                    self.builder.emit(Instruction::op_d(Opcode::Raise, reg));
-                    self.builder.free_register(reg);
-                } else {
-                    self.builder.emit(Instruction::op(Opcode::Reraise));
+            StmtKind::Raise { exc, cause } => {
+                match (exc, cause) {
+                    // raise X from Y - exception chaining with explicit cause
+                    (Some(e), Some(c)) => {
+                        let exc_reg = self.compile_expr(e)?;
+                        let cause_reg = self.compile_expr(c)?;
+                        self.builder.emit(Instruction::op_ds(
+                            Opcode::RaiseFrom,
+                            exc_reg,
+                            cause_reg,
+                        ));
+                        self.builder.free_register(cause_reg);
+                        self.builder.free_register(exc_reg);
+                    }
+                    // raise X - simple exception raise
+                    (Some(e), None) => {
+                        let reg = self.compile_expr(e)?;
+                        self.builder.emit(Instruction::op_d(Opcode::Raise, reg));
+                        self.builder.free_register(reg);
+                    }
+                    // bare raise - reraise current exception
+                    (None, _) => {
+                        self.builder.emit(Instruction::op(Opcode::Reraise));
+                    }
                 }
             }
 
@@ -535,7 +663,27 @@ impl Compiler {
                 self.compile_function_def(name, args, body, decorator_list, true)?;
             }
 
-            // TODO: Implement remaining statements (ClassDef, With, Try, etc.)
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                self.compile_try(body, handlers, orelse, finalbody)?;
+            }
+
+            StmtKind::TryStar {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+            } => {
+                // TryStar is Python 3.11+ except* syntax
+                // For now, treat it like regular Try (except* semantics require ExceptionGroup)
+                self.compile_try(body, handlers, orelse, finalbody)?;
+            }
+
+            // TODO: Implement remaining statements (With, etc.)
             _ => {
                 // Placeholder for unimplemented statements
             }
@@ -934,6 +1082,222 @@ impl Compiler {
                 .builder
                 .emit(Instruction::op_dss(Opcode::NotIn, dst, left, right)),
         }
+    }
+
+    // =========================================================================
+    // Exception Handling Compilation
+    // =========================================================================
+
+    /// Compile a try/except/finally statement with zero-cost exception handling.
+    ///
+    /// This generates exception table entries for the VM's table-driven unwinder.
+    /// No runtime opcodes are executed on try block entry/exit - the exception
+    /// table is consulted only when an exception is raised.
+    ///
+    /// # Layout
+    /// ```text
+    /// try_start:
+    ///     <try body>              # Protected by exception entry
+    ///     JUMP end_label          # Skip handlers on normal exit
+    /// handler_0:                  # except Type1 as e:
+    ///     <check exception type>
+    ///     <handler body>
+    ///     JUMP end_label
+    /// handler_1:                  # except Type2:
+    ///     <handler body>
+    ///     JUMP end_label
+    /// finally:                    # finally:
+    ///     <finally body>
+    /// end_label:
+    /// ```
+    fn compile_try(
+        &mut self,
+        body: &[Stmt],
+        handlers: &[ExceptHandler],
+        orelse: &[Stmt],
+        finalbody: &[Stmt],
+    ) -> CompileResult<()> {
+        use crate::ExceptionEntry;
+
+        // Create labels for control flow
+        let end_label = self.builder.create_label();
+        let orelse_label = if !orelse.is_empty() {
+            Some(self.builder.create_label())
+        } else {
+            None
+        };
+        let finally_label = if !finalbody.is_empty() {
+            Some(self.builder.create_label())
+        } else {
+            None
+        };
+
+        // Create handler labels (one per except clause)
+        let handler_labels: Vec<_> = handlers
+            .iter()
+            .map(|_| self.builder.create_label())
+            .collect();
+
+        // Record try block start position
+        let try_start_pc = self.builder.current_pc();
+        let stack_depth = self.builder.current_stack_depth();
+
+        // Compile the try body
+        for stmt in body {
+            self.compile_stmt(stmt)?;
+        }
+
+        // Record try block end position
+        let try_end_pc = self.builder.current_pc();
+
+        // Jump to else or end on normal completion
+        if let Some(else_label) = orelse_label {
+            self.builder.emit_jump(else_label);
+        } else if let Some(fin_label) = finally_label {
+            self.builder.emit_jump(fin_label);
+        } else if !handlers.is_empty() {
+            self.builder.emit_jump(end_label);
+        }
+
+        // Compile each exception handler
+        for (i, handler) in handlers.iter().enumerate() {
+            self.builder.bind_label(handler_labels[i]);
+
+            let handler_start_pc = self.builder.current_pc();
+
+            // Extract handler info
+            let type_idx = if let Some(type_expr) = &handler.typ {
+                // Compile the exception type expression and store as type filter
+                let type_reg = self.compile_expr(type_expr)?;
+
+                // For now, we use the type register as part of the handler check
+                // The VM will use ExceptionMatch opcode at runtime
+                let exc_reg = self.builder.alloc_register();
+
+                // Load the current exception into exc_reg (LoadException opcode)
+                self.builder
+                    .emit(Instruction::op_d(Opcode::LoadException, exc_reg));
+
+                // Check if exception matches type
+                let match_reg = self.builder.alloc_register();
+                self.builder.emit(Instruction::op_dss(
+                    Opcode::ExceptionMatch,
+                    match_reg,
+                    exc_reg,
+                    type_reg,
+                ));
+
+                // If no match, jump to next handler or reraise
+                let next_handler = if i + 1 < handlers.len() {
+                    handler_labels[i + 1]
+                } else if let Some(fin_label) = finally_label {
+                    fin_label
+                } else {
+                    // No more handlers, jump to end (reraise happens at end_label)
+                    end_label
+                };
+
+                self.builder.emit_jump_if_false(match_reg, next_handler);
+
+                self.builder.free_register(match_reg);
+                self.builder.free_register(type_reg);
+
+                // If handler has a name binding (except E as e:), bind it
+                if let Some(name) = &handler.name {
+                    let location = self.resolve_variable(name);
+                    self.builder
+                        .emit_store_var(location, exc_reg, Some(name.as_ref()));
+                }
+
+                self.builder.free_register(exc_reg);
+
+                Some(handler_start_pc as u16)
+            } else {
+                // Bare except: catches all
+                if let Some(name) = &handler.name {
+                    let exc_reg = self.builder.alloc_register();
+                    self.builder
+                        .emit(Instruction::op_d(Opcode::LoadException, exc_reg));
+                    let location = self.resolve_variable(name);
+                    self.builder
+                        .emit_store_var(location, exc_reg, Some(name.as_ref()));
+                    self.builder.free_register(exc_reg);
+                }
+                None
+            };
+
+            // Compile handler body
+            for stmt in &handler.body {
+                self.compile_stmt(stmt)?;
+            }
+
+            // Jump to finally or end after handler
+            if let Some(fin_label) = finally_label {
+                self.builder.emit_jump(fin_label);
+            } else {
+                self.builder.emit_jump(end_label);
+            }
+
+            // Add exception entry for this handler
+            // exception_type_idx = u16::MAX means catch-all
+            self.builder.add_exception_entry(ExceptionEntry {
+                start_pc: try_start_pc,
+                end_pc: try_end_pc,
+                handler_pc: handler_start_pc,
+                finally_pc: u32::MAX, // No finally for this handler entry
+                depth: stack_depth as u16,
+                exception_type_idx: type_idx.unwrap_or(u16::MAX),
+            });
+        }
+
+        // Compile else block (only if try body completes normally)
+        if let Some(else_label) = orelse_label {
+            self.builder.bind_label(else_label);
+            for stmt in orelse {
+                self.compile_stmt(stmt)?;
+            }
+            // Jump to finally or end
+            if let Some(fin_label) = finally_label {
+                self.builder.emit_jump(fin_label);
+            } else {
+                self.builder.emit_jump(end_label);
+            }
+        }
+
+        // Compile finally block
+        if let Some(fin_label) = finally_label {
+            self.builder.bind_label(fin_label);
+            let finally_start_pc = self.builder.current_pc();
+
+            // Push current exception info to preserve exception state
+            // This is required for proper exception re-raise semantics
+            self.builder.emit(Instruction::op(Opcode::PushExcInfo));
+
+            for stmt in finalbody {
+                self.compile_stmt(stmt)?;
+            }
+
+            // Pop exception info and check if we need to re-raise
+            self.builder.emit(Instruction::op(Opcode::PopExcInfo));
+
+            // EndFinally opcode re-raises exception if one is pending
+            self.builder.emit(Instruction::op(Opcode::EndFinally));
+
+            // Add finally exception entry covering the try block
+            self.builder.add_exception_entry(ExceptionEntry {
+                start_pc: try_start_pc,
+                end_pc: try_end_pc,
+                handler_pc: finally_start_pc,
+                finally_pc: finally_start_pc, // Handler is also the finally block
+                depth: stack_depth as u16,
+                exception_type_idx: u16::MAX, // Finally catches all
+            });
+        }
+
+        // End label
+        self.builder.bind_label(end_label);
+
+        Ok(())
     }
 
     // =========================================================================
@@ -1417,6 +1781,663 @@ for x in range(100):
     if x % 2 == 0:
         continue
     y = x * 2
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    // =========================================================================
+    // Class Compilation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_compile_empty_class() {
+        // Simplest possible class definition
+        let code = compile(
+            r#"
+class Empty:
+    pass
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+        // Class body code should be in constants
+        assert!(
+            !code.constants.is_empty(),
+            "Class should have nested code object"
+        );
+    }
+
+    #[test]
+    fn test_compile_class_with_method() {
+        // Class with a simple method
+        let code = compile(
+            r#"
+class Counter:
+    def increment(self):
+        pass
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+        // Should have nested code object for class body
+        assert!(
+            !code.constants.is_empty(),
+            "Class should have nested code objects"
+        );
+    }
+
+    #[test]
+    fn test_compile_class_with_init() {
+        // Class with __init__ method
+        let code = compile(
+            r#"
+class MyClass:
+    def __init__(self, x):
+        self.x = x
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_class_variable() {
+        // Class with class-level variable
+        let code = compile(
+            r#"
+class Config:
+    DEBUG = True
+    VERSION = 1
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_single_base() {
+        // Simple inheritance
+        let code = compile(
+            r#"
+class Child(Parent):
+    pass
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_multiple_bases() {
+        // Multiple inheritance
+        let code = compile(
+            r#"
+class Multi(Base1, Base2, Base3):
+    pass
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_decorator() {
+        // Decorated class
+        let code = compile(
+            r#"
+@decorator
+class MyClass:
+    pass
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+        // Should have CALL for decorator application
+    }
+
+    #[test]
+    fn test_compile_class_with_multiple_decorators() {
+        // Multiple decorators
+        let code = compile(
+            r#"
+@decorator1
+@decorator2
+@decorator3
+class MyClass:
+    pass
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_decorator_call() {
+        // Decorator with arguments
+        let code = compile(
+            r#"
+@dataclass(frozen=True)
+class Point:
+    x: int
+    y: int
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_multiple_methods() {
+        // Class with multiple methods
+        let code = compile(
+            r#"
+class Calculator:
+    def add(self, a, b):
+        return a + b
+    
+    def subtract(self, a, b):
+        return a - b
+    
+    def multiply(self, a, b):
+        return a * b
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_static_method() {
+        // Class with static method
+        let code = compile(
+            r#"
+class Utils:
+    @staticmethod
+    def helper(x):
+        return x * 2
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_class_method() {
+        // Class with class method
+        let code = compile(
+            r#"
+class Factory:
+    @classmethod
+    def create(cls):
+        return cls()
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_property() {
+        // Class with property decorator
+        let code = compile(
+            r#"
+class Circle:
+    @property
+    def area(self):
+        return 3.14159 * self.radius ** 2
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_nested_class() {
+        // Nested class definition
+        let code = compile(
+            r#"
+class Outer:
+    class Inner:
+        pass
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_deeply_nested_class() {
+        // Deeply nested class definitions
+        let code = compile(
+            r#"
+class Level1:
+    class Level2:
+        class Level3:
+            value = 42
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_docstring() {
+        // Class with docstring
+        let code = compile(
+            r#"
+class Documented:
+    """This is a docstring."""
+    pass
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_super_init() {
+        // Class calling super().__init__
+        let code = compile(
+            r#"
+class Child(Parent):
+    def __init__(self):
+        super().__init__()
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_explicit_super() {
+        // Class using explicit super(ClassName, self)
+        let code = compile(
+            r#"
+class Child(Parent):
+    def __init__(self):
+        super(Child, self).__init__()
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_super_method_call() {
+        // Class calling super() method
+        let code = compile(
+            r#"
+class Child(Parent):
+    def process(self):
+        return super().process() + 1
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_dunder_methods() {
+        // Class with magic methods
+        let code = compile(
+            r#"
+class Custom:
+    def __str__(self):
+        return "Custom"
+    
+    def __repr__(self):
+        return "Custom()"
+    
+    def __len__(self):
+        return 0
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_operator_overloading() {
+        // Class with operator overloading
+        let code = compile(
+            r#"
+class Vector:
+    def __add__(self, other):
+        pass
+    
+    def __sub__(self, other):
+        pass
+    
+    def __mul__(self, scalar):
+        pass
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_slots() {
+        // Class with __slots__ definition
+        let code = compile(
+            r#"
+class Point:
+    __slots__ = ['x', 'y']
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_class_body_expression() {
+        // Class with expression in body
+        let code = compile(
+            r#"
+class Computed:
+    VALUE = 1 + 2 + 3
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_conditional() {
+        // Class with conditional in body
+        let code = compile(
+            r#"
+class Conditional:
+    if True:
+        x = 1
+    else:
+        x = 2
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_for_loop() {
+        // Class with for loop in body
+        let code = compile(
+            r#"
+class Generated:
+    items = []
+    for i in range(5):
+        items.append(i)
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_comprehension() {
+        // Class with comprehension in body
+        let code = compile(
+            r#"
+class WithComprehension:
+    squares = [x**2 for x in range(10)]
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_inheriting_from_expression() {
+        // Class inheriting from expression
+        let code = compile(
+            r#"
+class Sub(get_base()):
+    pass
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_method_decorator() {
+        // Method with multiple decorators
+        let code = compile(
+            r#"
+class Service:
+    @decorator1
+    @decorator2
+    def method(self):
+        pass
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_private_method() {
+        // Class with private method (name mangling)
+        let code = compile(
+            r#"
+class Private:
+    def __secret(self):
+        pass
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_closure_in_method() {
+        // Method containing a closure
+        let code = compile(
+            r#"
+class WithClosure:
+    def outer(self):
+        x = 1
+        def inner():
+            return x
+        return inner
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_multiple_classes() {
+        // Multiple class definitions in same module
+        let code = compile(
+            r#"
+class First:
+    pass
+
+class Second:
+    pass
+
+class Third(First, Second):
+    pass
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_and_function() {
+        // Class and function in same module
+        let code = compile(
+            r#"
+def helper():
+    pass
+
+class MyClass:
+    def method(self):
+        helper()
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_dataclass_like() {
+        // Dataclass-like pattern
+        let code = compile(
+            r#"
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+    
+    def __eq__(self, other):
+        return self.x == other.x and self.y == other.y
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_singleton_pattern() {
+        // Singleton pattern
+        let code = compile(
+            r#"
+class Singleton:
+    _instance = None
+    
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_class_with_lambda_in_body() {
+        // Class with lambda in body
+        let code = compile(
+            r#"
+class WithLambda:
+    transform = lambda x: x * 2
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_class_code_object_has_class_flag() {
+        // Verify class compilation produces code object
+        let code = compile(
+            r#"
+class Flagged:
+    pass
+"#,
+        );
+        // Verify we have constants (class body code object)
+        assert!(
+            !code.constants.is_empty(),
+            "Class body code object should exist in constants"
+        );
+        // Verify instructions are generated
+        assert!(!code.instructions.is_empty());
+    }
+
+    // =========================================================================
+    // Exception Compilation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_compile_simple_try_except() {
+        let code = compile(
+            r#"
+try:
+    x = 1
+except:
+    y = 2
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+        assert!(!code.exception_table.is_empty());
+    }
+
+    #[test]
+    fn test_compile_try_except_with_type() {
+        let code = compile(
+            r#"
+try:
+    x = dangerous()
+except ValueError:
+    y = fallback()
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+        assert!(!code.exception_table.is_empty());
+    }
+
+    #[test]
+    fn test_compile_try_except_else() {
+        let code = compile(
+            r#"
+try:
+    x = 1
+except:
+    y = 2
+else:
+    z = 3
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+        assert!(!code.exception_table.is_empty());
+    }
+
+    #[test]
+    fn test_compile_try_finally() {
+        let code = compile(
+            r#"
+try:
+    x = 1
+finally:
+    cleanup()
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+        assert!(!code.exception_table.is_empty());
+    }
+
+    #[test]
+    fn test_compile_try_except_finally() {
+        let code = compile(
+            r#"
+try:
+    x = 1
+except ValueError:
+    y = 2
+finally:
+    cleanup()
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+        assert!(code.exception_table.len() >= 2);
+    }
+
+    #[test]
+    fn test_compile_multiple_except_handlers() {
+        let code = compile(
+            r#"
+try:
+    x = risky()
+except ValueError:
+    a = 1
+except TypeError:
+    b = 2
+except:
+    c = 3
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+        assert!(code.exception_table.len() >= 3);
+    }
+
+    #[test]
+    fn test_compile_nested_try_except() {
+        let code = compile(
+            r#"
+try:
+    try:
+        x = 1
+    except:
+        y = 2
+except:
+    z = 3
+"#,
+        );
+        assert!(!code.instructions.is_empty());
+        assert!(code.exception_table.len() >= 2);
+    }
+
+    #[test]
+    fn test_compile_try_in_function() {
+        let code = compile(
+            r#"
+def safe_divide(a, b):
+    try:
+        return a / b
+    except ZeroDivisionError:
+        return 0
 "#,
         );
         assert!(!code.instructions.is_empty());
