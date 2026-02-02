@@ -240,36 +240,126 @@ pub fn build_slice(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 }
 
 // =============================================================================
-// Import (Stubs)
+// Import Operations
 // =============================================================================
 
 /// ImportName: dst = import(name_idx)
+///
+/// Imports a module by name index and stores the module object in dst register.
+/// Uses the VM's ImportResolver for high-performance cached module lookup.
 #[inline(always)]
 pub fn import_name(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame();
+    let dst = inst.dst();
     let name_idx = inst.imm16();
-    let name = frame.get_name(name_idx).clone();
 
-    ControlFlow::Error(RuntimeError::new(
-        crate::error::RuntimeErrorKind::ImportError {
-            module: name,
-            message: "Import not yet implemented".into(),
-        },
-    ))
+    let frame = vm.current_frame();
+    let module_name = frame.get_name(name_idx).clone();
+
+    // Use the VM's import resolver to import the module
+    match vm.import_resolver.import_module(&module_name) {
+        Ok(module) => {
+            // Create a Value from the module
+            // For now, we'll store a placeholder - proper object representation TBD
+            // TODO: Convert Arc<ModuleObject> to Value with proper heap allocation
+            let module_ptr = std::sync::Arc::into_raw(module) as u64;
+            let value = Value::from_bits(module_ptr | 0x0004_0000_0000_0000); // Object tag
+            vm.current_frame_mut().set_reg(dst.0, value);
+            ControlFlow::Continue
+        }
+        Err(err) => ControlFlow::Error(RuntimeError::new(
+            crate::error::RuntimeErrorKind::ImportError {
+                module: module_name,
+                message: err.to_string().into(),
+            },
+        )),
+    }
 }
 
-/// ImportFrom: dst = from module import name
+/// ImportFrom: dst = from module import attr
+///
+/// Imports a specific attribute from a module object.
+/// Encoding: dst=destination, src=module register, imm8=attr name index
 #[inline(always)]
 pub fn import_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    // TODO: Implement import from
-    ControlFlow::Error(RuntimeError::internal("ImportFrom not yet implemented"))
+    let dst = inst.dst();
+    let module_reg_idx = inst.src1().0;
+    let attr_idx = inst.src2().0 as u16; // Using src2 position for 8-bit attr index
+
+    let frame = vm.current_frame();
+    let attr_name = frame.get_name(attr_idx).clone();
+    let module_value = frame.get_reg(module_reg_idx);
+
+    // Get the module from the value
+    // TODO: Proper object system integration
+    let module_ptr =
+        (module_value.to_bits() & 0x0000_FFFF_FFFF_FFFF) as *const crate::import::ModuleObject;
+
+    if module_ptr.is_null() {
+        return ControlFlow::Error(RuntimeError::new(
+            crate::error::RuntimeErrorKind::ImportError {
+                module: "<unknown>".into(),
+                message: "Cannot import from None".into(),
+            },
+        ));
+    }
+
+    // Safety: We trust the module pointer from a previous ImportName
+    let module = unsafe { &*module_ptr };
+
+    // Get the attribute from the module
+    match module.get_attr(&attr_name) {
+        Some(value) => {
+            vm.current_frame_mut().set_reg(dst.0, value);
+            ControlFlow::Continue
+        }
+        None => ControlFlow::Error(RuntimeError::new(
+            crate::error::RuntimeErrorKind::ImportError {
+                module: module.name().to_string().into(),
+                message: format!(
+                    "cannot import name '{}' from '{}'",
+                    attr_name,
+                    module.name()
+                )
+                .into(),
+            },
+        )),
+    }
 }
 
 /// ImportStar: from module import *
+///
+/// Imports all public names from a module into the current global scope.
+/// Encoding: dst=unused, src=module register
 #[inline(always)]
 pub fn import_star(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    // TODO: Implement import star
-    ControlFlow::Error(RuntimeError::internal("ImportStar not yet implemented"))
+    let module_reg_idx = inst.src1().0;
+
+    let frame = vm.current_frame();
+    let module_value = frame.get_reg(module_reg_idx);
+
+    // Get the module from the value
+    let module_ptr =
+        (module_value.to_bits() & 0x0000_FFFF_FFFF_FFFF) as *const crate::import::ModuleObject;
+
+    if module_ptr.is_null() {
+        return ControlFlow::Error(RuntimeError::new(
+            crate::error::RuntimeErrorKind::ImportError {
+                module: "<unknown>".into(),
+                message: "Cannot import * from None".into(),
+            },
+        ));
+    }
+
+    // Safety: We trust the module pointer from a previous ImportName
+    let module = unsafe { &*module_ptr };
+
+    // Get all public names from the module
+    // If __all__ is defined, use it; otherwise use all non-underscore names
+    for (name, value) in module.public_items() {
+        vm.globals.set((*name).into(), value);
+    }
+
+    ControlFlow::Continue
 }
 
 #[cfg(test)]
