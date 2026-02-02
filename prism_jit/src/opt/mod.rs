@@ -5,6 +5,8 @@
 //! - **GVN (Global Value Numbering)**: Eliminates redundant computations
 //! - **DCE (Dead Code Elimination)**: Removes unreachable nodes
 //! - **Simplify**: Algebraic simplifications and constant folding
+//! - **LICM (Loop Invariant Code Motion)**: Hoists loop-invariant code
+//! - **RCE (Range Check Elimination)**: Eliminates redundant bounds checks
 //!
 //! # Optimization Pipeline
 //!
@@ -23,6 +25,7 @@ pub mod inline;
 pub mod licm;
 pub mod loop_analyzer;
 pub mod pipeline;
+pub mod rce;
 pub mod simplify;
 
 // Re-export key types
@@ -31,6 +34,10 @@ pub use inline::{Inline, InlineConfig};
 pub use licm::Licm;
 pub use loop_analyzer::LoopInvariantAnalysis;
 pub use pipeline::{OptPipeline, PipelineConfig};
+pub use rce::{
+    InductionAnalysis, InductionDetector, InductionDirection, InductionInit, InductionStep,
+    InductionVariable, RangeCheckElimination,
+};
 
 use crate::ir::graph::Graph;
 
