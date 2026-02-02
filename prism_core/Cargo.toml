@@ -15,3 +15,9 @@ num-traits.workspace = true
 parking_lot.workspace = true
 
 [dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "small_int_cache"
+harness = false
+
