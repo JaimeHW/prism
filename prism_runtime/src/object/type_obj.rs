@@ -44,6 +44,9 @@ impl TypeId {
     pub const GENERATOR: Self = Self(21);
     pub const EXCEPTION: Self = Self(22);
     pub const BUILTIN_FUNCTION: Self = Self(23);
+    pub const SUPER: Self = Self(24);
+    pub const CELL: Self = Self(25);
+    pub const MODULE_OBJECT: Self = Self(26);
 
     /// First ID available for user-defined types.
     pub const FIRST_USER_TYPE: u32 = 256;
@@ -52,6 +55,12 @@ impl TypeId {
     #[inline]
     pub const fn raw(self) -> u32 {
         self.0
+    }
+
+    /// Create a TypeId from a raw value.
+    #[inline]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
     }
 
     /// Check if this is a built-in type.
@@ -87,6 +96,9 @@ impl TypeId {
             21 => "generator",
             22 => "BaseException",
             23 => "builtin_function",
+            24 => "super",
+            25 => "cell",
+            26 => "module",
             _ => "<unknown>",
         }
     }
@@ -248,6 +260,16 @@ pub struct TypeSlots {
     pub nb_invert: Option<UnarySlot>,
     pub nb_lshift: Option<BinarySlot>,
     pub nb_rshift: Option<BinarySlot>,
+}
+
+impl std::fmt::Debug for TypeSlots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypeSlots")
+            .field("tp_call", &self.tp_call.map(|_| "fn(...)"))
+            .field("tp_hash", &self.tp_hash.map(|_| "fn(...)"))
+            .field("tp_iter", &self.tp_iter.map(|_| "fn(...)"))
+            .finish_non_exhaustive()
+    }
 }
 
 // =============================================================================
