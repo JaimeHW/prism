@@ -6,6 +6,7 @@
 use crate::builtins::BuiltinRegistry;
 use crate::dispatch::{ControlFlow, get_handler};
 use crate::error::{RuntimeError, VmResult};
+use crate::exception::{ExceptionState, HandlerStack, InlineHandlerCache};
 use crate::frame::{Frame, MAX_RECURSION_DEPTH};
 use crate::globals::GlobalScope;
 use crate::ic_manager::ICManager;
@@ -48,6 +49,18 @@ pub struct VirtualMachine {
     jit: Option<JitContext>,
     /// Temporary storage for JIT return value when root frame executes via JIT.
     jit_return_value: Option<Value>,
+
+    // =========================================================================
+    // Exception Handling State
+    // =========================================================================
+    /// Exception state machine for tracking exception propagation phases.
+    exc_state: ExceptionState,
+    /// Runtime handler stack for active try/except/finally blocks.
+    handler_stack: HandlerStack,
+    /// Inline handler cache for fast handler lookup by PC.
+    handler_cache: InlineHandlerCache,
+    /// Currently active exception (if any) being propagated.
+    active_exception: Option<Value>,
 }
 
 impl VirtualMachine {
@@ -64,6 +77,10 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit: None,
             jit_return_value: None,
+            exc_state: ExceptionState::default(),
+            handler_stack: HandlerStack::new(),
+            handler_cache: InlineHandlerCache::new(),
+            active_exception: None,
         }
     }
 
@@ -80,6 +97,10 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit: Some(JitContext::with_defaults()),
             jit_return_value: None,
+            exc_state: ExceptionState::default(),
+            handler_stack: HandlerStack::new(),
+            handler_cache: InlineHandlerCache::new(),
+            active_exception: None,
         }
     }
 
@@ -101,6 +122,10 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit,
             jit_return_value: None,
+            exc_state: ExceptionState::default(),
+            handler_stack: HandlerStack::new(),
+            handler_cache: InlineHandlerCache::new(),
+            active_exception: None,
         }
     }
 
@@ -117,6 +142,10 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit: None,
             jit_return_value: None,
+            exc_state: ExceptionState::default(),
+            handler_stack: HandlerStack::new(),
+            handler_cache: InlineHandlerCache::new(),
+            active_exception: None,
         }
     }
 
@@ -187,6 +216,70 @@ impl VirtualMachine {
                         Some(result) => return Ok(result),
                         None => {} // Continue with caller frame
                     }
+                }
+
+                // =========================================================
+                // Exception Handling
+                // =========================================================
+                ControlFlow::Exception {
+                    type_id,
+                    handler_pc,
+                } => {
+                    // TODO: Implement full exception propagation
+                    // For now, return as runtime error
+                    return Err(RuntimeError::exception(
+                        type_id,
+                        format!(
+                            "Exception raised (type_id={}, handler_pc={})",
+                            type_id, handler_pc
+                        ),
+                    )
+                    .into());
+                }
+
+                ControlFlow::Reraise => {
+                    // TODO: Implement reraise from active exception
+                    return Err(RuntimeError::internal("Reraise not yet implemented").into());
+                }
+
+                ControlFlow::EnterHandler {
+                    handler_pc,
+                    stack_depth: _,
+                } => {
+                    // Jump to handler code
+                    let frame = &mut self.frames[self.current_frame_idx];
+                    frame.ip = handler_pc;
+                }
+
+                ControlFlow::EnterFinally {
+                    finally_pc,
+                    stack_depth: _,
+                    reraise: _,
+                } => {
+                    // Jump to finally block
+                    let frame = &mut self.frames[self.current_frame_idx];
+                    frame.ip = finally_pc;
+                }
+
+                ControlFlow::ExitHandler => {
+                    // Handler completed, resume normal execution
+                    // TODO: Pop handler from handler stack
+                }
+
+                // =========================================================
+                // Generator Protocol
+                // =========================================================
+                ControlFlow::Yield {
+                    value: _,
+                    resume_point: _,
+                } => {
+                    // TODO: Implement generator yield
+                    return Err(RuntimeError::internal("Generators not yet implemented").into());
+                }
+
+                ControlFlow::Resume { send_value: _ } => {
+                    // TODO: Implement generator resume
+                    return Err(RuntimeError::internal("Generators not yet implemented").into());
                 }
 
                 ControlFlow::Error(err) => {
@@ -352,6 +445,119 @@ impl VirtualMachine {
     pub fn clear_frames(&mut self) {
         self.frames.clear();
         self.current_frame_idx = 0;
+    }
+
+    // =========================================================================
+    // Exception Handling
+    // =========================================================================
+
+    /// Get the current frame's ID for exception handler tracking.
+    #[inline]
+    pub fn current_frame_id(&self) -> u32 {
+        self.current_frame_idx as u32
+    }
+
+    /// Set the active exception being propagated.
+    #[inline]
+    pub fn set_active_exception(&mut self, exc: Value) {
+        self.active_exception = Some(exc);
+        self.exc_state = ExceptionState::Propagating;
+    }
+
+    /// Get the active exception if any.
+    #[inline]
+    pub fn get_active_exception(&self) -> Option<&Value> {
+        self.active_exception.as_ref()
+    }
+
+    /// Check if there's an active exception.
+    #[inline]
+    pub fn has_active_exception(&self) -> bool {
+        self.active_exception.is_some()
+    }
+
+    /// Clear the active exception.
+    #[inline]
+    pub fn clear_active_exception(&mut self) {
+        self.active_exception = None;
+    }
+
+    /// Get the type ID of the active exception.
+    ///
+    /// Returns the exception type ID for fast matching, or None if no
+    /// active exception exists.
+    #[inline]
+    pub fn get_active_exception_type_id(&self) -> Option<u16> {
+        // TODO: Extract actual type ID from exception value
+        // For now, return a generic Exception type ID if exception exists
+        if self.active_exception.is_some() {
+            Some(4) // ExceptionTypeId::Exception
+        } else {
+            None
+        }
+    }
+
+    /// Push an exception handler onto the handler stack.
+    ///
+    /// Returns false if the stack is full.
+    #[inline]
+    pub fn push_exception_handler(&mut self, frame: crate::exception::HandlerFrame) -> bool {
+        self.handler_stack.push(frame)
+    }
+
+    /// Pop an exception handler from the handler stack.
+    #[inline]
+    pub fn pop_exception_handler(&mut self) -> Option<crate::exception::HandlerFrame> {
+        self.handler_stack.pop()
+    }
+
+    /// Check if we should reraise after a finally block.
+    #[inline]
+    pub fn should_reraise_after_finally(&self) -> bool {
+        // Check if we were propagating before entering finally
+        self.exc_state == ExceptionState::Finally && self.active_exception.is_some()
+    }
+
+    /// Clear the reraise flag after handling.
+    #[inline]
+    pub fn clear_reraise_flag(&mut self) {
+        // Transition state - exception will be preserved for reraise
+    }
+
+    /// Clear exception state (after successful handling).
+    #[inline]
+    pub fn clear_exception_state(&mut self) {
+        self.exc_state = ExceptionState::Normal;
+    }
+
+    /// Get the current exception state.
+    #[inline]
+    pub fn exception_state(&self) -> ExceptionState {
+        self.exc_state
+    }
+
+    /// Set the exception state directly.
+    #[inline]
+    pub fn set_exception_state(&mut self, state: ExceptionState) {
+        self.exc_state = state;
+    }
+
+    /// Cache a handler lookup result for fast path.
+    #[inline]
+    pub fn cache_handler(&mut self, pc: u32, handler_idx: u16) {
+        self.handler_cache.record(pc, handler_idx);
+    }
+
+    /// Look up a cached handler for a PC.
+    #[inline]
+    pub fn lookup_cached_handler(&mut self, pc: u32) -> Option<u16> {
+        self.handler_cache.try_get(pc)
+    }
+
+    /// Get the handler stack depth.
+    #[inline]
+    pub fn handler_stack_depth(&self) -> usize {
+        self.handler_stack.len()
     }
 }
 
