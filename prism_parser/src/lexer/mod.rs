@@ -469,11 +469,16 @@ impl<'src> Lexer<'src> {
         let mut temp_cursor = Cursor::new(text);
         let result = parse_string(&mut temp_cursor, prefix);
 
-        // Advance main cursor by how many bytes temp_cursor consumed (minus the quote we already consumed)
-        let consumed = temp_cursor.pos();
-        // Move cursor forward by consumed minus 1 (since we already bumped the first quote)
-        for _ in 1..consumed {
-            self.cursor.bump();
+        // Advance main cursor to match where temp_cursor ended
+        // We need to advance by bytes, not by character count
+        // temp_cursor.pos() gives us the byte position in the temp slice
+        // We've already consumed 1 character (the first quote), so we need
+        // to advance our cursor until it reaches token_start + temp_cursor.pos()
+        let target_pos = self.token_start + temp_cursor.pos();
+        while self.cursor.pos() < target_pos {
+            if self.cursor.bump().is_none() {
+                break;
+            }
         }
         result
     }

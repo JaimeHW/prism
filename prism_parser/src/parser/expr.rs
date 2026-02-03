@@ -550,8 +550,8 @@ impl ExprParser {
         // Parse first element
         let first = Self::parse(parser, Precedence::Lowest)?;
 
-        // Check for generator expression
-        if parser.check_keyword(KW::For) {
+        // Check for generator expression (supports both 'for' and 'async for')
+        if parser.check_keyword(KW::For) || parser.check_keyword(KW::Async) {
             let generators = Self::parse_comprehension_clauses(parser)?;
             parser.expect(TokenKind::RightParen, "expected ')'")?;
             return Ok(Expr::new(
@@ -601,8 +601,8 @@ impl ExprParser {
         // Parse first element
         let first = Self::parse(parser, Precedence::Lowest)?;
 
-        // Check for comprehension
-        if parser.check_keyword(KW::For) {
+        // Check for comprehension (supports both 'for' and 'async for')
+        if parser.check_keyword(KW::For) || parser.check_keyword(KW::Async) {
             let generators = Self::parse_comprehension_clauses(parser)?;
             parser.expect(TokenKind::RightBracket, "expected ']'")?;
             return Ok(Expr::new(
@@ -649,8 +649,8 @@ impl ExprParser {
         if !first_is_splat && parser.match_token(TokenKind::Colon) {
             let value = Self::parse(parser, Precedence::Lowest)?;
 
-            // Check for dict comprehension
-            if parser.check_keyword(KW::For) {
+            // Check for dict comprehension (supports both 'for' and 'async for')
+            if parser.check_keyword(KW::For) || parser.check_keyword(KW::Async) {
                 let generators = Self::parse_comprehension_clauses(parser)?;
                 parser.expect(TokenKind::RightBrace, "expected '}'")?;
                 return Ok(Expr::new(
@@ -718,8 +718,8 @@ impl ExprParser {
             ));
         }
 
-        // It's a set - check for set comprehension
-        if parser.check_keyword(KW::For) {
+        // It's a set - check for set comprehension (supports both 'for' and 'async for')
+        if parser.check_keyword(KW::For) || parser.check_keyword(KW::Async) {
             let generators = Self::parse_comprehension_clauses(parser)?;
             parser.expect(TokenKind::RightBrace, "expected '}'")?;
             return Ok(Expr::new(
@@ -753,8 +753,27 @@ impl ExprParser {
                 parser.expect_keyword(KW::For, "expected 'for' after 'async'")?;
             }
 
-            // Parse target at BitwiseOr to stop before 'in' (Comparison level)
-            let target = Self::parse(parser, Precedence::BitwiseOr)?;
+            // Parse target - need to handle tuple targets like `k, v`
+            // First parse at BitwiseOr to get the first element
+            let target_start = parser.start_span();
+            let first = Self::parse(parser, Precedence::BitwiseOr)?;
+
+            // Check for comma (tuple target like `for k, v in items`)
+            let target = if parser.match_token(TokenKind::Comma) {
+                let mut elements = vec![first];
+                // Parse remaining comma-separated targets until 'in' keyword
+                while !parser.check_keyword(KW::In) {
+                    elements.push(Self::parse(parser, Precedence::BitwiseOr)?);
+                    if !parser.match_token(TokenKind::Comma) {
+                        break;
+                    }
+                }
+                // Create tuple from elements
+                Expr::new(ExprKind::Tuple(elements), parser.span_from(target_start))
+            } else {
+                first
+            };
+
             parser.expect_keyword(KW::In, "expected 'in'")?;
             let iter = Self::parse(parser, Precedence::Or)?;
 
@@ -865,6 +884,34 @@ impl ExprParser {
                 else {
                     let expr = Self::parse(parser, Precedence::Lowest)?;
 
+                    // Check for generator expression as sole argument: sum(x for x in items)
+                    // This is a special Python syntax where parentheses around the genexp are optional
+                    // when the genexp is the only argument to the function call.
+                    if args.is_empty()
+                        && keywords.is_empty()
+                        && (parser.check_keyword(KW::For) || parser.check_keyword(KW::Async))
+                    {
+                        let generators = Self::parse_comprehension_clauses(parser)?;
+                        parser.expect(TokenKind::RightParen, "expected ')'")?;
+
+                        let genexp = Expr::new(
+                            ExprKind::GeneratorExp {
+                                elt: Box::new(expr),
+                                generators,
+                            },
+                            parser.span_from(arg_start),
+                        );
+
+                        return Ok(Expr::new(
+                            ExprKind::Call {
+                                func: Box::new(func),
+                                args: vec![genexp],
+                                keywords: vec![],
+                            },
+                            parser.span_from(start),
+                        ));
+                    }
+
                     // Check if this is a keyword argument
                     if parser.match_token(TokenKind::Equal) {
                         if let ExprKind::Name(name) = expr.kind {
@@ -924,7 +971,7 @@ impl ExprParser {
         ))
     }
 
-    /// Parse lambda parameters.
+    /// Parse lambda parameters (supports full Python syntax including *args, **kwargs).
     fn parse_lambda_params(parser: &mut Parser<'_>) -> PrismResult<Arguments> {
         let mut args = Arguments::default();
 
@@ -932,8 +979,61 @@ impl ExprParser {
             return Ok(args);
         }
 
+        // Track state for proper parameter ordering
+        let mut seen_star = false; // After bare * or *args
+        let mut seen_kwargs = false; // After **kwargs
+
         loop {
-            if let TokenKind::Ident(name) = &parser.current().kind {
+            // Check for **kwargs
+            if parser.match_token(TokenKind::DoubleStar) {
+                if seen_kwargs {
+                    return Err(parser.error_at_current("duplicate **kwargs"));
+                }
+                if let TokenKind::Ident(name) = &parser.current().kind {
+                    let arg_start = parser.start_span();
+                    let name = name.clone();
+                    parser.advance();
+                    args.kwarg = Some(crate::ast::Arg {
+                        arg: name,
+                        annotation: None,
+                        span: parser.span_from(arg_start),
+                    });
+                    seen_kwargs = true;
+                } else {
+                    return Err(parser.error_at_current("expected identifier after **"));
+                }
+            }
+            // Check for *args or bare *
+            else if parser.match_token(TokenKind::Star) {
+                if seen_star {
+                    return Err(parser.error_at_current("duplicate *"));
+                }
+                if seen_kwargs {
+                    return Err(parser.error_at_current("* cannot follow **kwargs"));
+                }
+                seen_star = true;
+
+                // Check if it's *args or bare *
+                if let TokenKind::Ident(name) = &parser.current().kind {
+                    let arg_start = parser.start_span();
+                    let name = name.clone();
+                    parser.advance();
+                    args.vararg = Some(crate::ast::Arg {
+                        arg: name,
+                        annotation: None,
+                        span: parser.span_from(arg_start),
+                    });
+                }
+                // else: bare * - just marks start of keyword-only params
+            }
+            // Check for positional-only marker /
+            else if parser.match_token(TokenKind::Slash) {
+                // Move all current args to posonlyargs
+                args.posonlyargs = std::mem::take(&mut args.args);
+                // Defaults stay as-is, they belong to posonlyargs now
+            }
+            // Regular parameter
+            else if let TokenKind::Ident(name) = &parser.current().kind {
                 let arg_start = parser.start_span();
                 let name = name.clone();
                 parser.advance();
@@ -947,19 +1047,30 @@ impl ExprParser {
                 // Check for default value
                 if parser.match_token(TokenKind::Equal) {
                     let default = Self::parse(parser, Precedence::Lowest)?;
-                    args.defaults.push(default);
-                    args.args.push(arg);
+                    if seen_star {
+                        args.kw_defaults.push(Some(default));
+                        args.kwonlyargs.push(arg);
+                    } else {
+                        args.defaults.push(default);
+                        args.args.push(arg);
+                    }
                 } else {
-                    args.args.push(arg);
-                }
-
-                if !parser.match_token(TokenKind::Comma) {
-                    break;
-                }
-                if parser.check(TokenKind::Colon) {
-                    break;
+                    if seen_star {
+                        args.kw_defaults.push(None);
+                        args.kwonlyargs.push(arg);
+                    } else {
+                        args.args.push(arg);
+                    }
                 }
             } else {
+                break;
+            }
+
+            // Continue if comma, stop at colon or end
+            if !parser.match_token(TokenKind::Comma) {
+                break;
+            }
+            if parser.check(TokenKind::Colon) {
                 break;
             }
         }
@@ -1159,6 +1270,172 @@ mod tests {
     fn test_lambda() {
         let expr = parse("lambda x: x + 1");
         assert!(matches!(expr.kind, ExprKind::Lambda { .. }));
+    }
+
+    #[test]
+    fn test_lambda_no_params() {
+        let expr = parse("lambda: 42");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert!(args.args.is_empty());
+            assert!(args.vararg.is_none());
+            assert!(args.kwarg.is_none());
+        } else {
+            panic!("expected Lambda");
+        }
+    }
+
+    #[test]
+    fn test_lambda_multiple_params() {
+        let expr = parse("lambda x, y, z: x + y + z");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert_eq!(args.args.len(), 3);
+        } else {
+            panic!("expected Lambda");
+        }
+    }
+
+    #[test]
+    fn test_lambda_with_defaults() {
+        let expr = parse("lambda x, y=10: x + y");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert_eq!(args.args.len(), 2);
+            assert_eq!(args.defaults.len(), 1);
+        } else {
+            panic!("expected Lambda");
+        }
+    }
+
+    #[test]
+    fn test_lambda_varargs() {
+        let expr = parse("lambda *args: args");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert!(args.vararg.is_some());
+            assert_eq!(args.vararg.as_ref().unwrap().arg.as_str(), "args");
+        } else {
+            panic!("expected Lambda");
+        }
+    }
+
+    #[test]
+    fn test_lambda_kwargs() {
+        let expr = parse("lambda **kwargs: kwargs");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert!(args.kwarg.is_some());
+            assert_eq!(args.kwarg.as_ref().unwrap().arg.as_str(), "kwargs");
+        } else {
+            panic!("expected Lambda");
+        }
+    }
+
+    #[test]
+    fn test_lambda_varargs_and_kwargs() {
+        let expr = parse("lambda *args, **kwargs: (args, kwargs)");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert!(args.vararg.is_some());
+            assert!(args.kwarg.is_some());
+        } else {
+            panic!("expected Lambda");
+        }
+    }
+
+    #[test]
+    fn test_lambda_positional_and_varargs() {
+        let expr = parse("lambda a, b, *args: (a, b, args)");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert_eq!(args.args.len(), 2);
+            assert!(args.vararg.is_some());
+        } else {
+            panic!("expected Lambda");
+        }
+    }
+
+    #[test]
+    fn test_lambda_keyword_only() {
+        let expr = parse("lambda *, key: key");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert!(args.vararg.is_none()); // bare *
+            assert_eq!(args.kwonlyargs.len(), 1);
+            assert_eq!(args.kwonlyargs[0].arg.as_str(), "key");
+        } else {
+            panic!("expected Lambda");
+        }
+    }
+
+    #[test]
+    fn test_lambda_keyword_only_with_default() {
+        let expr = parse("lambda *, a, b=10: a + b");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert_eq!(args.kwonlyargs.len(), 2);
+            assert_eq!(args.kw_defaults.len(), 2);
+            // First kwonly has no default (None), second has default (Some)
+            assert!(args.kw_defaults[0].is_none());
+            assert!(args.kw_defaults[1].is_some());
+        } else {
+            panic!("expected Lambda");
+        }
+    }
+
+    #[test]
+    fn test_lambda_varargs_and_keyword_only() {
+        let expr = parse("lambda *args, key: (args, key)");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert!(args.vararg.is_some());
+            assert_eq!(args.kwonlyargs.len(), 1);
+        } else {
+            panic!("expected Lambda");
+        }
+    }
+
+    #[test]
+    fn test_lambda_full_signature() {
+        let expr = parse("lambda a, b=1, *args, c, d=2, **kwargs: (a, b, args, c, d, kwargs)");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert_eq!(args.args.len(), 2); // a, b
+            assert_eq!(args.defaults.len(), 1); // b=1
+            assert!(args.vararg.is_some()); // *args
+            assert_eq!(args.kwonlyargs.len(), 2); // c, d
+            assert_eq!(args.kw_defaults.len(), 2); // c (None), d=2 (Some)
+            assert!(args.kwarg.is_some()); // **kwargs
+        } else {
+            panic!("expected Lambda");
+        }
+    }
+
+    #[test]
+    fn test_lambda_positional_only() {
+        let expr = parse("lambda a, b, /: a + b");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert_eq!(args.posonlyargs.len(), 2);
+            assert!(args.args.is_empty());
+        } else {
+            panic!("expected Lambda");
+        }
+    }
+
+    #[test]
+    fn test_lambda_positional_only_and_regular() {
+        let expr = parse("lambda a, /, b: a + b");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert_eq!(args.posonlyargs.len(), 1);
+            assert_eq!(args.args.len(), 1);
+        } else {
+            panic!("expected Lambda");
+        }
+    }
+
+    #[test]
+    fn test_lambda_complete_signature() {
+        // pos_only, /, regular, *args, kw_only, **kwargs
+        let expr = parse("lambda a, /, b, *args, c, **kw: 0");
+        if let ExprKind::Lambda { args, .. } = expr.kind {
+            assert_eq!(args.posonlyargs.len(), 1); // a
+            assert_eq!(args.args.len(), 1); // b
+            assert!(args.vararg.is_some()); // *args
+            assert_eq!(args.kwonlyargs.len(), 1); // c
+            assert!(args.kwarg.is_some()); // **kw
+        } else {
+            panic!("expected Lambda");
+        }
     }
 
     #[test]

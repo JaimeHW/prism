@@ -81,7 +81,28 @@ impl StmtParser {
 
     /// Parse an expression statement (possibly assignment).
     fn parse_expression_statement(parser: &mut Parser<'_>, start: u32) -> PrismResult<Stmt> {
+        let first_start = parser.start_span();
         let first = ExprParser::parse(parser, Precedence::Lowest)?;
+
+        // Handle tuple targets: a, b = value
+        // After parsing first expression, check if we have a comma (tuple target)
+        let first = if parser.match_token(TokenKind::Comma) {
+            let mut elements = vec![first];
+            // Parse remaining comma-separated expressions until '=' or newline
+            while !parser.check(TokenKind::Equal)
+                && !parser.check(TokenKind::Newline)
+                && !parser.check(TokenKind::Eof)
+            {
+                elements.push(ExprParser::parse(parser, Precedence::Lowest)?);
+                if !parser.match_token(TokenKind::Comma) {
+                    break;
+                }
+            }
+            // Create tuple from collected elements
+            Expr::new(ExprKind::Tuple(elements), parser.span_from(first_start))
+        } else {
+            first
+        };
 
         // Check for assignment
         if parser.match_token(TokenKind::Equal) {
@@ -515,8 +536,27 @@ impl StmtParser {
     fn parse_for(parser: &mut Parser<'_>, start: u32, is_async: bool) -> PrismResult<Stmt> {
         parser.advance(); // consume 'for'
 
-        // Use BitwiseOr precedence to stop before 'in' (which is at Comparison level)
-        let target = ExprParser::parse(parser, Precedence::BitwiseOr)?;
+        // Parse target - need to handle tuple targets like `k, v`
+        // First parse at BitwiseOr to get the first element
+        let target_start = parser.start_span();
+        let first = ExprParser::parse(parser, Precedence::BitwiseOr)?;
+
+        // Check for comma (tuple target like `for k, v in items`)
+        let target = if parser.match_token(TokenKind::Comma) {
+            let mut elements = vec![first];
+            // Parse remaining comma-separated targets until 'in' keyword
+            while !parser.check_keyword(KW::In) {
+                elements.push(ExprParser::parse(parser, Precedence::BitwiseOr)?);
+                if !parser.match_token(TokenKind::Comma) {
+                    break;
+                }
+            }
+            // Create tuple from elements
+            Expr::new(ExprKind::Tuple(elements), parser.span_from(target_start))
+        } else {
+            first
+        };
+
         parser.expect_keyword(KW::In, "expected 'in'")?;
         let iter = ExprParser::parse(parser, Precedence::Lowest)?;
         parser.expect(TokenKind::Colon, "expected ':'")?;
@@ -932,7 +972,16 @@ impl StmtParser {
                 None
             };
             parser.expect(TokenKind::Colon, "expected ':'")?;
-            let body = Self::parse_block(parser)?;
+
+            // Support both single-line (case 1: x = 1) and block bodies
+            let body = if parser.check(TokenKind::Newline) {
+                Self::parse_block(parser)?
+            } else {
+                // Single-line body: parse a simple statement
+                let start = parser.start_span();
+                let stmt = Self::parse_simple_statement(parser, start)?;
+                vec![stmt]
+            };
             cases.push(MatchCase {
                 pattern,
                 guard,
@@ -1008,15 +1057,75 @@ impl StmtParser {
                 })
             }
 
-            // Capture or value pattern
+            // Capture, class, or value pattern
             TokenKind::Ident(name) => {
                 parser.advance();
 
-                // Check for dotted name (value pattern)
-                if parser.check(TokenKind::Dot) {
+                // Check for class pattern: Name(...)
+                if parser.check(TokenKind::LeftParen) {
+                    // Build the class expression (may be dotted like module.Class)
+                    let mut cls_expr = Expr::new(ExprKind::Name(name), parser.span_from(start));
+
+                    // Handle dotted names: module.Class(...)
+                    while parser.check(TokenKind::Dot) {
+                        parser.advance();
+                        let attr = parser.expect_identifier("expected attribute")?;
+                        cls_expr = Expr::new(
+                            ExprKind::Attribute {
+                                value: Box::new(cls_expr),
+                                attr,
+                            },
+                            parser.span_from(start),
+                        );
+                    }
+
+                    // Now parse the class pattern arguments
+                    parser.expect(TokenKind::LeftParen, "expected '('")?;
+                    let (patterns, kwd_attrs, kwd_patterns) =
+                        Self::parse_class_pattern_args(parser)?;
+                    parser.expect(TokenKind::RightParen, "expected ')'")?;
+
+                    Ok(Pattern {
+                        kind: PatternKind::MatchClass {
+                            cls: Box::new(cls_expr),
+                            patterns,
+                            kwd_attrs,
+                            kwd_patterns,
+                        },
+                        span: parser.span_from(start),
+                    })
+                }
+                // Check for dotted name (value pattern like module.constant)
+                else if parser.check(TokenKind::Dot) {
                     let mut expr = Expr::new(ExprKind::Name(name), parser.span_from(start));
                     while parser.match_token(TokenKind::Dot) {
                         let attr = parser.expect_identifier("expected attribute")?;
+                        // After getting dotted name, check if followed by ( for class pattern
+                        if parser.check(TokenKind::LeftParen) {
+                            // It's actually a class pattern like module.Class(...)
+                            expr = Expr::new(
+                                ExprKind::Attribute {
+                                    value: Box::new(expr),
+                                    attr,
+                                },
+                                parser.span_from(start),
+                            );
+
+                            parser.expect(TokenKind::LeftParen, "expected '('")?;
+                            let (patterns, kwd_attrs, kwd_patterns) =
+                                Self::parse_class_pattern_args(parser)?;
+                            parser.expect(TokenKind::RightParen, "expected ')'")?;
+
+                            return Ok(Pattern {
+                                kind: PatternKind::MatchClass {
+                                    cls: Box::new(expr),
+                                    patterns,
+                                    kwd_attrs,
+                                    kwd_patterns,
+                                },
+                                span: parser.span_from(start),
+                            });
+                        }
                         expr = Expr::new(
                             ExprKind::Attribute {
                                 value: Box::new(expr),
@@ -1047,6 +1156,16 @@ impl StmtParser {
                 Ok(Pattern {
                     kind: PatternKind::MatchValue(Box::new(Expr::new(
                         ExprKind::Int(n),
+                        parser.span_from(start),
+                    ))),
+                    span: parser.span_from(start),
+                })
+            }
+            TokenKind::Float(f) => {
+                parser.advance();
+                Ok(Pattern {
+                    kind: PatternKind::MatchValue(Box::new(Expr::new(
+                        ExprKind::Float(f),
                         parser.span_from(start),
                     ))),
                     span: parser.span_from(start),
@@ -1134,6 +1253,45 @@ impl StmtParser {
                     span: parser.span_from(start),
                 })
             }
+            // Negative number literals
+            TokenKind::Minus => {
+                parser.advance();
+                match &parser.current().kind {
+                    TokenKind::Int(n) => {
+                        let n = *n;
+                        parser.advance();
+                        // Create unary minus expression for negative integer
+                        let inner = Expr::new(ExprKind::Int(n), parser.span_from(start));
+                        Ok(Pattern {
+                            kind: PatternKind::MatchValue(Box::new(Expr::new(
+                                ExprKind::UnaryOp {
+                                    op: crate::ast::UnaryOp::USub,
+                                    operand: Box::new(inner),
+                                },
+                                parser.span_from(start),
+                            ))),
+                            span: parser.span_from(start),
+                        })
+                    }
+                    TokenKind::Float(f) => {
+                        let f = *f;
+                        parser.advance();
+                        // Create unary minus expression for negative float
+                        let inner = Expr::new(ExprKind::Float(f), parser.span_from(start));
+                        Ok(Pattern {
+                            kind: PatternKind::MatchValue(Box::new(Expr::new(
+                                ExprKind::UnaryOp {
+                                    op: crate::ast::UnaryOp::USub,
+                                    operand: Box::new(inner),
+                                },
+                                parser.span_from(start),
+                            ))),
+                            span: parser.span_from(start),
+                        })
+                    }
+                    _ => Err(parser.error_at_current("expected number after '-' in pattern")),
+                }
+            }
 
             _ => Err(parser.error_at_current("expected pattern")),
         }
@@ -1182,6 +1340,54 @@ impl StmtParser {
         }
 
         Ok((keys, patterns, rest))
+    }
+    /// Parse class pattern arguments: positional and keyword patterns.
+    /// Returns (positional_patterns, keyword_attr_names, keyword_patterns)
+    fn parse_class_pattern_args(
+        parser: &mut Parser<'_>,
+    ) -> PrismResult<(Vec<Pattern>, Vec<String>, Vec<Pattern>)> {
+        let mut patterns = Vec::new();
+        let mut kwd_attrs = Vec::new();
+        let mut kwd_patterns = Vec::new();
+        let mut seen_keyword = false;
+
+        while !parser.check(TokenKind::RightParen) {
+            // Check if this is potentially a keyword argument
+            // We can tell by checking if current token is identifier followed by =
+            // Try to parse as pattern first, then check for keyword format
+            let pattern = Self::parse_pattern(parser)?;
+
+            // Check if it was a capture pattern followed by = (making it a keyword arg)
+            if parser.check(TokenKind::Equal) {
+                // This pattern should be a capture (name) that becomes a keyword attr
+                if let PatternKind::MatchAs {
+                    pattern: None,
+                    name: Some(attr_name),
+                } = pattern.kind
+                {
+                    parser.advance(); // consume =
+                    let value_pattern = Self::parse_pattern(parser)?;
+                    kwd_attrs.push(attr_name);
+                    kwd_patterns.push(value_pattern);
+                    seen_keyword = true;
+                } else {
+                    return Err(parser.error_at_current("keyword argument name must be identifier"));
+                }
+            } else {
+                // It's a positional pattern
+                if seen_keyword {
+                    return Err(parser
+                        .error_at_current("positional patterns may not follow keyword patterns"));
+                }
+                patterns.push(pattern);
+            }
+
+            if !parser.match_token(TokenKind::Comma) {
+                break;
+            }
+        }
+
+        Ok((patterns, kwd_attrs, kwd_patterns))
     }
 
     /// Parse a decorated definition.
