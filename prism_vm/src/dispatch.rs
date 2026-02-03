@@ -127,8 +127,12 @@ use crate::ops::class;
 use crate::ops::comparison;
 use crate::ops::containers;
 use crate::ops::control;
+use crate::ops::coroutine;
 use crate::ops::load_store;
+use crate::ops::r#match;
+use crate::ops::method_dispatch;
 use crate::ops::objects;
+use crate::ops::unpack;
 
 /// Build the static dispatch table.
 /// Returns array of 256 function pointers indexed by opcode.
@@ -229,15 +233,20 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::ForIter as usize] = objects::for_iter;
     table[Opcode::Len as usize] = objects::len;
     table[Opcode::IsCallable as usize] = objects::is_callable;
+    table[Opcode::LoadMethod as usize] = method_dispatch::load_method;
     table[Opcode::BuildClass as usize] = class::build_class;
 
     // Function Calls (0x70-0x7F)
     table[Opcode::Call as usize] = calls::call;
     table[Opcode::CallKw as usize] = calls::call_kw;
-    table[Opcode::CallMethod as usize] = calls::call_method;
+    table[Opcode::CallMethod as usize] = method_dispatch::call_method;
     table[Opcode::TailCall as usize] = calls::tail_call;
     table[Opcode::MakeFunction as usize] = calls::make_function;
     table[Opcode::MakeClosure as usize] = calls::make_closure;
+    table[Opcode::CallKwEx as usize] = calls::call_kw_ex;
+    table[Opcode::CallEx as usize] = unpack::call_ex;
+    table[Opcode::BuildTupleUnpack as usize] = unpack::build_tuple_unpack;
+    table[Opcode::BuildDictUnpack as usize] = unpack::build_dict_unpack;
 
     // Container Operations (0x80-0x8F)
     table[Opcode::BuildList as usize] = containers::build_list;
@@ -256,6 +265,21 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::ImportName as usize] = containers::import_name;
     table[Opcode::ImportFrom as usize] = containers::import_from;
     table[Opcode::ImportStar as usize] = containers::import_star;
+
+    // Pattern Matching (0x9A-0x9F)
+    table[Opcode::MatchClass as usize] = r#match::match_class;
+    table[Opcode::MatchMapping as usize] = r#match::match_mapping;
+    table[Opcode::MatchSequence as usize] = r#match::match_sequence;
+    table[Opcode::MatchKeys as usize] = r#match::match_keys;
+    table[Opcode::CopyDictWithoutKeys as usize] = r#match::copy_dict_without_keys;
+    table[Opcode::GetMatchArgs as usize] = r#match::get_match_args;
+
+    // Coroutine/Async Operations (0xA0-0xAF)
+    table[Opcode::GetAwaitable as usize] = coroutine::get_awaitable;
+    table[Opcode::GetAIter as usize] = coroutine::get_aiter;
+    table[Opcode::GetANext as usize] = coroutine::get_anext;
+    table[Opcode::EndAsyncFor as usize] = coroutine::end_async_for;
+    table[Opcode::Send as usize] = coroutine::send;
 
     table
 }
