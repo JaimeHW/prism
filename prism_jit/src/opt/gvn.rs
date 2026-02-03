@@ -74,7 +74,11 @@ impl Gvn {
             | Operator::ConstNone => true,
 
             // Pure arithmetic operations
-            Operator::IntOp(_) | Operator::FloatOp(_) | Operator::GenericOp(_) => true,
+            Operator::IntOp(_)
+            | Operator::FloatOp(_)
+            | Operator::GenericOp(_)
+            | Operator::MulHigh
+            | Operator::MulHighSigned => true,
 
             // Pure comparisons
             Operator::IntCmp(_) | Operator::FloatCmp(_) | Operator::GenericCmp(_) => true,

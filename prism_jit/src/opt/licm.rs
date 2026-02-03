@@ -31,11 +31,11 @@
 //!   if (i < n) goto loop
 //! ```
 
-use super::OptimizationPass;
 use super::loop_analyzer::LoopInvariantAnalysis;
+use super::OptimizationPass;
 use crate::ir::cfg::{BlockId, Cfg, DominatorTree, LoopAnalysis};
 use crate::ir::graph::Graph;
-use crate::ir::node::NodeId;
+use crate::ir::node::{NodeFlags, NodeId};
 
 // =============================================================================
 // LICM Pass
@@ -189,24 +189,52 @@ impl Licm {
 
     /// Hoist a single node.
     ///
-    /// In Sea-of-Nodes, "hoisting" means re-scheduling the node to
-    /// execute in the preheader. Since control flow is implicit,
-    /// this is done by updating the node's control input.
-    fn hoist_node(&mut self, graph: &mut Graph, node_id: NodeId, header: BlockId) -> bool {
-        // In Sea-of-Nodes IR, we mark the node as hoisted by
-        // setting an annotation. The actual scheduling happens
-        // during code generation.
-        //
-        // For now, we just track that the node should be hoisted.
-        // A full implementation would update control dependencies.
-
+    /// In Sea-of-Nodes, "hoisting" means scheduling the node to execute
+    /// before the loop. This is done by:
+    ///
+    /// 1. Marking the node with LOOP_INVARIANT and HOISTED flags
+    /// 2. Removing the IN_LOOP flag if present
+    /// 3. The scheduler uses these flags to place the node in the preheader
+    ///
+    /// # Arguments
+    ///
+    /// * `graph` - The IR graph to modify
+    /// * `node_id` - The node to hoist
+    /// * `_header` - The loop header block (for future control input updates)
+    ///
+    /// # Returns
+    ///
+    /// `true` if the node was successfully hoisted, `false` otherwise
+    fn hoist_node(&mut self, graph: &mut Graph, node_id: NodeId, _header: BlockId) -> bool {
         // Verify node still exists and is valid
-        if graph.get(node_id).is_none() {
+        let node = match graph.get_mut(node_id) {
+            Some(n) => n,
+            None => return false,
+        };
+
+        // Skip if already hoisted
+        if node.flags.contains(NodeFlags::HOISTED) {
             return false;
         }
 
-        // Node is "hoisted" - in practice this means the scheduler
-        // should place it before the loop header
+        // Skip if pinned (cannot be moved)
+        if node.flags.contains(NodeFlags::PINNED) {
+            return false;
+        }
+
+        // Skip if dead
+        if node.flags.contains(NodeFlags::DEAD) {
+            return false;
+        }
+
+        // Mark as loop invariant and hoisted
+        // The scheduler will use these flags to place the node before the loop
+        node.flags.insert(NodeFlags::LOOP_INVARIANT);
+        node.flags.insert(NodeFlags::HOISTED);
+
+        // Remove IN_LOOP flag since node is now conceptually outside the loop
+        node.flags.remove(NodeFlags::IN_LOOP);
+
         true
     }
 }
@@ -330,5 +358,108 @@ mod tests {
         let stats = LicmStats::default();
         assert_eq!(stats.nodes_hoisted, 0);
         assert_eq!(stats.loops_analyzed, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // hoist_node Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_hoist_node_sets_flags() {
+        let mut builder = GraphBuilder::new(2, 2);
+        let p0 = builder.parameter(0).unwrap();
+        let p1 = builder.parameter(1).unwrap();
+        let sum = builder.int_add(p0, p1);
+        let mut graph = builder.finish();
+
+        // Initially no flags
+        assert!(!graph.node(sum).flags.contains(NodeFlags::LOOP_INVARIANT));
+        assert!(!graph.node(sum).flags.contains(NodeFlags::HOISTED));
+
+        let mut licm = Licm::new();
+        let header = BlockId::new(0);
+        let hoisted = licm.hoist_node(&mut graph, sum, header);
+
+        assert!(hoisted);
+        assert!(graph.node(sum).flags.contains(NodeFlags::LOOP_INVARIANT));
+        assert!(graph.node(sum).flags.contains(NodeFlags::HOISTED));
+    }
+
+    #[test]
+    fn test_hoist_node_removes_in_loop_flag() {
+        let mut builder = GraphBuilder::new(2, 2);
+        let p0 = builder.parameter(0).unwrap();
+        let p1 = builder.parameter(1).unwrap();
+        let sum = builder.int_add(p0, p1);
+        let mut graph = builder.finish();
+
+        // Simulate node being inside a loop
+        graph.node_mut(sum).flags.insert(NodeFlags::IN_LOOP);
+        assert!(graph.node(sum).flags.contains(NodeFlags::IN_LOOP));
+
+        let mut licm = Licm::new();
+        let header = BlockId::new(0);
+        let hoisted = licm.hoist_node(&mut graph, sum, header);
+
+        assert!(hoisted);
+        assert!(!graph.node(sum).flags.contains(NodeFlags::IN_LOOP));
+    }
+
+    #[test]
+    fn test_hoist_node_skips_already_hoisted() {
+        let mut builder = GraphBuilder::new(2, 2);
+        let p0 = builder.parameter(0).unwrap();
+        let p1 = builder.parameter(1).unwrap();
+        let sum = builder.int_add(p0, p1);
+        let mut graph = builder.finish();
+
+        // Mark as already hoisted
+        graph.node_mut(sum).flags.insert(NodeFlags::HOISTED);
+
+        let mut licm = Licm::new();
+        let header = BlockId::new(0);
+        let hoisted = licm.hoist_node(&mut graph, sum, header);
+
+        // Should return false since already hoisted
+        assert!(!hoisted);
+    }
+
+    #[test]
+    fn test_hoist_node_skips_pinned() {
+        let mut builder = GraphBuilder::new(2, 2);
+        let p0 = builder.parameter(0).unwrap();
+        let p1 = builder.parameter(1).unwrap();
+        let sum = builder.int_add(p0, p1);
+        let mut graph = builder.finish();
+
+        // Mark as pinned (cannot be moved)
+        graph.node_mut(sum).flags.insert(NodeFlags::PINNED);
+
+        let mut licm = Licm::new();
+        let header = BlockId::new(0);
+        let hoisted = licm.hoist_node(&mut graph, sum, header);
+
+        // Should return false since pinned
+        assert!(!hoisted);
+        assert!(!graph.node(sum).flags.contains(NodeFlags::HOISTED));
+    }
+
+    #[test]
+    fn test_hoist_node_skips_dead() {
+        let mut builder = GraphBuilder::new(2, 2);
+        let p0 = builder.parameter(0).unwrap();
+        let p1 = builder.parameter(1).unwrap();
+        let sum = builder.int_add(p0, p1);
+        let mut graph = builder.finish();
+
+        // Mark as dead
+        graph.node_mut(sum).flags.insert(NodeFlags::DEAD);
+
+        let mut licm = Licm::new();
+        let header = BlockId::new(0);
+        let hoisted = licm.hoist_node(&mut graph, sum, header);
+
+        // Should return false since dead
+        assert!(!hoisted);
     }
 }

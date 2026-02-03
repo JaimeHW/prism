@@ -78,6 +78,8 @@ impl Dce {
             | Operator::IntOp(_)
             | Operator::FloatOp(_)
             | Operator::GenericOp(_)
+            | Operator::MulHigh
+            | Operator::MulHighSigned
             | Operator::IntCmp(_)
             | Operator::FloatCmp(_)
             | Operator::GenericCmp(_)
