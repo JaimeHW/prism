@@ -315,8 +315,6 @@ impl FunctionBuilder {
     /// Free a register for reuse.
     #[inline]
     pub fn free_register(&mut self, reg: Register) {
-        // Only track if it was the most recently allocated
-        // This is a simple strategy; could be improved with more sophisticated tracking
         self.free_registers.push(reg);
     }
 
@@ -325,6 +323,52 @@ impl FunctionBuilder {
         for _ in 0..count {
             self.alloc_register();
         }
+    }
+
+    /// Allocate a contiguous block of registers for function calls.
+    ///
+    /// This reserves `count` consecutive registers starting from a fresh base register
+    /// (never from the free list) to avoid clobbering live registers.
+    ///
+    /// Call instructions use consecutive registers: [result, arg0, arg1, ...]
+    /// This method ensures all those registers are properly reserved.
+    ///
+    /// # Returns
+    /// The base register of the block. Registers [base..base+count) are reserved.
+    #[inline]
+    pub fn alloc_register_block(&mut self, count: u8) -> Register {
+        // Allocate from `next_register` to guarantee contiguity
+        // Do NOT reuse freed registers, as they may be scattered
+        let base = Register(self.next_register);
+        self.next_register = self
+            .next_register
+            .checked_add(count)
+            .expect("register overflow");
+        self.max_registers = self.max_registers.max(self.next_register);
+        base
+    }
+
+    /// Free a contiguous block of registers (for cleanup after call).
+    #[inline]
+    pub fn free_register_block(&mut self, base: Register, count: u8) {
+        // Add all registers in the block to the free list
+        for i in 0..count {
+            self.free_registers.push(Register(base.0 + i));
+        }
+    }
+
+    /// Clear the free register list to prevent register reuse.
+    ///
+    /// This is used before compiling code that allocates a live register (like list_reg in comprehensions)
+    /// followed by inner code that uses Call instructions. Call uses consecutive registers
+    /// [dst, dst+1, ...], and if dst is reused from the free list at a low position,
+    /// dst+1 could clobber the live register.
+    ///
+    /// By clearing the free list, we force all subsequent allocations to use fresh registers
+    /// from `next_register`, which are guaranteed to be after any previously allocated live registers.
+    #[inline]
+    pub fn clear_free_registers(&mut self) {
+        self.free_registers.clear();
     }
 
     // =========================================================================
