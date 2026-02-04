@@ -40,14 +40,25 @@ pub struct InterferenceGraph {
     precolored: HashMap<VReg, PReg>,
     /// Degree of each node.
     degrees: HashMap<VReg, u32>,
-    /// Number of allocatable registers per class.
+    /// Number of allocatable GPR registers.
     k_gpr: u32,
+    /// Number of allocatable XMM registers (128-bit).
     k_xmm: u32,
+    /// Number of allocatable YMM registers (256-bit).
+    k_ymm: u32,
+    /// Number of allocatable ZMM registers (512-bit).
+    k_zmm: u32,
 }
 
 impl InterferenceGraph {
     /// Create a new empty interference graph.
-    pub fn new(k_gpr: u32, k_xmm: u32) -> Self {
+    ///
+    /// # Parameters
+    /// - `k_gpr`: Number of allocatable GPR registers
+    /// - `k_xmm`: Number of allocatable XMM registers (128-bit)
+    /// - `k_ymm`: Number of allocatable YMM registers (256-bit)
+    /// - `k_zmm`: Number of allocatable ZMM registers (512-bit)
+    pub fn new(k_gpr: u32, k_xmm: u32, k_ymm: u32, k_zmm: u32) -> Self {
         InterferenceGraph {
             adjacency: HashMap::new(),
             move_edges: Vec::new(),
@@ -55,12 +66,35 @@ impl InterferenceGraph {
             degrees: HashMap::new(),
             k_gpr,
             k_xmm,
+            k_ymm,
+            k_zmm,
         }
     }
 
+    /// Create a new interference graph with legacy 2-parameter API.
+    ///
+    /// Uses default values for YMM (16) and ZMM (32) counts.
+    #[inline]
+    pub fn new_legacy(k_gpr: u32, k_xmm: u32) -> Self {
+        Self::new(k_gpr, k_xmm, 16, 32)
+    }
+
     /// Build an interference graph from live intervals.
-    pub fn build(intervals: &[LiveInterval], k_gpr: u32, k_xmm: u32) -> Self {
-        let mut graph = InterferenceGraph::new(k_gpr, k_xmm);
+    ///
+    /// # Parameters
+    /// - `intervals`: Live intervals to build the graph from
+    /// - `k_gpr`: Number of allocatable GPR registers
+    /// - `k_xmm`: Number of allocatable XMM registers (128-bit)
+    /// - `k_ymm`: Number of allocatable YMM registers (256-bit)
+    /// - `k_zmm`: Number of allocatable ZMM registers (512-bit)
+    pub fn build(
+        intervals: &[LiveInterval],
+        k_gpr: u32,
+        k_xmm: u32,
+        k_ymm: u32,
+        k_zmm: u32,
+    ) -> Self {
+        let mut graph = InterferenceGraph::new(k_gpr, k_xmm, k_ymm, k_zmm);
 
         // Ensure all vregs have entries
         for interval in intervals {
@@ -73,6 +107,14 @@ impl InterferenceGraph {
         graph.build_with_sweep(intervals);
 
         graph
+    }
+
+    /// Build an interference graph using legacy 2-parameter API.
+    ///
+    /// Uses default values for YMM (16) and ZMM (32) counts.
+    #[inline]
+    pub fn build_legacy(intervals: &[LiveInterval], k_gpr: u32, k_xmm: u32) -> Self {
+        Self::build(intervals, k_gpr, k_xmm, 16, 32)
     }
 
     /// Build using sweep-line algorithm for O(n log n) performance.
@@ -226,8 +268,51 @@ impl InterferenceGraph {
     }
 
     /// Get the number of colors (registers) for a register class.
+    ///
+    /// Returns the number of allocatable registers based on register class:
+    /// - `RegClass::Int` / `RegClass::Any`: GPR count
+    /// - `RegClass::Float`: XMM count
+    /// - `RegClass::Vec256`: YMM count
+    /// - `RegClass::Vec512`: ZMM count
+    pub fn k_for_class(&self, reg_class: super::RegClass) -> u32 {
+        match reg_class {
+            super::RegClass::Int | super::RegClass::Any => self.k_gpr,
+            super::RegClass::Float => self.k_xmm,
+            super::RegClass::Vec256 => self.k_ymm,
+            super::RegClass::Vec512 => self.k_zmm,
+        }
+    }
+
+    /// Get the number of colors (registers) for float vs int.
+    ///
+    /// Legacy API - prefer `k_for_class()` for full vector support.
+    #[inline]
     pub fn k(&self, is_float: bool) -> u32 {
         if is_float { self.k_xmm } else { self.k_gpr }
+    }
+
+    /// Get the number of allocatable GPR registers.
+    #[inline]
+    pub fn k_gpr(&self) -> u32 {
+        self.k_gpr
+    }
+
+    /// Get the number of allocatable XMM registers.
+    #[inline]
+    pub fn k_xmm(&self) -> u32 {
+        self.k_xmm
+    }
+
+    /// Get the number of allocatable YMM registers.
+    #[inline]
+    pub fn k_ymm(&self) -> u32 {
+        self.k_ymm
+    }
+
+    /// Get the number of allocatable ZMM registers.
+    #[inline]
+    pub fn k_zmm(&self) -> u32 {
+        self.k_zmm
     }
 
     /// Get all move edges.
@@ -303,7 +388,7 @@ mod tests {
         // [0, 10) and [20, 30) don't overlap
         let intervals = vec![make_interval(0, 0, 10), make_interval(1, 20, 30)];
 
-        let graph = InterferenceGraph::build(&intervals, 14, 15);
+        let graph = InterferenceGraph::build_legacy(&intervals, 14, 15);
 
         assert!(!graph.interferes(VReg::new(0), VReg::new(1)));
     }
@@ -313,7 +398,7 @@ mod tests {
         // [0, 20) and [10, 30) overlap
         let intervals = vec![make_interval(0, 0, 20), make_interval(1, 10, 30)];
 
-        let graph = InterferenceGraph::build(&intervals, 14, 15);
+        let graph = InterferenceGraph::build_legacy(&intervals, 14, 15);
 
         assert!(graph.interferes(VReg::new(0), VReg::new(1)));
         assert!(graph.interferes(VReg::new(1), VReg::new(0)));
@@ -331,7 +416,7 @@ mod tests {
             make_interval(2, 25, 35),
         ];
 
-        let graph = InterferenceGraph::build(&intervals, 14, 15);
+        let graph = InterferenceGraph::build_legacy(&intervals, 14, 15);
 
         assert_eq!(graph.degree(VReg::new(0)), 2);
         assert_eq!(graph.degree(VReg::new(1)), 1);
@@ -346,7 +431,7 @@ mod tests {
             make_interval(2, 25, 35),
         ];
 
-        let mut graph = InterferenceGraph::build(&intervals, 14, 15);
+        let mut graph = InterferenceGraph::build_legacy(&intervals, 14, 15);
 
         // Coalesce v1 into v0
         graph.coalesce(VReg::new(0), VReg::new(1));
@@ -356,5 +441,117 @@ mod tests {
 
         // v0 should still interfere with v2
         assert!(graph.interferes(VReg::new(0), VReg::new(2)));
+    }
+
+    // =========================================================================
+    // Vector Register Class Tests
+    // =========================================================================
+
+    #[test]
+    fn test_vector_register_counts_full_api() {
+        // Test with explicit YMM and ZMM counts
+        let graph = InterferenceGraph::new(14, 16, 15, 31);
+
+        assert_eq!(graph.k_gpr(), 14);
+        assert_eq!(graph.k_xmm(), 16);
+        assert_eq!(graph.k_ymm(), 15);
+        assert_eq!(graph.k_zmm(), 31);
+    }
+
+    #[test]
+    fn test_vector_register_counts_legacy_api() {
+        // Legacy API should provide default YMM=16, ZMM=32
+        let graph = InterferenceGraph::new_legacy(14, 16);
+
+        assert_eq!(graph.k_gpr(), 14);
+        assert_eq!(graph.k_xmm(), 16);
+        assert_eq!(graph.k_ymm(), 16); // Default
+        assert_eq!(graph.k_zmm(), 32); // Default
+    }
+
+    #[test]
+    fn test_k_for_class_int() {
+        let graph = InterferenceGraph::new(14, 16, 15, 31);
+
+        assert_eq!(graph.k_for_class(RegClass::Int), 14);
+        assert_eq!(graph.k_for_class(RegClass::Any), 14);
+    }
+
+    #[test]
+    fn test_k_for_class_float() {
+        let graph = InterferenceGraph::new(14, 16, 15, 31);
+
+        assert_eq!(graph.k_for_class(RegClass::Float), 16);
+    }
+
+    #[test]
+    fn test_k_for_class_vec256() {
+        let graph = InterferenceGraph::new(14, 16, 15, 31);
+
+        assert_eq!(graph.k_for_class(RegClass::Vec256), 15);
+    }
+
+    #[test]
+    fn test_k_for_class_vec512() {
+        let graph = InterferenceGraph::new(14, 16, 15, 31);
+
+        assert_eq!(graph.k_for_class(RegClass::Vec512), 31);
+    }
+
+    #[test]
+    fn test_legacy_k_method_matches_k_for_class() {
+        let graph = InterferenceGraph::new(14, 16, 15, 31);
+
+        // Legacy k() method should match GPR/XMM
+        assert_eq!(graph.k(false), graph.k_for_class(RegClass::Int));
+        assert_eq!(graph.k(true), graph.k_for_class(RegClass::Float));
+    }
+
+    #[test]
+    fn test_build_with_vector_counts() {
+        let intervals = vec![make_interval(0, 0, 10)];
+
+        let graph = InterferenceGraph::build(&intervals, 13, 15, 14, 30);
+
+        assert_eq!(graph.k_gpr(), 13);
+        assert_eq!(graph.k_xmm(), 15);
+        assert_eq!(graph.k_ymm(), 14);
+        assert_eq!(graph.k_zmm(), 30);
+    }
+
+    #[test]
+    fn test_build_legacy_with_default_vector_counts() {
+        let intervals = vec![make_interval(0, 0, 10)];
+
+        let graph = InterferenceGraph::build_legacy(&intervals, 13, 15);
+
+        assert_eq!(graph.k_gpr(), 13);
+        assert_eq!(graph.k_xmm(), 15);
+        assert_eq!(graph.k_ymm(), 16); // Default
+        assert_eq!(graph.k_zmm(), 32); // Default
+    }
+
+    #[test]
+    fn test_all_register_classes_accessible() {
+        let graph = InterferenceGraph::new(14, 16, 15, 31);
+
+        // Verify all register classes return correct values
+        let test_cases = [
+            (RegClass::Int, 14),
+            (RegClass::Any, 14),
+            (RegClass::Float, 16),
+            (RegClass::Vec256, 15),
+            (RegClass::Vec512, 31),
+        ];
+
+        for (class, expected) in test_cases {
+            assert_eq!(
+                graph.k_for_class(class),
+                expected,
+                "k_for_class({:?}) should return {}",
+                class,
+                expected
+            );
+        }
     }
 }

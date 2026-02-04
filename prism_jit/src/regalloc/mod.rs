@@ -16,6 +16,7 @@
 //! - `linear_scan.rs`: Linear scan allocator
 //! - `graph_coloring.rs`: Chaitin-Briggs graph coloring allocator
 //! - `spill.rs`: Spill code generation
+//! - `constraint.rs`: Instruction-level operand constraints
 //!
 //! # Usage
 //!
@@ -24,6 +25,7 @@
 //! let result = allocator.allocate(&func)?;
 //! ```
 
+pub mod constraint;
 pub mod interference;
 pub mod interval;
 pub mod linear_scan;
@@ -31,10 +33,14 @@ pub mod liveness;
 pub mod spill;
 
 use crate::backend::x64::registers::{Gpr, GprSet, Xmm, XmmSet};
+use crate::backend::x64::simd::{Ymm, YmmSet, Zmm, ZmmSet};
 use crate::ir::node::NodeId;
 use std::collections::HashMap;
 
 // Re-export key types
+pub use constraint::{
+    ConstraintDatabase, InstructionConstraint, OperandConstraint, OperandDescriptor, OperandRole,
+};
 pub use interference::InterferenceGraph;
 pub use interval::{LiveInterval, LiveRange};
 pub use linear_scan::LinearScanAllocator;
@@ -82,10 +88,14 @@ impl std::fmt::Display for VReg {
 /// A physical machine register.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PReg {
-    /// General-purpose register.
+    /// General-purpose register (64-bit).
     Gpr(Gpr),
-    /// XMM floating-point register.
+    /// XMM register (128-bit SSE/AVX scalar).
     Xmm(Xmm),
+    /// YMM register (256-bit AVX/AVX2 vector).
+    Ymm(Ymm),
+    /// ZMM register (512-bit AVX-512 vector).
+    Zmm(Zmm),
 }
 
 impl PReg {
@@ -94,7 +104,7 @@ impl PReg {
     pub fn as_gpr(self) -> Option<Gpr> {
         match self {
             PReg::Gpr(g) => Some(g),
-            PReg::Xmm(_) => None,
+            _ => None,
         }
     }
 
@@ -102,8 +112,60 @@ impl PReg {
     #[inline]
     pub fn as_xmm(self) -> Option<Xmm> {
         match self {
-            PReg::Gpr(_) => None,
             PReg::Xmm(x) => Some(x),
+            _ => None,
+        }
+    }
+
+    /// Get the YMM register if this is a YMM.
+    #[inline]
+    pub fn as_ymm(self) -> Option<Ymm> {
+        match self {
+            PReg::Ymm(y) => Some(y),
+            _ => None,
+        }
+    }
+
+    /// Get the ZMM register if this is a ZMM.
+    #[inline]
+    pub fn as_zmm(self) -> Option<Zmm> {
+        match self {
+            PReg::Zmm(z) => Some(z),
+            _ => None,
+        }
+    }
+
+    /// Get the register width in bits.
+    #[inline]
+    pub fn width(self) -> u16 {
+        match self {
+            PReg::Gpr(_) => 64,
+            PReg::Xmm(_) => 128,
+            PReg::Ymm(_) => 256,
+            PReg::Zmm(_) => 512,
+        }
+    }
+
+    /// Check if this is a vector register (XMM, YMM, or ZMM).
+    #[inline]
+    pub fn is_vector(self) -> bool {
+        !matches!(self, PReg::Gpr(_))
+    }
+
+    /// Check if this is a SIMD register (YMM or ZMM, not scalar XMM).
+    #[inline]
+    pub fn is_wide_vector(self) -> bool {
+        matches!(self, PReg::Ymm(_) | PReg::Zmm(_))
+    }
+
+    /// Get the hardware encoding (0-15 for GPR/XMM/YMM, 0-31 for ZMM).
+    #[inline]
+    pub fn encoding(self) -> u8 {
+        match self {
+            PReg::Gpr(g) => g.encoding(),
+            PReg::Xmm(x) => x.encoding(),
+            PReg::Ymm(y) => y.encoding(),
+            PReg::Zmm(z) => z.encoding(),
         }
     }
 }
@@ -113,6 +175,8 @@ impl std::fmt::Display for PReg {
         match self {
             PReg::Gpr(g) => write!(f, "{}", g),
             PReg::Xmm(x) => write!(f, "{}", x),
+            PReg::Ymm(y) => write!(f, "{}", y),
+            PReg::Zmm(z) => write!(f, "{}", z),
         }
     }
 }
@@ -124,22 +188,60 @@ impl std::fmt::Display for PReg {
 /// Register class for allocation constraints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RegClass {
-    /// General-purpose integer registers.
+    /// General-purpose integer registers (64-bit).
     Int,
-    /// Floating-point XMM registers.
+    /// Floating-point XMM registers (128-bit scalar/vector).
     Float,
+    /// 256-bit vector registers (YMM, AVX/AVX2).
+    Vec256,
+    /// 512-bit vector registers (ZMM, AVX-512).
+    Vec512,
     /// Any register (for moves, etc.).
     Any,
 }
 
 impl RegClass {
-    /// Get the available registers for this class.
-    pub fn available(self, gprs: GprSet, xmms: XmmSet) -> usize {
+    /// Get the register width in bits.
+    #[inline]
+    pub const fn width(self) -> u16 {
         match self {
-            RegClass::Int => gprs.count() as usize,
-            RegClass::Float => xmms.count() as usize,
-            RegClass::Any => (gprs.count() + xmms.count()) as usize,
+            RegClass::Int => 64,
+            RegClass::Float => 128,
+            RegClass::Vec256 => 256,
+            RegClass::Vec512 => 512,
+            RegClass::Any => 64, // Conservative default
         }
+    }
+
+    /// Get the spill slot size in bytes.
+    #[inline]
+    pub const fn spill_size(self) -> u32 {
+        match self {
+            RegClass::Int => 8,
+            RegClass::Float => 16,
+            RegClass::Vec256 => 32,
+            RegClass::Vec512 => 64,
+            RegClass::Any => 8,
+        }
+    }
+
+    /// Get required alignment for spill slots.
+    #[inline]
+    pub const fn spill_alignment(self) -> u32 {
+        // Vector spills require alignment equal to their size
+        self.spill_size()
+    }
+
+    /// Check if this is a vector register class.
+    #[inline]
+    pub const fn is_vector(self) -> bool {
+        matches!(self, RegClass::Float | RegClass::Vec256 | RegClass::Vec512)
+    }
+
+    /// Check if this is a wide vector class (256+ bits).
+    #[inline]
+    pub const fn is_wide_vector(self) -> bool {
+        matches!(self, RegClass::Vec256 | RegClass::Vec512)
     }
 }
 
@@ -240,6 +342,11 @@ impl AllocationMap {
         self.num_spill_slots
     }
 
+    /// Set the number of spill slots (used to sync with external allocators).
+    pub fn set_spill_slot_count(&mut self, count: u32) {
+        self.num_spill_slots = count;
+    }
+
     /// Add a move pair for later resolution.
     pub fn add_move(&mut self, from: VReg, to: VReg) {
         self.moves.push((from, to));
@@ -267,10 +374,18 @@ pub struct AllocatorConfig {
     pub available_gprs: GprSet,
     /// Available XMM registers for allocation.
     pub available_xmms: XmmSet,
+    /// Available YMM registers for 256-bit vectors.
+    pub available_ymms: YmmSet,
+    /// Available ZMM registers for 512-bit vectors.
+    pub available_zmms: ZmmSet,
     /// Reserved GPR (scratch).
     pub scratch_gpr: Gpr,
-    /// Reserved XMM (scratch).  
+    /// Reserved XMM (scratch).
     pub scratch_xmm: Xmm,
+    /// Reserved YMM (scratch for 256-bit ops).
+    pub scratch_ymm: Ymm,
+    /// Reserved ZMM (scratch for 512-bit ops).
+    pub scratch_zmm: Zmm,
     /// Enable coalescing (reduces moves).
     pub enable_coalescing: bool,
     /// Enable live range splitting.
@@ -289,8 +404,12 @@ impl Default for AllocatorConfig {
         AllocatorConfig {
             available_gprs: gprs,
             available_xmms: XmmSet::ALL.remove(Xmm::Xmm15),
+            available_ymms: YmmSet::ALL.remove(Ymm::Ymm15),
+            available_zmms: ZmmSet::ALL.remove(Zmm::Zmm31),
             scratch_gpr: Gpr::R11,
             scratch_xmm: Xmm::Xmm15,
+            scratch_ymm: Ymm::Ymm15,
+            scratch_zmm: Zmm::Zmm31,
             enable_coalescing: true,
             enable_splitting: true,
             loop_weight: 10.0,
