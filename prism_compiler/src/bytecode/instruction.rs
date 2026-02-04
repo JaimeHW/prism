@@ -518,6 +518,10 @@ pub enum Opcode {
     /// Check if there's a pending exception (for finally block logic).
     /// dst = True if exception is pending, False otherwise.
     HasExcInfo = 0x96,
+    /// Clear exception state after handler processes exception successfully.
+    /// Used when an except block catches an exception and handles it.
+    /// Clears active exception and sets state to Normal.
+    ClearException = 0xAB,
 
     // =========================================================================
     // With Statement / Context Managers (0x97-0x9F)
@@ -717,6 +721,7 @@ impl Opcode {
             0x94 => Some(Opcode::PushExcInfo),
             0x95 => Some(Opcode::PopExcInfo),
             0x96 => Some(Opcode::HasExcInfo),
+            0xAB => Some(Opcode::ClearException),
 
             0x97 => Some(Opcode::BeforeWith),
             0x98 => Some(Opcode::ExitWith),
@@ -805,9 +810,9 @@ impl Opcode {
             ImportStar => DstSrc,
 
             // Extended exception handling
-            RaiseFrom => DstSrc,              // dst = exc_reg, src = cause_reg
-            PushExcInfo | PopExcInfo => NoOp, // No operands, operates on exception stack
-            HasExcInfo => Dst,                // dst = bool result
+            RaiseFrom => DstSrc, // dst = exc_reg, src = cause_reg
+            PushExcInfo | PopExcInfo | ClearException => NoOp, // No operands, operates on exception stack
+            HasExcInfo => Dst,                                 // dst = bool result
 
             // With statement / context managers
             BeforeWith | ExitWith | WithCleanup => DstSrc, // dst = result, src = context manager

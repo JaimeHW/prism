@@ -132,7 +132,16 @@ impl Compiler {
     ///
     /// Uses the symbol table to determine whether the variable is local,
     /// closure (cell/free), or global.
+    ///
+    /// For nested functions, also checks the builder's local map for
+    /// parameters and locals defined via define_local().
     fn resolve_variable(&self, name: &str) -> VarLocation {
+        // First, check if this name is defined as a local in the current builder.
+        // This handles function parameters and body-level locals in nested functions.
+        if let Some(slot) = self.builder.lookup_local(name) {
+            return VarLocation::Local(slot.0);
+        }
+
         // Look up in symbol table's root scope (module level)
         if let Some(symbol) = self.symbol_table.root.lookup(name) {
             // Check closure variables first (cells and frees use same opcodes)
@@ -997,33 +1006,49 @@ impl Compiler {
                 }
 
                 // Strategy to avoid register collisions:
-                // 1. Compile function first
-                // 2. If func_reg falls in the arg range, move it to a safe register
-                // 3. Compile positional args to dst+1..dst+posargc
-                // 4. Compile keyword values to dst+posargc+1..dst+posargc+kwargc
-                // 5. Emit call (Call for no keywords, CallKw for keywords)
+                // CRITICAL: The Call instruction uses consecutive registers [dst, dst+1, dst+2, ...].
+                // The VM reads args from registers [dst+1, dst+2, ...]. If `reg` (allocated by compile_expr)
+                // is from the free list at a low position, `reg+1` could clobber a live register
+                // like list_reg in a list comprehension.
+                //
+                // SOLUTION: When there are arguments (argc > 0), allocate a fresh contiguous block
+                // from next_register to avoid any collision. For zero-arg calls, use reg directly
+                // since there are no consecutive arg writes to cause clobbering.
 
-                let mut func_reg = self.compile_expr(func)?;
-
-                // Calculate total argument range
                 let posargc = args.len();
                 let kwargc = keywords.len();
                 let total_argc = posargc + kwargc;
-                let arg_range_start = reg.0 + 1;
-                let arg_range_end = reg.0 + 1 + total_argc as u8;
 
-                // Check if func_reg collides with our argument range
-                if total_argc > 0 && func_reg.0 >= arg_range_start && func_reg.0 < arg_range_end {
-                    // func_reg would be clobbered by arg writes - move it to a safe register
-                    let safe_reg = self.builder.alloc_register();
-                    self.builder.emit_move(safe_reg, func_reg);
-                    self.builder.free_register(func_reg);
-                    func_reg = safe_reg;
+                // Compile function expression first (before allocating call block)
+                let mut func_reg = self.compile_expr(func)?;
+
+                // For calls WITH arguments, use fresh contiguous block to prevent clobbering.
+                // For zero-arg calls, use `reg` directly (no arg writes to worry about).
+                let (call_dst, call_block, block_size) = if total_argc > 0 {
+                    // Allocate fresh contiguous block for [call_dst, arg0, arg1, ...]
+                    let size = (1 + total_argc) as u8;
+                    let block = self.builder.alloc_register_block(size);
+                    (block, Some(block), size)
+                } else {
+                    // No arguments - use reg directly, no block needed
+                    (reg, None, 0)
+                };
+
+                // Check if func_reg is inside our call block range (would be clobbered)
+                if let Some(block) = call_block {
+                    let block_end = block.0 + block_size;
+                    if func_reg.0 >= block.0 && func_reg.0 < block_end {
+                        // Move func to a safe register outside the block
+                        let safe_reg = self.builder.alloc_register();
+                        self.builder.emit_move(safe_reg, func_reg);
+                        self.builder.free_register(func_reg);
+                        func_reg = safe_reg;
+                    }
                 }
 
-                // Compile positional arguments to dst+1..dst+posargc
+                // Compile positional arguments to call_dst+1..call_dst+posargc
                 for (i, arg) in args.iter().enumerate() {
-                    let arg_dst = Register::new(reg.0 + 1 + i as u8);
+                    let arg_dst = Register::new(call_dst.0 + 1 + i as u8);
                     let temp = self.compile_expr(arg)?;
                     if temp != arg_dst {
                         self.builder.emit_move(arg_dst, temp);
@@ -1034,12 +1059,12 @@ impl Compiler {
                 // Handle keyword arguments
                 if keywords.is_empty() {
                     // No keywords - use simple Call instruction
-                    self.builder.emit_call(reg, func_reg, posargc as u8);
+                    self.builder.emit_call(call_dst, func_reg, posargc as u8);
                 } else {
                     // Compile keyword argument values to consecutive registers
                     // after positional arguments
                     for (i, kw) in keywords.iter().enumerate() {
-                        let kw_dst = Register::new(reg.0 + 1 + posargc as u8 + i as u8);
+                        let kw_dst = Register::new(call_dst.0 + 1 + posargc as u8 + i as u8);
                         let temp = self.compile_expr(&kw.value)?;
                         if temp != kw_dst {
                             self.builder.emit_move(kw_dst, temp);
@@ -1059,7 +1084,7 @@ impl Compiler {
 
                     // Emit CallKw instruction pair
                     self.builder.emit_call_kw(
-                        reg,
+                        call_dst,
                         func_reg,
                         posargc as u8,
                         kwargc as u8,
@@ -1068,6 +1093,14 @@ impl Compiler {
                 }
 
                 self.builder.free_register(func_reg);
+
+                // If we used a block, move result to expected destination and free block
+                if let Some(block) = call_block {
+                    if call_dst != reg {
+                        self.builder.emit_move(reg, call_dst);
+                    }
+                    self.builder.free_register_block(block, block_size);
+                }
             }
 
             ExprKind::Attribute { value, attr, .. } => {
@@ -1110,26 +1143,30 @@ impl Compiler {
             }
 
             ExprKind::Tuple(elts) => {
-                let first_elem = self.builder.alloc_register();
-                let mut elem_regs = Vec::with_capacity(elts.len());
+                // CRITICAL: BuildTuple expects consecutive registers [first, first+1, ...].
+                // Using alloc_register() individually can allocate non-contiguous registers
+                // from the free list, breaking this invariant.
+                // Use alloc_register_block to guarantee contiguity.
+                if elts.is_empty() {
+                    // Empty tuple - just build with no elements
+                    self.builder.emit_build_tuple(reg, reg, 0);
+                } else {
+                    let count = elts.len() as u8;
+                    let first_elem = self.builder.alloc_register_block(count);
 
-                for (i, elt) in elts.iter().enumerate() {
-                    let elem_reg = if i == 0 {
-                        first_elem
-                    } else {
-                        self.builder.alloc_register()
-                    };
-                    let temp = self.compile_expr(elt)?;
-                    self.builder.emit_move(elem_reg, temp);
-                    self.builder.free_register(temp);
-                    elem_regs.push(elem_reg);
-                }
+                    for (i, elt) in elts.iter().enumerate() {
+                        let elem_reg = Register::new(first_elem.0 + i as u8);
+                        let temp = self.compile_expr(elt)?;
+                        if temp != elem_reg {
+                            self.builder.emit_move(elem_reg, temp);
+                        }
+                        self.builder.free_register(temp);
+                    }
 
-                self.builder
-                    .emit_build_tuple(reg, first_elem, elts.len() as u8);
+                    self.builder.emit_build_tuple(reg, first_elem, count);
 
-                for elem_reg in elem_regs {
-                    self.builder.free_register(elem_reg);
+                    // Free the element register block
+                    self.builder.free_register_block(first_elem, count);
                 }
             }
 
@@ -1657,14 +1694,37 @@ impl Compiler {
     ) -> CompileResult<()> {
         use crate::ExceptionEntry;
 
-        // Create labels for control flow
+        // =================================================================
+        // Analysis Phase - Determine handler structure
+        // =================================================================
+
+        // Check if there's a bare except clause (catches all exceptions)
+        let has_bare_except = handlers.iter().any(|h| h.typ.is_none());
+
+        // Check if there are any typed handlers that need matching
+        let has_typed_handlers = handlers.iter().any(|h| h.typ.is_some());
+
+        // =================================================================
+        // Label Creation Phase
+        // =================================================================
+
         let end_label = self.builder.create_label();
+
         let orelse_label = if !orelse.is_empty() {
             Some(self.builder.create_label())
         } else {
             None
         };
+
         let finally_label = if !finalbody.is_empty() {
+            Some(self.builder.create_label())
+        } else {
+            None
+        };
+
+        // Only create reraise label if we have typed handlers AND no bare except
+        // (if there's a bare except, it will catch everything, so no reraise needed)
+        let reraise_label = if has_typed_handlers && !has_bare_except {
             Some(self.builder.create_label())
         } else {
             None
@@ -1676,19 +1736,20 @@ impl Compiler {
             .map(|_| self.builder.create_label())
             .collect();
 
-        // Record try block start position
+        // =================================================================
+        // Try Body Compilation
+        // =================================================================
+
         let try_start_pc = self.builder.current_pc();
         let stack_depth = self.builder.current_stack_depth();
 
-        // Compile the try body
         for stmt in body {
             self.compile_stmt(stmt)?;
         }
 
-        // Record try block end position
         let try_end_pc = self.builder.current_pc();
 
-        // Jump to else or end on normal completion
+        // Jump to else/finally/end on normal completion (no exception)
         if let Some(else_label) = orelse_label {
             self.builder.emit_jump(else_label);
         } else if let Some(fin_label) = finally_label {
@@ -1697,50 +1758,59 @@ impl Compiler {
             self.builder.emit_jump(end_label);
         }
 
-        // Compile each exception handler
+        // =================================================================
+        // Exception Handler Compilation
+        // =================================================================
+
         for (i, handler) in handlers.iter().enumerate() {
             self.builder.bind_label(handler_labels[i]);
 
             let handler_start_pc = self.builder.current_pc();
 
-            // Extract handler info
+            // Compile handler match logic
             let type_idx = if let Some(type_expr) = &handler.typ {
-                // Compile the exception type expression and store as type filter
+                // -----------------------------------------------------------
+                // Typed handler: except SomeException as e:
+                // -----------------------------------------------------------
+
+                // Compile the exception type expression to get the type class
                 let type_reg = self.compile_expr(type_expr)?;
 
-                // For now, we use the type register as part of the handler check
-                // The VM will use ExceptionMatch opcode at runtime
+                // Load the current exception into a register for later binding
                 let exc_reg = self.builder.alloc_register();
-
-                // Load the current exception into exc_reg (LoadException opcode)
                 self.builder
                     .emit(Instruction::op_d(Opcode::LoadException, exc_reg));
 
-                // Check if exception matches type
+                // Check if exception matches type using dynamic matching
+                // Note: ExceptionMatch reads src1 as the type, gets exception from VM state
                 let match_reg = self.builder.alloc_register();
-                self.builder.emit(Instruction::op_dss(
+                self.builder.emit(Instruction::op_ds(
                     Opcode::ExceptionMatch,
                     match_reg,
-                    exc_reg,
                     type_reg,
                 ));
 
-                // If no match, jump to next handler or reraise
-                let next_handler = if i + 1 < handlers.len() {
+                // Determine where to jump if no match
+                let no_match_target = if i + 1 < handlers.len() {
+                    // Try next handler
                     handler_labels[i + 1]
+                } else if let Some(reraise_lbl) = reraise_label {
+                    // No more handlers, reraise the exception
+                    reraise_lbl
                 } else if let Some(fin_label) = finally_label {
+                    // No reraise needed, go to finally (bare except will catch)
                     fin_label
                 } else {
-                    // No more handlers, jump to end (reraise happens at end_label)
+                    // Should not happen if has_bare_except is true
                     end_label
                 };
 
-                self.builder.emit_jump_if_false(match_reg, next_handler);
+                self.builder.emit_jump_if_false(match_reg, no_match_target);
 
                 self.builder.free_register(match_reg);
                 self.builder.free_register(type_reg);
 
-                // If handler has a name binding (except E as e:), bind it
+                // If handler has a name binding (except E as e:), store the exception
                 if let Some(name) = &handler.name {
                     let location = self.resolve_variable(name);
                     self.builder
@@ -1751,7 +1821,10 @@ impl Compiler {
 
                 Some(handler_start_pc as u16)
             } else {
-                // Bare except: catches all
+                // -----------------------------------------------------------
+                // Bare except: catches all exceptions
+                // -----------------------------------------------------------
+
                 if let Some(name) = &handler.name {
                     let exc_reg = self.builder.alloc_register();
                     self.builder
@@ -1761,15 +1834,28 @@ impl Compiler {
                         .emit_store_var(location, exc_reg, Some(name.as_ref()));
                     self.builder.free_register(exc_reg);
                 }
+
                 None
             };
+
+            // =============================================================
+            // Handler Body Execution
+            // =============================================================
+
+            // NOTE: We do NOT clear the exception here at the start.
+            // Bare `raise` inside the handler needs to access the exception.
+            // We clear it AFTER the handler body completes successfully.
 
             // Compile handler body
             for stmt in &handler.body {
                 self.compile_stmt(stmt)?;
             }
 
-            // Jump to finally or end after handler
+            // Clear exception state AFTER successful handler execution
+            // If handler body contained bare `raise`, control flow never reaches here
+            self.builder.emit(Instruction::op(Opcode::ClearException));
+
+            // Jump to finally or end after successful handler execution
             if let Some(fin_label) = finally_label {
                 self.builder.emit_jump(fin_label);
             } else {
@@ -1777,24 +1863,25 @@ impl Compiler {
             }
 
             // Add exception entry for this handler
-            // exception_type_idx = u16::MAX means catch-all
             self.builder.add_exception_entry(ExceptionEntry {
                 start_pc: try_start_pc,
                 end_pc: try_end_pc,
                 handler_pc: handler_start_pc,
-                finally_pc: u32::MAX, // No finally for this handler entry
+                finally_pc: u32::MAX,
                 depth: stack_depth as u16,
                 exception_type_idx: type_idx.unwrap_or(u16::MAX),
             });
         }
 
-        // Compile else block (only if try body completes normally)
+        // =================================================================
+        // Else Block Compilation (runs only if no exception occurred)
+        // =================================================================
+
         if let Some(else_label) = orelse_label {
             self.builder.bind_label(else_label);
             for stmt in orelse {
                 self.compile_stmt(stmt)?;
             }
-            // Jump to finally or end
             if let Some(fin_label) = finally_label {
                 self.builder.emit_jump(fin_label);
             } else {
@@ -1802,37 +1889,59 @@ impl Compiler {
             }
         }
 
-        // Compile finally block
+        // =================================================================
+        // Reraise Path (only if typed handlers exist without bare except)
+        // =================================================================
+
+        if let Some(reraise_lbl) = reraise_label {
+            self.builder.bind_label(reraise_lbl);
+
+            if let Some(fin_label) = finally_label {
+                // Execute finally before reraising
+                self.builder.emit_jump(fin_label);
+            } else {
+                // No finally, reraise immediately
+                self.builder.emit(Instruction::op(Opcode::Reraise));
+            }
+        }
+
+        // =================================================================
+        // Finally Block Compilation
+        // =================================================================
+
         if let Some(fin_label) = finally_label {
             self.builder.bind_label(fin_label);
             let finally_start_pc = self.builder.current_pc();
 
-            // Push current exception info to preserve exception state
-            // This is required for proper exception re-raise semantics
+            // Push exception info to preserve state during finally execution
             self.builder.emit(Instruction::op(Opcode::PushExcInfo));
 
+            // Compile finally body
             for stmt in finalbody {
                 self.compile_stmt(stmt)?;
             }
 
-            // Pop exception info and check if we need to re-raise
+            // Pop exception info
             self.builder.emit(Instruction::op(Opcode::PopExcInfo));
 
-            // EndFinally opcode re-raises exception if one is pending
+            // EndFinally will reraise if there's a pending exception
             self.builder.emit(Instruction::op(Opcode::EndFinally));
 
-            // Add finally exception entry covering the try block
+            // Add finally exception entry
             self.builder.add_exception_entry(ExceptionEntry {
                 start_pc: try_start_pc,
                 end_pc: try_end_pc,
                 handler_pc: finally_start_pc,
-                finally_pc: finally_start_pc, // Handler is also the finally block
+                finally_pc: finally_start_pc,
                 depth: stack_depth as u16,
-                exception_type_idx: u16::MAX, // Finally catches all
+                exception_type_idx: u16::MAX,
             });
         }
 
-        // End label
+        // =================================================================
+        // End Label - Normal exit point
+        // =================================================================
+
         self.builder.bind_label(end_label);
 
         Ok(())
@@ -2995,18 +3104,43 @@ impl Compiler {
         generators: &[prism_parser::ast::Comprehension],
         dst: Register,
     ) -> CompileResult<Register> {
+        eprintln!("[DEBUG compile_listcomp] dst={}, entering", dst.0);
+
         // For now, compile comprehension inline for simplicity
         // Full implementation would create a nested scope
 
         // Create the result list
-        let list_reg = self.builder.alloc_register();
+        // CRITICAL: Use alloc_register_block(1) instead of alloc_register() to prevent
+        // the list register from being at a position that could be clobbered by
+        // Call instruction's consecutive argument writes ([dst, dst+1, dst+2, ...]).
+        // alloc_register_block allocates from next_register (guaranteed contiguous),
+        // not from the free list which could give us a register adjacent to Call's dst.
+        let list_reg = self.builder.alloc_register_block(1);
+        eprintln!(
+            "[DEBUG compile_listcomp] list_reg={} (will use for BuildList)",
+            list_reg.0
+        );
+
+        // CRITICAL: Clear the free register list to prevent register reuse.
+        // Call instructions use consecutive registers [dst, dst+1, ...], and if dst
+        // is reused from the free list at a position before list_reg, then dst+1
+        // could clobber list_reg. By clearing the free list, all subsequent allocations
+        // (including Call's dst) will use fresh registers from next_register (which is
+        // after list_reg), preventing any clobbering.
+        self.builder.clear_free_registers();
+
         self.builder.emit_build_list(list_reg, list_reg, 0);
 
         // Compile generators (nested loops)
         self.compile_comprehension_generators(elt, generators, list_reg, ComprehensionKind::List)?;
 
         // Move result to destination
+        eprintln!(
+            "[DEBUG compile_listcomp] moving list_reg={} to dst={}",
+            list_reg.0, dst.0
+        );
         self.builder.emit_move(dst, list_reg);
+        eprintln!("[DEBUG compile_listcomp] freeing list_reg={}", list_reg.0);
         self.builder.free_register(list_reg);
 
         Ok(dst)
@@ -3129,12 +3263,26 @@ impl Compiler {
             let elem_reg = self.compile_expr(elt)?;
             match kind {
                 ComprehensionKind::List => {
-                    self.builder
-                        .emit(Instruction::op_ds(Opcode::ListAppend, result_reg, elem_reg));
+                    eprintln!(
+                        "[DEBUG emit ListAppend] result_reg={}, elem_reg={}",
+                        result_reg.0, elem_reg.0
+                    );
+                    // ListAppend: src1.append(src2) - list in src1, element in src2
+                    self.builder.emit(Instruction::op_dss(
+                        Opcode::ListAppend,
+                        Register(0), // dst unused for ListAppend
+                        result_reg,  // src1 = list
+                        elem_reg,    // src2 = element
+                    ));
                 }
                 ComprehensionKind::Set => {
-                    self.builder
-                        .emit(Instruction::op_ds(Opcode::SetAdd, result_reg, elem_reg));
+                    // SetAdd: src1.add(src2) - set in src1, element in src2
+                    self.builder.emit(Instruction::op_dss(
+                        Opcode::SetAdd,
+                        Register(0), // dst unused for SetAdd
+                        result_reg,  // src1 = set
+                        elem_reg,    // src2 = element
+                    ));
                 }
             }
             self.builder.free_register(elem_reg);
