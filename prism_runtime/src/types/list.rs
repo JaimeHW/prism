@@ -137,6 +137,27 @@ impl ListObject {
         self.items.reverse();
     }
 
+    /// Concatenate two lists into a new list.
+    ///
+    /// This is the Python `list + list` operation. Returns a new list containing
+    /// all elements from both lists in order.
+    ///
+    /// # Performance
+    ///
+    /// Pre-allocates exact capacity for the result to avoid reallocations.
+    /// O(n + m) time complexity where n and m are the lengths of the two lists.
+    #[inline]
+    pub fn concat(&self, other: &ListObject) -> Self {
+        let total_len = self.items.len() + other.items.len();
+        let mut result = Vec::with_capacity(total_len);
+        result.extend(self.items.iter().copied());
+        result.extend(other.items.iter().copied());
+        Self {
+            header: ObjectHeader::new(TypeId::LIST),
+            items: result,
+        }
+    }
+
     /// Get a slice of the list.
     pub fn slice(&self, start: Option<i64>, end: Option<i64>, step: Option<i64>) -> Self {
         let len = self.len() as i64;

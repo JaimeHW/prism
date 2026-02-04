@@ -47,6 +47,7 @@ impl TypeId {
     pub const SUPER: Self = Self(24);
     pub const CELL: Self = Self(25);
     pub const MODULE_OBJECT: Self = Self(26);
+    pub const EXCEPTION_TYPE: Self = Self(27);
 
     /// First ID available for user-defined types.
     pub const FIRST_USER_TYPE: u32 = 256;
@@ -99,6 +100,7 @@ impl TypeId {
             24 => "super",
             25 => "cell",
             26 => "module",
+            27 => "exception_type",
             _ => "<unknown>",
         }
     }
