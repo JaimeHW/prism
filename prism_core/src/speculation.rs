@@ -28,6 +28,8 @@ pub enum TypeHint {
     StrInt = 6,
     /// Int and string (for repetition).
     IntStr = 7,
+    /// Both operands are lists (concatenation).
+    ListList = 8,
 }
 
 impl TypeHint {
