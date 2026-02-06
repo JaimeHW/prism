@@ -11,6 +11,7 @@ pub mod list;
 pub mod range;
 pub mod set;
 pub mod simd;
+pub mod slice;
 pub mod string;
 pub mod tuple;
 
@@ -21,5 +22,6 @@ pub use function::FunctionObject;
 pub use list::ListObject;
 pub use range::RangeObject;
 pub use set::SetObject;
+pub use slice::{SliceIndices, SliceObject, SliceValue};
 pub use string::{SSO_MAX_LEN, StringObject, empty_string};
 pub use tuple::TupleObject;

@@ -238,6 +238,23 @@ unsafe impl Trace for IteratorObject {
 }
 
 // =============================================================================
+// SliceObject - Leaf type (primitives only)
+// =============================================================================
+
+use crate::types::slice::SliceObject;
+
+/// Safety: SliceObject contains no GC-managed references.
+/// Only holds primitive SliceValue (wrapped i64) for start/stop/step.
+unsafe impl Trace for SliceObject {
+    #[inline]
+    fn trace(&self, _tracer: &mut dyn Tracer) {
+        // SliceObject is a leaf type:
+        // - ObjectHeader (traced but empty)
+        // - start, stop, step: SliceValue (i64) - primitives
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
