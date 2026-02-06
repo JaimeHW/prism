@@ -297,16 +297,17 @@ fn call_kw_user_function(
     }
 
     // Handle excess positional arguments
-    let varargs_tuple: Option<Box<TupleObject>> = if posargc > arg_count {
+    // We defer allocation to Phase 5 when we have access to the allocator
+    let varargs_values: Option<SmallVec<[Value; 8]>> = if posargc > arg_count {
         if has_varargs {
-            // Collect excess into *args tuple
+            // Collect excess for later allocation into *args tuple
             let excess_count = posargc - arg_count;
             let mut excess: SmallVec<[Value; 8]> = SmallVec::with_capacity(excess_count);
             for i in arg_count..posargc {
                 let arg_val = vm.frames[caller_frame_idx].get_reg(dst_reg + 1 + i as u8);
                 excess.push(arg_val);
             }
-            Some(Box::new(TupleObject::from_slice(&excess)))
+            Some(excess)
         } else {
             // Too many positional arguments - error
             return ControlFlow::Error(RuntimeError::type_error(format!(
@@ -319,8 +320,8 @@ fn call_kw_user_function(
             )));
         }
     } else if has_varargs {
-        // Empty *args tuple
-        Some(Box::new(TupleObject::empty()))
+        // Empty *args tuple (will create empty tuple during Phase 5)
+        Some(SmallVec::new())
     } else {
         None
     };
@@ -329,9 +330,9 @@ fn call_kw_user_function(
     // Phase 2: Bind keyword arguments
     // =========================================================================
 
-    // Prepare **kwargs dict if function accepts it
-    let mut varkw_dict: Option<Box<DictObject>> = if has_varkw {
-        Some(Box::new(DictObject::with_capacity(kwargc)))
+    // Prepare varkw entries - defer dict allocation to Phase 5
+    let mut varkw_entries: Option<SmallVec<[(Value, Value); 4]>> = if has_varkw {
+        Some(SmallVec::new())
     } else {
         None
     };
@@ -370,11 +371,10 @@ fn call_kw_user_function(
                     }
                     bound_args[param_idx] = kw_val;
                     bound_mask |= 1 << param_idx;
-                } else if let Some(ref mut kwargs_dict) = varkw_dict {
-                    // Store in **kwargs dict
-                    // Create string key for the dict
+                } else if let Some(ref mut varkw_list) = varkw_entries {
+                    // Store entry for later allocation into **kwargs dict
                     let key = create_string_key(kw_name);
-                    kwargs_dict.set(key, kw_val);
+                    varkw_list.push((key, kw_val));
                 } else {
                     // Unexpected keyword argument - error
                     return ControlFlow::Error(RuntimeError::type_error(format!(
@@ -455,6 +455,44 @@ fn call_kw_user_function(
         return ControlFlow::Error(e);
     }
 
+    // Allocate *args tuple on GC heap if needed
+    let varargs_value = if has_varargs {
+        let tuple = match &varargs_values {
+            Some(vals) if !vals.is_empty() => TupleObject::from_slice(&vals),
+            _ => TupleObject::empty(),
+        };
+        match vm.allocator().alloc(tuple) {
+            Some(ptr) => Some(Value::object_ptr(ptr as *const ())),
+            None => {
+                return ControlFlow::Error(RuntimeError::internal(
+                    "out of memory: failed to allocate varargs tuple",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Allocate **kwargs dict on GC heap if needed
+    let varkw_value = if has_varkw {
+        let mut dict = DictObject::new();
+        if let Some(entries) = &varkw_entries {
+            for (key, val) in entries {
+                dict.set(*key, *val);
+            }
+        }
+        match vm.allocator().alloc(dict) {
+            Some(ptr) => Some(Value::object_ptr(ptr as *const ())),
+            None => {
+                return ControlFlow::Error(RuntimeError::internal(
+                    "out of memory: failed to allocate varkw dict",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     // Populate bound parameters in new frame
     // Locals layout:
     // - [0..arg_count): positional parameters
@@ -472,16 +510,8 @@ fn call_kw_user_function(
     }
 
     // Set *args tuple if present
-    if has_varargs {
-        if let Some(varargs) = varargs_tuple {
-            let tuple_val = Value::object_ptr(Box::into_raw(varargs) as *const ());
-            new_frame.set_reg(local_idx, tuple_val);
-        } else {
-            // Empty tuple placeholder
-            let empty_tuple = Box::new(TupleObject::empty());
-            let tuple_val = Value::object_ptr(Box::into_raw(empty_tuple) as *const ());
-            new_frame.set_reg(local_idx, tuple_val);
-        }
+    if let Some(tuple_val) = varargs_value {
+        new_frame.set_reg(local_idx, tuple_val);
         local_idx += 1;
     }
 
@@ -492,16 +522,8 @@ fn call_kw_user_function(
     }
 
     // Set **kwargs dict if present
-    if has_varkw {
-        if let Some(varkw) = varkw_dict {
-            let dict_val = Value::object_ptr(Box::into_raw(varkw) as *const ());
-            new_frame.set_reg(local_idx, dict_val);
-        } else {
-            // Empty dict placeholder
-            let empty_dict = Box::new(DictObject::new());
-            let dict_val = Value::object_ptr(Box::into_raw(empty_dict) as *const ());
-            new_frame.set_reg(local_idx, dict_val);
-        }
+    if let Some(dict_val) = varkw_value {
+        new_frame.set_reg(local_idx, dict_val);
     }
 
     ControlFlow::Continue
@@ -626,41 +648,52 @@ pub fn tail_call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// Creates a FunctionObject from a code constant and stores it in dst.
 #[inline(always)]
 pub fn make_function(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
     let code_idx = inst.imm16();
     let dst = inst.dst().0;
 
-    // Get code object from constant pool
-    // The compiler stores Arc<CodeObject> as Arc::into_raw pointer in constant pool
-    let code_val = frame.get_const(code_idx);
+    // Get code object from constant pool (release frame borrow immediately)
+    let (code_clone, qualname) = {
+        let frame = vm.current_frame();
+        let code_val = frame.get_const(code_idx);
 
-    if let Some(code_ptr) = code_val.as_object_ptr() {
-        // Reconstruct Arc<CodeObject> from raw pointer
-        // SAFETY: The compiler stored Arc::into_raw(Arc<CodeObject>) in the constant pool.
-        // We clone the Arc here to increment reference count (the constant pool keeps its copy).
-        let code_raw = code_ptr as *const CodeObject;
-        // Clone the Arc without taking ownership (the constant pool still owns the original)
-        let code = unsafe { Arc::from_raw(code_raw) };
-        let code_clone = Arc::clone(&code);
-        // Prevent dropping (the constant pool still owns this Arc)
-        std::mem::forget(code);
+        if let Some(code_ptr) = code_val.as_object_ptr() {
+            // Reconstruct Arc<CodeObject> from raw pointer
+            // SAFETY: The compiler stored Arc::into_raw(Arc<CodeObject>) in the constant pool.
+            // We clone the Arc here to increment reference count (the constant pool keeps its copy).
+            let code_raw = code_ptr as *const CodeObject;
+            // Clone the Arc without taking ownership (the constant pool still owns the original)
+            let code = unsafe { Arc::from_raw(code_raw) };
+            let code_clone = Arc::clone(&code);
+            // Prevent dropping (the constant pool still owns this Arc)
+            std::mem::forget(code);
+            let qualname = Arc::from(frame.code.name.as_ref());
+            (code_clone, qualname)
+        } else {
+            return ControlFlow::Error(RuntimeError::internal(
+                "Invalid code object in constant pool",
+            ));
+        }
+    };
 
-        // Create FunctionObject with the actual compiled code
-        let func = Box::new(FunctionObject::new(
-            code_clone,
-            Arc::from(frame.code.name.as_ref()),
-            None, // defaults - TODO: handle function defaults
-            None, // closure - TODO: handle captured variables (use MakeClosure for that)
-        ));
-        let func_ptr = Box::into_raw(func) as *const ();
-        frame.set_reg(dst, Value::object_ptr(func_ptr));
-        ControlFlow::Continue
-    } else {
-        // Handle case where code is stored differently
-        ControlFlow::Error(RuntimeError::internal(
-            "Invalid code object in constant pool",
-        ))
-    }
+    // Create FunctionObject
+    let func = FunctionObject::new(
+        code_clone, qualname, None, // defaults - TODO: handle function defaults
+        None, // closure - TODO: handle captured variables (use MakeClosure for that)
+    );
+
+    // Allocate on GC heap
+    let func_ptr = match vm.allocator().alloc(func) {
+        Some(ptr) => ptr as *const (),
+        None => {
+            return ControlFlow::Error(RuntimeError::internal(
+                "out of memory: failed to allocate function",
+            ));
+        }
+    };
+
+    vm.current_frame_mut()
+        .set_reg(dst, Value::object_ptr(func_ptr));
+    ControlFlow::Continue
 }
 
 /// MakeClosure: create closure with captured variables
@@ -668,46 +701,59 @@ pub fn make_function(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
 /// Creates a FunctionObject with a captured closure environment.
 #[inline(always)]
 pub fn make_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame_mut();
     let code_idx = inst.imm16();
     let dst = inst.dst().0;
 
-    // Get code object from constant pool
-    // The compiler stores Arc<CodeObject> as Arc::into_raw pointer in constant pool
-    let code_val = frame.get_const(code_idx);
+    // Get code object from constant pool (release frame borrow immediately)
+    let (code_clone, qualname) = {
+        let frame = vm.current_frame();
+        let code_val = frame.get_const(code_idx);
 
-    if let Some(code_ptr) = code_val.as_object_ptr() {
-        // Reconstruct Arc<CodeObject> from raw pointer
-        // SAFETY: The compiler stored Arc::into_raw(Arc<CodeObject>) in the constant pool.
-        // We clone the Arc here to increment reference count (the constant pool keeps its copy).
-        let code_raw = code_ptr as *const CodeObject;
-        // Clone the Arc without taking ownership (the constant pool still owns the original)
-        let code = unsafe { Arc::from_raw(code_raw) };
-        let code_clone = Arc::clone(&code);
-        // Prevent dropping (the constant pool still owns this Arc)
-        std::mem::forget(code);
+        if let Some(code_ptr) = code_val.as_object_ptr() {
+            // Reconstruct Arc<CodeObject> from raw pointer
+            // SAFETY: The compiler stored Arc::into_raw(Arc<CodeObject>) in the constant pool.
+            // We clone the Arc here to increment reference count (the constant pool keeps its copy).
+            let code_raw = code_ptr as *const CodeObject;
+            // Clone the Arc without taking ownership (the constant pool still owns the original)
+            let code = unsafe { Arc::from_raw(code_raw) };
+            let code_clone = Arc::clone(&code);
+            // Prevent dropping (the constant pool still owns this Arc)
+            std::mem::forget(code);
+            let qualname = Arc::from(frame.code.name.as_ref());
+            (code_clone, qualname)
+        } else {
+            return ControlFlow::Error(RuntimeError::internal(
+                "Invalid code object in constant pool for closure",
+            ));
+        }
+    };
 
-        // TODO: Capture closure environment from current frame
-        // For now, create function without captured variables
-        // When properly implemented:
-        // 1. Get list of free variables from code_clone.freevars
-        // 2. Capture values from current frame's closure or registers
-        // 3. Create ClosureEnv with captured values
+    // TODO: Capture closure environment from current frame
+    // For now, create function without captured variables
+    // When properly implemented:
+    // 1. Get list of free variables from code_clone.freevars
+    // 2. Capture values from current frame's closure or registers
+    // 3. Create ClosureEnv with captured values
 
-        let func = Box::new(FunctionObject::new(
-            code_clone,
-            Arc::from(frame.code.name.as_ref()),
-            None, // defaults - TODO: handle function defaults
-            None, // closure - TODO: implement ClosureEnv capture
-        ));
-        let func_ptr = Box::into_raw(func) as *const ();
-        frame.set_reg(dst, Value::object_ptr(func_ptr));
-        ControlFlow::Continue
-    } else {
-        ControlFlow::Error(RuntimeError::internal(
-            "Invalid code object in constant pool for closure",
-        ))
-    }
+    // Create FunctionObject
+    let func = FunctionObject::new(
+        code_clone, qualname, None, // defaults - TODO: handle function defaults
+        None, // closure - TODO: implement ClosureEnv capture
+    );
+
+    // Allocate on GC heap
+    let func_ptr = match vm.allocator().alloc(func) {
+        Some(ptr) => ptr as *const (),
+        None => {
+            return ControlFlow::Error(RuntimeError::internal(
+                "out of memory: failed to allocate closure",
+            ));
+        }
+    };
+
+    vm.current_frame_mut()
+        .set_reg(dst, Value::object_ptr(func_ptr));
+    ControlFlow::Continue
 }
 
 #[cfg(test)]
