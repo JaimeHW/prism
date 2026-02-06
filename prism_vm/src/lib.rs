@@ -47,6 +47,7 @@
 #![allow(clippy::new_without_default)]
 
 // Core modules
+pub mod allocator;
 pub mod error;
 pub mod frame;
 pub mod gc_integration;
@@ -83,6 +84,7 @@ pub mod stdlib;
 pub mod import;
 
 // Re-exports
+pub use allocator::{AllocResult, GcAllocator, HeapAllocExt};
 pub use builtins::{BuiltinError, BuiltinFn, BuiltinRegistry};
 pub use dispatch::ControlFlow;
 pub use error::{RuntimeError, RuntimeErrorKind, VmResult};
