@@ -1422,6 +1422,17 @@ impl TemplateInstruction {
             | TemplateInstruction::ForIter { bc_offset, .. }
             | TemplateInstruction::Len { bc_offset, .. }
             | TemplateInstruction::IsCallable { bc_offset, .. }
+            | TemplateInstruction::BuildList { bc_offset, .. }
+            | TemplateInstruction::BuildTuple { bc_offset, .. }
+            | TemplateInstruction::BuildSet { bc_offset, .. }
+            | TemplateInstruction::BuildDict { bc_offset, .. }
+            | TemplateInstruction::BuildString { bc_offset, .. }
+            | TemplateInstruction::BuildSlice { bc_offset, .. }
+            | TemplateInstruction::ListAppend { bc_offset, .. }
+            | TemplateInstruction::SetAdd { bc_offset, .. }
+            | TemplateInstruction::DictSet { bc_offset, .. }
+            | TemplateInstruction::UnpackSequence { bc_offset, .. }
+            | TemplateInstruction::UnpackEx { bc_offset, .. }
             | TemplateInstruction::IntAdd { bc_offset, .. }
             | TemplateInstruction::IntSub { bc_offset, .. }
             | TemplateInstruction::IntMul { bc_offset, .. }
