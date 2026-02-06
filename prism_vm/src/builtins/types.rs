@@ -180,7 +180,16 @@ pub fn builtin_object(args: &[Value]) -> Result<Value, BuiltinError> {
     Ok(Value::none())
 }
 
-/// Builtin getattr function.
+/// Builtin getattr(object, name[, default]) function.
+///
+/// Returns the value of the named attribute of object.
+/// If the named attribute does not exist, default is returned if provided,
+/// otherwise AttributeError is raised.
+///
+/// # Python Semantics
+/// - `getattr(x, 'name')` → x.name
+/// - `getattr(x, 'name', default)` → x.name if exists, else default
+/// - Raises AttributeError if attribute not found and no default
 pub fn builtin_getattr(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() < 2 || args.len() > 3 {
         return Err(BuiltinError::TypeError(format!(
@@ -188,13 +197,66 @@ pub fn builtin_getattr(args: &[Value]) -> Result<Value, BuiltinError> {
             args.len()
         )));
     }
-    // TODO: Get attribute from object
-    Err(BuiltinError::NotImplemented(
-        "getattr() not yet implemented".to_string(),
-    ))
+
+    let obj = args[0];
+    let name = args[1];
+    let default = args.get(2).copied();
+
+    // Validate name is a string
+    let name_str = if let Some(ptr) = name.as_object_ptr() {
+        use prism_runtime::object::ObjectHeader;
+        use prism_runtime::object::type_obj::TypeId;
+        use prism_runtime::types::string::StringObject;
+
+        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+        if type_id == TypeId::STR {
+            let string_obj = unsafe { &*(ptr as *const StringObject) };
+            string_obj.as_str().to_string()
+        } else {
+            return Err(BuiltinError::TypeError(
+                "attribute name must be string".to_string(),
+            ));
+        }
+    } else {
+        return Err(BuiltinError::TypeError(
+            "attribute name must be string".to_string(),
+        ));
+    };
+
+    // Try to get the attribute
+    if let Some(ptr) = obj.as_object_ptr() {
+        use prism_runtime::object::ObjectHeader;
+        use prism_runtime::object::shaped_object::ShapedObject;
+        use prism_runtime::object::type_obj::TypeId;
+
+        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+
+        if type_id == TypeId::OBJECT {
+            let shaped = unsafe { &*(ptr as *const ShapedObject) };
+            if let Some(value) = shaped.get_property(&name_str) {
+                return Ok(value);
+            }
+        }
+    }
+
+    // Attribute not found - return default or raise error
+    match default {
+        Some(d) => Ok(d),
+        None => Err(BuiltinError::AttributeError(format!(
+            "'{}' object has no attribute '{}'",
+            get_type_name(obj),
+            name_str
+        ))),
+    }
 }
 
-/// Builtin setattr function.
+/// Builtin setattr(object, name, value) function.
+///
+/// Sets the value of the named attribute of object.
+///
+/// # Python Semantics
+/// - `setattr(x, 'name', value)` → x.name = value
+/// - Raises TypeError if the object doesn't support attribute assignment
 pub fn builtin_setattr(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 3 {
         return Err(BuiltinError::TypeError(format!(
@@ -202,13 +264,71 @@ pub fn builtin_setattr(args: &[Value]) -> Result<Value, BuiltinError> {
             args.len()
         )));
     }
-    // TODO: Set attribute on object
-    Err(BuiltinError::NotImplemented(
-        "setattr() not yet implemented".to_string(),
-    ))
+
+    let obj = args[0];
+    let name = args[1];
+    let value = args[2];
+
+    // Validate name is a string
+    let name_str = if let Some(ptr) = name.as_object_ptr() {
+        use prism_runtime::object::ObjectHeader;
+        use prism_runtime::object::type_obj::TypeId;
+        use prism_runtime::types::string::StringObject;
+
+        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+        if type_id == TypeId::STR {
+            let string_obj = unsafe { &*(ptr as *const StringObject) };
+            string_obj.as_str().to_string()
+        } else {
+            return Err(BuiltinError::TypeError(
+                "attribute name must be string".to_string(),
+            ));
+        }
+    } else {
+        return Err(BuiltinError::TypeError(
+            "attribute name must be string".to_string(),
+        ));
+    };
+
+    // Try to set the attribute
+    if let Some(ptr) = obj.as_object_ptr() {
+        use prism_runtime::object::ObjectHeader;
+        use prism_runtime::object::shape::shape_registry;
+        use prism_runtime::object::shaped_object::ShapedObject;
+        use prism_runtime::object::type_obj::TypeId;
+
+        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+
+        if type_id == TypeId::OBJECT {
+            let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
+            let registry = shape_registry();
+            let interned_name = prism_core::intern::intern(&name_str);
+            shaped.set_property(interned_name, value, registry);
+            return Ok(Value::none());
+        } else {
+            return Err(BuiltinError::TypeError(format!(
+                "'{}' object has no attribute '{}'",
+                type_id.name(),
+                name_str
+            )));
+        }
+    }
+
+    // Primitive types don't support setattr
+    Err(BuiltinError::TypeError(format!(
+        "'{}' object has no attribute '{}'",
+        get_type_name(obj),
+        name_str
+    )))
 }
 
-/// Builtin hasattr function.
+/// Builtin hasattr(object, name) function.
+///
+/// Returns True if the object has the named attribute, False otherwise.
+///
+/// # Python Semantics
+/// - `hasattr(x, 'name')` → True if x.name exists
+/// - Implemented by calling getattr and checking for AttributeError
 pub fn builtin_hasattr(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 2 {
         return Err(BuiltinError::TypeError(format!(
@@ -216,11 +336,56 @@ pub fn builtin_hasattr(args: &[Value]) -> Result<Value, BuiltinError> {
             args.len()
         )));
     }
-    // TODO: Check if object has attribute
+
+    let obj = args[0];
+    let name = args[1];
+
+    // Validate name is a string
+    let name_str = if let Some(ptr) = name.as_object_ptr() {
+        use prism_runtime::object::ObjectHeader;
+        use prism_runtime::object::type_obj::TypeId;
+        use prism_runtime::types::string::StringObject;
+
+        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+        if type_id == TypeId::STR {
+            let string_obj = unsafe { &*(ptr as *const StringObject) };
+            string_obj.as_str().to_string()
+        } else {
+            return Err(BuiltinError::TypeError(
+                "attribute name must be string".to_string(),
+            ));
+        }
+    } else {
+        return Err(BuiltinError::TypeError(
+            "attribute name must be string".to_string(),
+        ));
+    };
+
+    // Check if the attribute exists
+    if let Some(ptr) = obj.as_object_ptr() {
+        use prism_runtime::object::ObjectHeader;
+        use prism_runtime::object::shaped_object::ShapedObject;
+        use prism_runtime::object::type_obj::TypeId;
+
+        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+
+        if type_id == TypeId::OBJECT {
+            let shaped = unsafe { &*(ptr as *const ShapedObject) };
+            return Ok(Value::bool(shaped.get_property(&name_str).is_some()));
+        }
+    }
+
+    // For other types, always return False (no custom attributes)
     Ok(Value::bool(false))
 }
 
-/// Builtin delattr function.
+/// Builtin delattr(object, name) function.
+///
+/// Deletes the named attribute from the object.
+///
+/// # Python Semantics
+/// - `delattr(x, 'name')` → del x.name
+/// - Raises AttributeError if attribute doesn't exist
 pub fn builtin_delattr(args: &[Value]) -> Result<Value, BuiltinError> {
     if args.len() != 2 {
         return Err(BuiltinError::TypeError(format!(
@@ -228,10 +393,85 @@ pub fn builtin_delattr(args: &[Value]) -> Result<Value, BuiltinError> {
             args.len()
         )));
     }
-    // TODO: Delete attribute from object
-    Err(BuiltinError::NotImplemented(
-        "delattr() not yet implemented".to_string(),
-    ))
+
+    let obj = args[0];
+    let name = args[1];
+
+    // Validate name is a string
+    let name_str = if let Some(ptr) = name.as_object_ptr() {
+        use prism_runtime::object::ObjectHeader;
+        use prism_runtime::object::type_obj::TypeId;
+        use prism_runtime::types::string::StringObject;
+
+        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+        if type_id == TypeId::STR {
+            let string_obj = unsafe { &*(ptr as *const StringObject) };
+            string_obj.as_str().to_string()
+        } else {
+            return Err(BuiltinError::TypeError(
+                "attribute name must be string".to_string(),
+            ));
+        }
+    } else {
+        return Err(BuiltinError::TypeError(
+            "attribute name must be string".to_string(),
+        ));
+    };
+
+    // Try to delete the attribute
+    if let Some(ptr) = obj.as_object_ptr() {
+        use prism_runtime::object::ObjectHeader;
+        use prism_runtime::object::shaped_object::ShapedObject;
+        use prism_runtime::object::type_obj::TypeId;
+
+        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+
+        if type_id == TypeId::OBJECT {
+            let shaped = unsafe { &mut *(ptr as *mut ShapedObject) };
+            if shaped.delete_property(&name_str) {
+                return Ok(Value::none());
+            } else {
+                return Err(BuiltinError::AttributeError(format!(
+                    "'object' object has no attribute '{}'",
+                    name_str
+                )));
+            }
+        } else {
+            return Err(BuiltinError::TypeError(format!(
+                "'{}' object has no attribute '{}'",
+                type_id.name(),
+                name_str
+            )));
+        }
+    }
+
+    // Primitive types don't support delattr
+    Err(BuiltinError::TypeError(format!(
+        "'{}' object has no attribute '{}'",
+        get_type_name(obj),
+        name_str
+    )))
+}
+
+/// Helper to get the type name of a value.
+fn get_type_name(value: Value) -> &'static str {
+    if value.is_none() {
+        "NoneType"
+    } else if value.is_bool() {
+        "bool"
+    } else if value.is_int() {
+        "int"
+    } else if value.is_float() {
+        "float"
+    } else if value.is_string() {
+        "str"
+    } else if let Some(ptr) = value.as_object_ptr() {
+        use prism_runtime::object::ObjectHeader;
+        let type_id = unsafe { (*(ptr as *const ObjectHeader)).type_id };
+        type_id.name()
+    } else {
+        "unknown"
+    }
 }
 
 #[cfg(test)]
