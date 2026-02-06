@@ -3,11 +3,13 @@
 //! The VirtualMachine is the main execution engine for Prism bytecode.
 //! It manages frames, globals, builtins, and the dispatch loop.
 
+use crate::allocator::GcAllocator;
 use crate::builtins::BuiltinRegistry;
 use crate::dispatch::{ControlFlow, get_handler};
 use crate::error::{RuntimeError, VmResult};
 use crate::exception::{ExcInfoStack, ExceptionState, HandlerStack, InlineHandlerCache};
 use crate::frame::{Frame, MAX_RECURSION_DEPTH};
+use crate::gc_integration::ManagedHeap;
 use crate::globals::GlobalScope;
 use crate::ic_manager::ICManager;
 use crate::import::ImportResolver;
@@ -29,6 +31,7 @@ use std::sync::Arc;
 /// - Inline caching for attribute access
 /// - Profiling for JIT tier-up decisions
 /// - Optional JIT compilation and execution
+/// - GC-managed heap for object allocation
 pub struct VirtualMachine {
     /// Frame stack (limited by MAX_RECURSION_DEPTH).
     pub frames: Vec<Frame>,
@@ -50,6 +53,13 @@ pub struct VirtualMachine {
     jit: Option<JitContext>,
     /// Temporary storage for JIT return value when root frame executes via JIT.
     jit_return_value: Option<Value>,
+
+    // =========================================================================
+    // GC Integration
+    // =========================================================================
+    /// GC-managed heap for object allocation.
+    /// All runtime objects (List, Tuple, Dict, etc.) are allocated from here.
+    heap: ManagedHeap,
 
     // =========================================================================
     // Exception Handling State
@@ -84,6 +94,7 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit: None,
             jit_return_value: None,
+            heap: ManagedHeap::with_defaults(),
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
             handler_cache: InlineHandlerCache::new(),
@@ -107,6 +118,7 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit: Some(JitContext::with_defaults()),
             jit_return_value: None,
+            heap: ManagedHeap::with_defaults(),
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
             handler_cache: InlineHandlerCache::new(),
@@ -135,6 +147,7 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit,
             jit_return_value: None,
+            heap: ManagedHeap::with_defaults(),
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
             handler_cache: InlineHandlerCache::new(),
@@ -158,6 +171,7 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit: None,
             jit_return_value: None,
+            heap: ManagedHeap::with_defaults(),
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
             handler_cache: InlineHandlerCache::new(),
@@ -679,6 +693,52 @@ impl VirtualMachine {
     pub fn clear_frames(&mut self) {
         self.frames.clear();
         self.current_frame_idx = 0;
+    }
+
+    // =========================================================================
+    // GC Integration
+    // =========================================================================
+
+    /// Get read-only access to the managed heap.
+    ///
+    /// Use this to query heap statistics, check collection thresholds,
+    /// or read heap configuration.
+    #[inline]
+    pub fn heap(&self) -> &ManagedHeap {
+        &self.heap
+    }
+
+    /// Get mutable access to the managed heap.
+    ///
+    /// Required for:
+    /// - Triggering garbage collection
+    /// - Updating root sets
+    /// - Modifying heap configuration
+    #[inline]
+    pub fn heap_mut(&mut self) -> &mut ManagedHeap {
+        &mut self.heap
+    }
+
+    /// Get a typed allocator for GC-managed object allocation.
+    ///
+    /// This provides a zero-cost typed interface for allocating objects
+    /// on the GC heap. The allocator borrows the underlying GcHeap,
+    /// ensuring type-safe allocation with proper Trace bounds.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let list = vm.allocator().alloc(ListObject::from_slice(&values))?;
+    /// let value = Value::object_ptr(list as *const ());
+    /// ```
+    ///
+    /// # Performance
+    ///
+    /// This method is `#[inline]` and creates a zero-cost wrapper.
+    /// The allocator itself is stack-allocated and holds only a reference.
+    #[inline]
+    pub fn allocator(&self) -> GcAllocator<'_> {
+        GcAllocator::new(self.heap.heap())
     }
 
     // =========================================================================
