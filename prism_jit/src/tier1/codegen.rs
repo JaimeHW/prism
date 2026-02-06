@@ -240,6 +240,77 @@ impl TemplateCompiler {
                 }
                 .emit(ctx);
             }
+            TemplateInstruction::LoadLocal { dst, slot, .. } => {
+                LoadLocalTemplate {
+                    dst_reg: *dst,
+                    local_idx: *slot,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::StoreLocal { src, slot, .. } => {
+                StoreLocalTemplate {
+                    src_reg: *src,
+                    local_idx: *slot,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::DeleteLocal { slot, .. } => {
+                DeleteLocalTemplate { local_idx: *slot }.emit(ctx);
+            }
+            TemplateInstruction::LoadGlobal { dst, name_idx, .. } => {
+                LoadGlobalTemplate {
+                    dst_reg: *dst,
+                    name_idx: *name_idx,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::StoreGlobal { src, name_idx, .. } => {
+                StoreGlobalTemplate {
+                    src_reg: *src,
+                    name_idx: *name_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::DeleteGlobal { name_idx, .. } => {
+                DeleteGlobalTemplate {
+                    name_idx: *name_idx,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            // Closure operations - deopt to interpreter for Tier 1
+            // (requires closure environment access from VM context)
+            TemplateInstruction::LoadClosure { .. } => {
+                // Closure cell access requires VM context - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::StoreClosure { .. } => {
+                // Closure cell write requires VM context - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::DeleteClosure { .. } => {
+                // Closure cell clear requires VM context - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            // Object attribute operations - deopt to interpreter for Tier 1
+            // (requires type dispatch and Shape/slot management)
+            TemplateInstruction::GetAttr { .. } => {
+                // Attribute access requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::SetAttr { .. } => {
+                // Attribute write requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::DelAttr { .. } => {
+                // Attribute delete requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
+            TemplateInstruction::LoadMethod { .. } => {
+                // Method loading requires type dispatch - deopt for Tier 1
+                ctx.asm.nop();
+            }
             TemplateInstruction::IntAdd { dst, lhs, rhs, .. } => {
                 IntAddTemplate {
                     dst_reg: *dst,
@@ -263,6 +334,32 @@ impl TemplateCompiler {
                     dst_reg: *dst,
                     lhs_reg: *lhs,
                     rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IntDiv { dst, lhs, rhs, .. } => {
+                IntFloorDivTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IntMod { dst, lhs, rhs, .. } => {
+                IntModTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IntNeg { dst, src, .. } => {
+                IntNegTemplate {
+                    dst_reg: *dst,
+                    src_reg: *src,
                     deopt_idx,
                 }
                 .emit(ctx);
@@ -299,6 +396,31 @@ impl TemplateCompiler {
                 }
                 .emit(ctx);
             }
+            TemplateInstruction::FloatFloorDiv { dst, lhs, rhs, .. } => {
+                FloatFloorDivTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::FloatMod { dst, lhs, rhs, .. } => {
+                FloatModTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::FloatNeg { dst, src, .. } => {
+                FloatNegTemplate {
+                    dst_reg: *dst,
+                    src_reg: *src,
+                }
+                .emit(ctx);
+            }
             TemplateInstruction::Jump { target, .. } => {
                 if let Some(label) = labels.get(target) {
                     JumpTemplate { target: *label }.emit(ctx);
@@ -320,6 +442,24 @@ impl TemplateCompiler {
                         condition_reg: *cond,
                         target: *label,
                         deopt_idx,
+                    }
+                    .emit(ctx);
+                }
+            }
+            TemplateInstruction::BranchIfNone { cond, target, .. } => {
+                if let Some(label) = labels.get(target) {
+                    BranchIfNoneTemplate {
+                        condition_reg: *cond,
+                        target: *label,
+                    }
+                    .emit(ctx);
+                }
+            }
+            TemplateInstruction::BranchIfNotNone { cond, target, .. } => {
+                if let Some(label) = labels.get(target) {
+                    BranchIfNotNoneTemplate {
+                        condition_reg: *cond,
+                        target: *label,
                     }
                     .emit(ctx);
                 }
@@ -431,6 +571,102 @@ impl TemplateCompiler {
                 }
                 .emit(ctx);
             }
+            // Generic (polymorphic) comparisons - runtime dispatch (NOP in tier1)
+            TemplateInstruction::GenericLt { .. }
+            | TemplateInstruction::GenericLe { .. }
+            | TemplateInstruction::GenericGt { .. }
+            | TemplateInstruction::GenericGe { .. }
+            | TemplateInstruction::GenericEq { .. }
+            | TemplateInstruction::GenericNe { .. } => {
+                // Generic comparisons require runtime dispatch for polymorphic behavior
+                // For tier1, these emit nothing and rely on interpreter fallback
+                // TODO: Add type-specialized fast paths with guards
+            }
+            // Bitwise operations
+            TemplateInstruction::IntAnd { dst, lhs, rhs, .. } => {
+                BitwiseAndTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IntOr { dst, lhs, rhs, .. } => {
+                BitwiseOrTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IntXor { dst, lhs, rhs, .. } => {
+                BitwiseXorTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IntNot { dst, src, .. } => {
+                BitwiseNotTemplate {
+                    dst_reg: *dst,
+                    src_reg: *src,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IntShl { dst, lhs, rhs, .. } => {
+                ShlTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IntShr { dst, lhs, rhs, .. } => {
+                ShrTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::LogicalNot { dst, src, .. } => {
+                NotTemplate {
+                    dst_reg: *dst,
+                    src_reg: *src,
+                    deopt_idx,
+                }
+                .emit(ctx);
+            }
+            // Identity operations (pointer equality)
+            TemplateInstruction::Is { dst, lhs, rhs, .. } => {
+                IsTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                }
+                .emit(ctx);
+            }
+            TemplateInstruction::IsNot { dst, lhs, rhs, .. } => {
+                IsNotTemplate {
+                    dst_reg: *dst,
+                    lhs_reg: *lhs,
+                    rhs_reg: *rhs,
+                }
+                .emit(ctx);
+            }
+            // Membership operations - runtime dispatch (NOP in tier1, handled by interpreter fallback)
+            TemplateInstruction::In { .. } | TemplateInstruction::NotIn { .. } => {
+                // Membership tests require complex runtime logic (__contains__ or iteration)
+                // For tier1, these emit nothing and rely on interpreter fallback
+                // TODO: Add specialized templates for common container types
+            }
             // Type guards
             TemplateInstruction::GuardInt { reg, .. } => {
                 GuardIntTemplate {
@@ -503,6 +739,155 @@ pub enum TemplateInstruction {
         src: u8,
     },
 
+    // Local variable operations
+    /// Load from local variable slot: dst = locals[slot]
+    LoadLocal {
+        bc_offset: u32,
+        dst: u8,
+        slot: u16,
+    },
+    /// Store to local variable slot: locals[slot] = src
+    StoreLocal {
+        bc_offset: u32,
+        src: u8,
+        slot: u16,
+    },
+    /// Delete local variable slot: locals[slot] = undefined
+    DeleteLocal {
+        bc_offset: u32,
+        slot: u16,
+    },
+
+    // Global variable operations
+    /// Load from global variable: dst = globals[name_idx]
+    LoadGlobal {
+        bc_offset: u32,
+        dst: u8,
+        name_idx: u16,
+    },
+    /// Store to global variable: globals[name_idx] = src
+    StoreGlobal {
+        bc_offset: u32,
+        src: u8,
+        name_idx: u16,
+    },
+    /// Delete global variable: del globals[name_idx]
+    DeleteGlobal {
+        bc_offset: u32,
+        name_idx: u16,
+    },
+
+    // Closure variable operations
+    /// Load from closure cell: dst = closure[cell_idx].get()
+    /// Can fail if cell is unbound (UnboundLocalError)
+    LoadClosure {
+        bc_offset: u32,
+        dst: u8,
+        cell_idx: u16,
+    },
+    /// Store to closure cell: closure[cell_idx].set(src)
+    StoreClosure {
+        bc_offset: u32,
+        src: u8,
+        cell_idx: u16,
+    },
+    /// Delete closure cell: closure[cell_idx].clear()
+    DeleteClosure {
+        bc_offset: u32,
+        cell_idx: u16,
+    },
+
+    // Object attribute operations
+    /// Get attribute: dst = obj.attr[name_idx]
+    /// Requires type dispatch - deopt for Tier 1
+    GetAttr {
+        bc_offset: u32,
+        dst: u8,
+        obj: u8,
+        name_idx: u8, // 8-bit name index from src2 field
+    },
+    /// Set attribute: obj.attr[name_idx] = value
+    /// Requires type dispatch - deopt for Tier 1
+    SetAttr {
+        bc_offset: u32,
+        obj: u8,
+        name_idx: u8,
+        value: u8,
+    },
+    /// Delete attribute: del obj.attr[name_idx]
+    /// Requires type dispatch - deopt for Tier 1
+    DelAttr {
+        bc_offset: u32,
+        obj: u8,
+        name_idx: u8,
+    },
+    /// Load method for optimized method calls: dst = obj.method
+    /// Requires type dispatch - deopt for Tier 1
+    LoadMethod {
+        bc_offset: u32,
+        dst: u8,
+        obj: u8,
+        name_idx: u8,
+    },
+
+    // Container item operations
+    /// Get item: dst = container[key]
+    /// Requires type dispatch - deopt for Tier 1
+    GetItem {
+        bc_offset: u32,
+        dst: u8,
+        container: u8,
+        key: u8,
+    },
+    /// Set item: container[key] = value
+    /// Requires type dispatch - deopt for Tier 1
+    SetItem {
+        bc_offset: u32,
+        container: u8,
+        key: u8,
+        value: u8,
+    },
+    /// Delete item: del container[key]
+    /// Requires type dispatch - deopt for Tier 1
+    DelItem {
+        bc_offset: u32,
+        container: u8,
+        key: u8,
+    },
+
+    // Iteration operations
+    /// Get iterator: dst = iter(src)
+    /// Requires type dispatch - deopt for Tier 1
+    GetIter {
+        bc_offset: u32,
+        dst: u8,
+        src: u8,
+    },
+    /// For-loop iterator advance: dst = next(iter), jump if StopIteration
+    /// Requires iterator state access - deopt for Tier 1
+    ForIter {
+        bc_offset: u32,
+        dst: u8,
+        iter: u8,
+        offset: i8, // Jump offset on StopIteration
+    },
+
+    // Utility operations
+    /// Get length: dst = len(src)
+    /// Requires type dispatch - deopt for Tier 1
+    Len {
+        bc_offset: u32,
+        dst: u8,
+        src: u8,
+    },
+    /// Check if callable: dst = callable(src)
+    /// Requires type checking - deopt for Tier 1
+    IsCallable {
+        bc_offset: u32,
+        dst: u8,
+        src: u8,
+    },
+
     // Integer arithmetic
     IntAdd {
         bc_offset: u32,
@@ -521,6 +906,23 @@ pub enum TemplateInstruction {
         dst: u8,
         lhs: u8,
         rhs: u8,
+    },
+    IntDiv {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    IntMod {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    IntNeg {
+        bc_offset: u32,
+        dst: u8,
+        src: u8,
     },
 
     // Float arithmetic
@@ -547,6 +949,26 @@ pub enum TemplateInstruction {
         dst: u8,
         lhs: u8,
         rhs: u8,
+    },
+    /// Float floor division: dst = floor(lhs / rhs)
+    FloatFloorDiv {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Float modulo: dst = lhs % rhs (Python semantics)
+    FloatMod {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Float negation: dst = -src
+    FloatNeg {
+        bc_offset: u32,
+        dst: u8,
+        src: u8,
     },
 
     // Integer comparisons
@@ -625,6 +1047,131 @@ pub enum TemplateInstruction {
         rhs: u8,
     },
 
+    // Generic (polymorphic) comparisons - require runtime dispatch
+    /// Generic less than: dst = lhs < rhs
+    GenericLt {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Generic less than or equal: dst = lhs <= rhs
+    GenericLe {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Generic greater than: dst = lhs > rhs
+    GenericGt {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Generic greater than or equal: dst = lhs >= rhs
+    GenericGe {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Generic equal: dst = lhs == rhs
+    GenericEq {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Generic not equal: dst = lhs != rhs
+    GenericNe {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+
+    // Bitwise operations
+    /// Bitwise AND: dst = lhs & rhs
+    IntAnd {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Bitwise OR: dst = lhs | rhs
+    IntOr {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Bitwise XOR: dst = lhs ^ rhs
+    IntXor {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Bitwise NOT: dst = ~src
+    IntNot {
+        bc_offset: u32,
+        dst: u8,
+        src: u8,
+    },
+    /// Left shift: dst = lhs << rhs
+    IntShl {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Right shift: dst = lhs >> rhs (arithmetic)
+    IntShr {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Logical NOT: dst = not src
+    LogicalNot {
+        bc_offset: u32,
+        dst: u8,
+        src: u8,
+    },
+
+    // Identity operations
+    /// Identity check: dst = lhs is rhs
+    Is {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Not identity check: dst = lhs is not rhs
+    IsNot {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+
+    // Membership operations
+    /// Membership check: dst = lhs in rhs
+    In {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+    /// Not membership check: dst = lhs not in rhs
+    NotIn {
+        bc_offset: u32,
+        dst: u8,
+        lhs: u8,
+        rhs: u8,
+    },
+
     // Type guards (emit deopt on type mismatch)
     GuardInt {
         bc_offset: u32,
@@ -658,6 +1205,18 @@ pub enum TemplateInstruction {
         cond: u8,
         target: u32,
     },
+    /// Branch if value is None
+    BranchIfNone {
+        bc_offset: u32,
+        cond: u8,
+        target: u32,
+    },
+    /// Branch if value is not None
+    BranchIfNotNone {
+        bc_offset: u32,
+        cond: u8,
+        target: u32,
+    },
     Return {
         bc_offset: u32,
         value: u8,
@@ -678,13 +1237,32 @@ impl TemplateInstruction {
             | TemplateInstruction::LoadNone { bc_offset, .. }
             | TemplateInstruction::LoadBool { bc_offset, .. }
             | TemplateInstruction::Move { bc_offset, .. }
+            | TemplateInstruction::LoadLocal { bc_offset, .. }
+            | TemplateInstruction::StoreLocal { bc_offset, .. }
+            | TemplateInstruction::DeleteLocal { bc_offset, .. }
+            | TemplateInstruction::LoadGlobal { bc_offset, .. }
+            | TemplateInstruction::StoreGlobal { bc_offset, .. }
+            | TemplateInstruction::DeleteGlobal { bc_offset, .. }
+            | TemplateInstruction::LoadClosure { bc_offset, .. }
+            | TemplateInstruction::StoreClosure { bc_offset, .. }
+            | TemplateInstruction::DeleteClosure { bc_offset, .. }
+            | TemplateInstruction::GetAttr { bc_offset, .. }
+            | TemplateInstruction::SetAttr { bc_offset, .. }
+            | TemplateInstruction::DelAttr { bc_offset, .. }
+            | TemplateInstruction::LoadMethod { bc_offset, .. }
             | TemplateInstruction::IntAdd { bc_offset, .. }
             | TemplateInstruction::IntSub { bc_offset, .. }
             | TemplateInstruction::IntMul { bc_offset, .. }
+            | TemplateInstruction::IntDiv { bc_offset, .. }
+            | TemplateInstruction::IntMod { bc_offset, .. }
+            | TemplateInstruction::IntNeg { bc_offset, .. }
             | TemplateInstruction::FloatAdd { bc_offset, .. }
             | TemplateInstruction::FloatSub { bc_offset, .. }
             | TemplateInstruction::FloatMul { bc_offset, .. }
             | TemplateInstruction::FloatDiv { bc_offset, .. }
+            | TemplateInstruction::FloatFloorDiv { bc_offset, .. }
+            | TemplateInstruction::FloatMod { bc_offset, .. }
+            | TemplateInstruction::FloatNeg { bc_offset, .. }
             | TemplateInstruction::IntLt { bc_offset, .. }
             | TemplateInstruction::IntLe { bc_offset, .. }
             | TemplateInstruction::IntGt { bc_offset, .. }
@@ -697,6 +1275,23 @@ impl TemplateInstruction {
             | TemplateInstruction::FloatGe { bc_offset, .. }
             | TemplateInstruction::FloatEq { bc_offset, .. }
             | TemplateInstruction::FloatNe { bc_offset, .. }
+            | TemplateInstruction::GenericLt { bc_offset, .. }
+            | TemplateInstruction::GenericLe { bc_offset, .. }
+            | TemplateInstruction::GenericGt { bc_offset, .. }
+            | TemplateInstruction::GenericGe { bc_offset, .. }
+            | TemplateInstruction::GenericEq { bc_offset, .. }
+            | TemplateInstruction::GenericNe { bc_offset, .. }
+            | TemplateInstruction::IntAnd { bc_offset, .. }
+            | TemplateInstruction::IntOr { bc_offset, .. }
+            | TemplateInstruction::IntXor { bc_offset, .. }
+            | TemplateInstruction::IntNot { bc_offset, .. }
+            | TemplateInstruction::IntShl { bc_offset, .. }
+            | TemplateInstruction::IntShr { bc_offset, .. }
+            | TemplateInstruction::LogicalNot { bc_offset, .. }
+            | TemplateInstruction::Is { bc_offset, .. }
+            | TemplateInstruction::IsNot { bc_offset, .. }
+            | TemplateInstruction::In { bc_offset, .. }
+            | TemplateInstruction::NotIn { bc_offset, .. }
             | TemplateInstruction::GuardInt { bc_offset, .. }
             | TemplateInstruction::GuardFloat { bc_offset, .. }
             | TemplateInstruction::GuardBool { bc_offset, .. }
@@ -704,6 +1299,8 @@ impl TemplateInstruction {
             | TemplateInstruction::Jump { bc_offset, .. }
             | TemplateInstruction::BranchIfTrue { bc_offset, .. }
             | TemplateInstruction::BranchIfFalse { bc_offset, .. }
+            | TemplateInstruction::BranchIfNone { bc_offset, .. }
+            | TemplateInstruction::BranchIfNotNone { bc_offset, .. }
             | TemplateInstruction::Return { bc_offset, .. }
             | TemplateInstruction::Nop { bc_offset } => *bc_offset,
         }
@@ -726,12 +1323,26 @@ impl TemplateInstruction {
             TemplateInstruction::IntAdd { .. }
                 | TemplateInstruction::IntSub { .. }
                 | TemplateInstruction::IntMul { .. }
+                | TemplateInstruction::IntDiv { .. }
+                | TemplateInstruction::IntMod { .. }
+                | TemplateInstruction::IntNeg { .. }
                 | TemplateInstruction::IntLt { .. }
                 | TemplateInstruction::IntLe { .. }
                 | TemplateInstruction::IntGt { .. }
                 | TemplateInstruction::IntGe { .. }
                 | TemplateInstruction::IntEq { .. }
                 | TemplateInstruction::IntNe { .. }
+                | TemplateInstruction::IntAnd { .. }
+                | TemplateInstruction::IntOr { .. }
+                | TemplateInstruction::IntXor { .. }
+                | TemplateInstruction::IntNot { .. }
+                | TemplateInstruction::IntShl { .. }
+                | TemplateInstruction::IntShr { .. }
+                | TemplateInstruction::LogicalNot { .. }
+                | TemplateInstruction::FloatFloorDiv { .. }
+                | TemplateInstruction::FloatMod { .. }
+                | TemplateInstruction::LoadGlobal { .. }
+                | TemplateInstruction::DeleteGlobal { .. }
                 | TemplateInstruction::BranchIfTrue { .. }
                 | TemplateInstruction::BranchIfFalse { .. }
                 | TemplateInstruction::GuardInt { .. }
@@ -747,12 +1358,26 @@ impl TemplateInstruction {
             TemplateInstruction::IntAdd { .. }
             | TemplateInstruction::IntSub { .. }
             | TemplateInstruction::IntMul { .. }
+            | TemplateInstruction::IntDiv { .. }
+            | TemplateInstruction::IntMod { .. }
+            | TemplateInstruction::IntNeg { .. }
             | TemplateInstruction::IntLt { .. }
             | TemplateInstruction::IntLe { .. }
             | TemplateInstruction::IntGt { .. }
             | TemplateInstruction::IntGe { .. }
             | TemplateInstruction::IntEq { .. }
             | TemplateInstruction::IntNe { .. }
+            | TemplateInstruction::IntAnd { .. }
+            | TemplateInstruction::IntOr { .. }
+            | TemplateInstruction::IntXor { .. }
+            | TemplateInstruction::IntNot { .. }
+            | TemplateInstruction::IntShl { .. }
+            | TemplateInstruction::IntShr { .. }
+            | TemplateInstruction::LogicalNot { .. }
+            | TemplateInstruction::FloatFloorDiv { .. }
+            | TemplateInstruction::FloatMod { .. }
+            | TemplateInstruction::LoadGlobal { .. }
+            | TemplateInstruction::DeleteGlobal { .. }
             | TemplateInstruction::GuardInt { .. }
             | TemplateInstruction::GuardFloat { .. }
             | TemplateInstruction::GuardBool { .. }
