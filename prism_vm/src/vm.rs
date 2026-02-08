@@ -241,7 +241,6 @@ impl VirtualMachine {
                 }
 
                 ControlFlow::Call { code, return_reg } => {
-                    eprintln!("[DEBUG Call] Calling function, return_reg={}", return_reg);
                     self.push_frame(code, return_reg)?;
                 }
 
@@ -295,19 +294,14 @@ impl VirtualMachine {
                 }
 
                 ControlFlow::Reraise => {
-                    eprintln!("[DEBUG ControlFlow::Reraise] Entered handler");
                     // Re-raise the current active exception
                     // First check active_exception_type_id (for except handlers)
                     // then fall back to exc_info_stack (for finally blocks)
                     let type_id = if let Some(tid) = self.active_exception_type_id {
-                        eprintln!("[DEBUG Reraise] type_id from active={}", tid);
                         tid
                     } else if let Some(exc_info) = self.exc_info_stack.peek() {
-                        let tid = exc_info.type_id();
-                        eprintln!("[DEBUG Reraise] type_id from exc_info={}", tid);
-                        tid
+                        exc_info.type_id()
                     } else {
-                        eprintln!("[DEBUG Reraise] No type_id found!");
                         return Err(
                             RuntimeError::type_error("No active exception to re-raise").into()
                         );
@@ -337,13 +331,6 @@ impl VirtualMachine {
 
                             self.frames.pop();
                             self.current_frame_idx = self.frames.len() - 1;
-
-                            eprintln!(
-                                "[DEBUG Reraise unwinding] frames.len={}, current_frame_idx={}, frame.ip={}",
-                                self.frames.len(),
-                                self.current_frame_idx,
-                                self.frames[self.current_frame_idx].ip
-                            );
 
                             if let Some(handler_entry) = self.find_exception_handler(type_id) {
                                 let frame = &mut self.frames[self.current_frame_idx];
@@ -430,8 +417,6 @@ impl VirtualMachine {
                     // Map RuntimeErrorKind to ExceptionTypeId for handler lookup
                     use crate::error::RuntimeErrorKind;
                     use crate::stdlib::exceptions::types::ExceptionTypeId;
-
-                    eprintln!("[DEBUG ControlFlow::Error] kind={:?}", err.kind);
 
                     let type_id = match &err.kind {
                         RuntimeErrorKind::TypeError { .. } => {
@@ -884,33 +869,17 @@ impl VirtualMachine {
         let frame = &self.frames[self.current_frame_idx];
         let pc = frame.ip.saturating_sub(1); // PC is post-increment, so -1 for current instruction
 
-        eprintln!(
-            "[DEBUG find_handler] pc={}, type_id={}, table_len={}",
-            pc,
-            type_id,
-            frame.code.exception_table.len()
-        );
-
         // Search exception table for matching handler
         // The handler bytecode itself uses ExceptionMatch opcode to do type matching,
         // so we just need to find any handler covering this PC range.
         for entry in frame.code.exception_table.iter() {
-            eprintln!(
-                "[DEBUG find_handler]   entry: start={}, end={}, handler={}",
-                entry.start_pc, entry.end_pc, entry.handler_pc
-            );
             // Check if PC is in range
             if pc >= entry.start_pc && pc < entry.end_pc {
-                eprintln!(
-                    "[DEBUG find_handler]   FOUND handler at {}",
-                    entry.handler_pc
-                );
                 // Jump to handler - handler bytecode will do type matching via ExceptionMatch
                 return Some(entry.handler_pc);
             }
         }
 
-        eprintln!("[DEBUG find_handler]   NO handler found");
         None
     }
 
