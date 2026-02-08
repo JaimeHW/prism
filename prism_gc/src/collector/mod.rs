@@ -40,6 +40,8 @@ mod concurrent_major_tests;
 #[cfg(test)]
 mod concurrent_marker_tests;
 #[cfg(test)]
+mod integration_tests;
+#[cfg(test)]
 mod mark_bitmap_tests;
 
 pub use concurrent_major::{
