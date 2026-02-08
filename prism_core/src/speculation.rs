@@ -121,7 +121,7 @@ impl PgoBranchHint {
         let numer = if total == 0 {
             u32::MAX / 2 // Default to 50/50 for no data
         } else {
-            ((taken as u128 * Self::DENOM as u128) / total as u128) as u32
+            ((taken as u128 * Self::DENOM as u128) / total as u128).min(u32::MAX as u128) as u32
         };
         Self {
             offset,
