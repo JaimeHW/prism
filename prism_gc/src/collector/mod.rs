@@ -84,17 +84,21 @@ pub enum CollectionType {
     Minor,
     /// Major (full) collection.
     Major,
+    /// Concurrent major (3-phase mark-sweep) collection.
+    ConcurrentMajor,
 }
 
 /// Collector state machine.
 ///
-/// Orchestrates minor and major collections, providing a unified interface
-/// for the runtime to trigger garbage collection.
+/// Orchestrates minor, major, and concurrent major collections,
+/// providing a unified interface for the runtime to trigger GC.
 pub struct Collector {
     /// Minor collector for nursery.
     minor: MinorCollector,
-    /// Major collector for full heap.
+    /// Major collector for full heap (STW mark-sweep).
     major: MajorCollector,
+    /// Concurrent major collector (3-phase concurrent mark-sweep).
+    concurrent_major: ConcurrentMajorCollector,
 }
 
 impl Collector {
@@ -104,6 +108,7 @@ impl Collector {
         Self {
             minor: MinorCollector::new(),
             major: MajorCollector::new(),
+            concurrent_major: ConcurrentMajorCollector::new(),
         }
     }
 
@@ -116,6 +121,20 @@ impl Collector {
         Self {
             minor: MinorCollector::with_promotion_age(promotion_age),
             major: MajorCollector::new(),
+            concurrent_major: ConcurrentMajorCollector::new(),
+        }
+    }
+
+    /// Create a collector with custom concurrent major config.
+    #[inline]
+    pub fn with_concurrent_config(
+        promotion_age: u8,
+        concurrent_config: ConcurrentMajorConfig,
+    ) -> Self {
+        Self {
+            minor: MinorCollector::with_promotion_age(promotion_age),
+            major: MajorCollector::new(),
+            concurrent_major: ConcurrentMajorCollector::with_config(concurrent_config),
         }
     }
 
@@ -260,10 +279,69 @@ impl Collector {
         }
     }
 
+    /// Perform a concurrent major collection.
+    ///
+    /// Three-phase concurrent mark-sweep:
+    /// 1. Initial Mark (STW): Scan roots, activate SATB barrier
+    /// 2. Concurrent Mark: Multi-threaded tracing via work-stealing
+    /// 3. Remark + Sweep (STW): Drain SATB, re-scan roots, sweep
+    ///
+    /// # Arguments
+    /// - `heap`: The GC heap
+    /// - `roots`: Root set containing stack roots, globals, etc.
+    /// - `object_tracer`: Object tracer for type-aware tracing
+    pub fn collect_concurrent_major<T: ObjectTracer>(
+        &mut self,
+        heap: &mut GcHeap,
+        roots: &RootSet,
+        object_tracer: &T,
+    ) -> CollectionResult {
+        let start = Instant::now();
+
+        let result = self.concurrent_major.collect(heap, roots, object_tracer);
+
+        let duration = start.elapsed();
+        heap.stats().record_major_gc(duration);
+        heap.reset_gc_counter();
+
+        CollectionResult {
+            collection_type: CollectionType::ConcurrentMajor,
+            duration,
+            bytes_freed: result.bytes_freed,
+            objects_freed: result.objects_freed,
+            bytes_promoted: 0,
+            objects_promoted: 0,
+            live_bytes: result.live_bytes,
+        }
+    }
+
+    /// Perform concurrent major collection without object tracing.
+    ///
+    /// Useful for tests or when runtime is unavailable.
+    pub fn collect_concurrent_major_roots_only(
+        &mut self,
+        heap: &mut GcHeap,
+        roots: &RootSet,
+    ) -> CollectionResult {
+        self.collect_concurrent_major(heap, roots, &crate::trace::NoopObjectTracer)
+    }
+
     /// Get the minor collector's promotion age.
     #[inline]
     pub fn promotion_age(&self) -> u8 {
         self.minor.promotion_age()
+    }
+
+    /// Get a reference to the concurrent major collector.
+    #[inline]
+    pub fn concurrent_major(&self) -> &ConcurrentMajorCollector {
+        &self.concurrent_major
+    }
+
+    /// Get a mutable reference to the concurrent major collector.
+    #[inline]
+    pub fn concurrent_major_mut(&mut self) -> &mut ConcurrentMajorCollector {
+        &mut self.concurrent_major
     }
 }
 
