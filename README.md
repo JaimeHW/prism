@@ -20,12 +20,13 @@ Prism is a from-scratch implementation of the Python 3.12 runtime, engineered fo
 
 ### Multi-Tier Execution Engine
 - **Tier 0 Interpreter** — Register-based bytecode VM with static dispatch tables and arithmetic fast-paths
-- **Tier 1 Template JIT** — Direct bytecode-to-machine-code translation with minimal compilation overhead
+- **Tier 1 Template JIT** — Direct bytecode-to-machine-code translation with inline caching, type specialization, and deoptimization IC
 - **Tier 2 Optimizing JIT** — Sea-of-Nodes IR with aggressive optimizations and profile-guided compilation
 
 ### Advanced Optimizations
-- **Inline Caching** — Monomorphic and polymorphic caches for property access and method dispatch
-- **Type Speculation** — Profile-driven type guards with fast-path native arithmetic
+- **Inline Caching** — Monomorphic, polymorphic, and megamorphic caches for property access, method calls, and type dispatch
+- **Type Speculation** — Profile-driven type guards with fast-path specialization for dict, list, and string operations
+- **Profile-Guided Optimization** — Branch probability annotation and hot/cold code splitting from runtime profiles
 - **On-Stack Replacement** — Mid-loop tier-up from interpreter to optimized code
 - **Loop Optimizations** — LICM, Range Check Elimination, loop unrolling, and induction variable analysis
 - **Function Inlining** — Budget-based graph merging with escape analysis
@@ -33,6 +34,7 @@ Prism is a from-scratch implementation of the Python 3.12 runtime, engineered fo
 - **Global Value Numbering** — Common subexpression elimination across the IR graph
 - **Partial Redundancy Elimination** — Optimal code motion with PRE
 - **Sparse Conditional Constant Propagation** — Aggressive constant folding with branch elimination
+- **Instruction Combining** — Peephole optimizations on instruction sequences
 - **Tail Call Optimization** — Stack frame reuse for tail-recursive functions
 - **Dead Store Elimination** — Removal of stores that are never read
 - **Auto-Vectorization** — SIMD transformation for compatible loops
@@ -83,7 +85,7 @@ Prism is a from-scratch implementation of the Python 3.12 runtime, engineered fo
 - **Complete Parser** — Pratt parser with 16 precedence tiers for Python's complex grammar
 - **Scope Analysis** — Deep binding analysis with Local/Global/Cell/Free variable resolution
 - **Arbitrary Precision Integers** — Full `BigInt` support for Python integer semantics
-- **Standard Library** — `math`, `sys`, `os`, `time`, `re`, generators, and exception hierarchy modules
+- **Standard Library** — `math`, `sys`, `os`, `time`, `re`, `json`, `collections`, `functools`, `itertools`, `io`, generators, and exception hierarchy modules
 
 ## Quick Start
 
@@ -105,11 +107,11 @@ Prism is organized as a modular Rust workspace:
 
 ```
 prism/
-├── prism_core      # Fundamental types: Value (NaN-boxing), Span, Error, Interning
+├── prism_core      # Fundamental types: Value (NaN-boxing), Span, Error, Interning, Speculation
 ├── prism_parser    # Python 3.12 grammar and AST construction
 ├── prism_compiler  # Scope analysis, pattern matching, register-based bytecode emission
 ├── prism_vm        # Execution engine, interpreter, JIT bridge, stdlib modules
-├── prism_jit       # Multi-tier JIT: IR, optimization passes, x64 codegen, SIMD
+├── prism_jit       # Multi-tier JIT: IR, optimization passes, x64/ARM64 codegen, SIMD
 ├── prism_runtime   # Object system, shapes, types (list, dict, set, string, etc.)
 ├── prism_gc        # Generational Immix collector with TLABs and write barriers
 ├── prism_builtins  # Builtin function implementations
@@ -134,7 +136,7 @@ Source ─▶ Parser ─▶ Compiler ─┼─▶│    (Linear Scan + SIMD Regs
    │                                            │ OSR (hot loops)
    │                          ┌─────────────────┴───────────────────────┐
    │                          │           Tier 1 Template JIT           │
-   │                          │  Direct bytecode → machine code mapping │
+   │                          │  Bytecode → x64 · IC · Type Specialize  │
    │                          └─────────────────▲───────────────────────┘
    │                                            │ tier-up (hot functions)
    │                          ┌─────────────────┴───────────────────────┐
@@ -145,29 +147,35 @@ Source ─▶ Parser ─▶ Compiler ─┼─▶│    (Linear Scan + SIMD Regs
 
 ### Optimization Pipeline
 
-The Tier 2 JIT runs an 11-pass optimization pipeline:
+The Tier 2 JIT runs a 15-pass optimization pipeline across 6 phases:
 
-| Pass | Description |
-|:-----|:------------|
-| GVN | Global Value Numbering — CSE across the graph |
-| DCE | Dead Code Elimination — remove unused computations |
-| SCCP | Sparse Conditional Constant Propagation |
-| Copy Prop | Copy Propagation — eliminate redundant moves |
-| LICM | Loop-Invariant Code Motion |
-| RCE | Range Check Elimination |
-| PRE | Partial Redundancy Elimination |
-| Strength Reduce | Division → multiplication, mul → shift/add |
-| DSE | Dead Store Elimination |
-| Inline | Budget-based function inlining |
-| Tail Call | Tail call optimization |
+| Phase | Pass | Description |
+|:------|:-----|:------------|
+| **Canonicalization** | SCCP | Sparse Conditional Constant Propagation |
+| | Simplify | Algebraic identities, constant folding |
+| | InstCombine | Peephole optimizations on instruction sequences |
+| **Profile-Guided** | Branch Probability | Annotate branches with measured/estimated weights |
+| | Hot/Cold Split | Partition code by execution temperature |
+| **Local** | Copy Prop | Copy Propagation — eliminate redundant moves |
+| | GVN | Global Value Numbering — CSE across the graph |
+| | DSE | Dead Store Elimination |
+| | PRE | Partial Redundancy Elimination |
+| | Strength Reduce | Division → multiplication, mul → shift/add |
+| **Loop** | LICM | Loop-Invariant Code Motion |
+| | Unroll | Loop body replication to reduce overhead |
+| | RCE | Range Check Elimination |
+| **Interprocedural** | Inline | Budget-based function inlining |
+| | Escape | Escape analysis for stack allocation |
+| | Tail Call | Tail call optimization |
+| **Cleanup** | DCE | Dead Code Elimination |
 
 ### JIT Tier Details
 
-| Tier | Strategy | Trigger | Optimizations |
-|:-----|:---------|:--------|:--------------|
+| Tier | Strategy | Trigger | Key Capabilities |
+|:-----|:---------|:--------|:-----------------|
 | **0** | Interpreter | Default | Inline caches, type feedback collection |
-| **1** | Template | ~100 calls | Direct translation, speculative guards |
-| **2** | Optimizing | ~1000 calls or hot loop | Full optimization pipeline, SIMD codegen |
+| **1** | Template | ~100 calls | Direct translation, IC fast paths, type specialization (dict/list/string) |
+| **2** | Optimizing | ~1000 calls or hot loop | Full optimization pipeline, PGO, SIMD codegen |
 
 ### Object Model
 
@@ -201,7 +209,7 @@ Objects with identical property insertion order share the same Shape, enabling O
 ### Prerequisites
 
 - **Rust 1.85+** (2024 Edition)
-- **x64 architecture** (ARM64 support planned)
+- **x64 architecture** (primary), ARM64 backend in progress
 
 ### Build
 
@@ -235,24 +243,24 @@ Prism is under active development. Current status:
 | Component | Status | Tests |
 |:----------|:-------|------:|
 | Parser | ✅ Complete | 167 |
-| Compiler | ✅ Complete | 697 |
-| Core Types & Values | ✅ Complete | 192 |
-| VM & Interpreter | ✅ Complete | 2,291 |
+| Compiler | ✅ Complete | 693 |
+| Core Types & Values | ✅ Complete | 244 |
+| VM & Interpreter | ✅ Complete | 3,927 |
 | Object System (Shapes) | ✅ Complete | — |
 | Descriptor Protocol | ✅ Complete | — |
 | Pattern Matching | ✅ Complete | — |
 | Exception Handling | ✅ Complete | — |
-| JIT Tier 1 & 2 | ✅ Complete | 1,873 |
+| JIT Tier 1 & 2 | ✅ Complete | 2,967 |
 | SIMD Backend (AVX2/AVX-512) | ✅ Complete | — |
-| Garbage Collector | ✅ Complete | 94 |
-| Runtime Types | ✅ Complete | 742 |
+| Garbage Collector | ✅ Complete | 84 |
+| Runtime Types | ✅ Complete | 789 |
 
-**Total test coverage: 6,000+ tests**
+**Total test coverage: 8,800+ tests**
 
 ### Roadmap
 
 - [ ] Async/await coroutines
-- [ ] ARM64 backend
+- [ ] ARM64 backend (infrastructure complete, codegen in progress)
 - [ ] Extended standard library coverage
 - [ ] Package import system
 
