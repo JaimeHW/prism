@@ -39,10 +39,19 @@
 pub mod code_cache;
 pub mod compiler_thread;
 pub mod entry_stub;
+pub mod profile_collector;
+pub mod profile_data;
+
+#[cfg(test)]
+mod profile_data_tests;
 
 pub use code_cache::{CodeCache, CompiledEntry};
 pub use compiler_thread::{CompilationRequest, CompilerThread};
 pub use entry_stub::{EntryStub, ExitReason};
+pub use profile_data::{
+    AtomicBranchCounter, BranchProfile, CallProfile, CallTarget, ProfileData, ProfileError,
+    TypeProfile, TypeProfileEntry,
+};
 
 // =============================================================================
 // Runtime Configuration

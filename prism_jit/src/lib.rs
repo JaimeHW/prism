@@ -12,6 +12,7 @@
 pub mod backend;
 pub mod codegen;
 pub mod gc;
+pub mod ic;
 pub mod ir;
 pub mod opt;
 pub mod regalloc;
