@@ -49,6 +49,68 @@ pub fn split<P: AsRef<Path>>(path: P) -> (String, String) {
     (dirname(&path), basename(&path))
 }
 
+/// Split a path into (drive, tail) where drive is a drive letter spec
+/// or UNC path prefix, and tail is everything else.
+///
+/// On Unix, drive is always empty.
+///
+/// Equivalent to Python's `os.path.splitdrive()`.
+///
+/// # Examples
+///
+/// ```ignore
+/// // Windows
+/// assert_eq!(splitdrive("C:\\foo\\bar"), ("C:".into(), "\\foo\\bar".into()));
+/// // Unix
+/// assert_eq!(splitdrive("/foo/bar"), ("".into(), "/foo/bar".into()));
+/// ```
+pub fn splitdrive<P: AsRef<Path>>(path: P) -> (String, String) {
+    let s = path.as_ref().to_string_lossy();
+    splitdrive_str(&s)
+}
+
+/// Internal string-based splitdrive implementation.
+fn splitdrive_str(path: &str) -> (String, String) {
+    #[cfg(windows)]
+    {
+        let bytes = path.as_bytes();
+
+        // UNC path: \\server\share
+        if bytes.len() >= 2
+            && (bytes[0] == b'\\' || bytes[0] == b'/')
+            && (bytes[1] == b'\\' || bytes[1] == b'/')
+        {
+            // Find the end of server\share
+            let rest = &path[2..];
+            if let Some(sep_pos) = rest.find(|c: char| c == '\\' || c == '/') {
+                let after_server = &rest[sep_pos + 1..];
+                if let Some(share_end) = after_server.find(|c: char| c == '\\' || c == '/') {
+                    let drive_end = 2 + sep_pos + 1 + share_end;
+                    return (path[..drive_end].to_string(), path[drive_end..].to_string());
+                } else {
+                    // \\server\share with no trailing path
+                    return (path.to_string(), String::new());
+                }
+            }
+            return (path.to_string(), String::new());
+        }
+
+        // Drive letter: X:
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return (path[..2].to_string(), path[2..].to_string());
+        }
+
+        // No drive
+        (String::new(), path.to_string())
+    }
+
+    #[cfg(not(windows))]
+    {
+        // On Unix, there's no drive concept
+        (String::new(), path.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +174,70 @@ mod tests {
         let (head, tail) = split("/foo/bar.txt");
         assert!(head.contains("foo"));
         assert_eq!(tail, "bar.txt");
+    }
+
+    // =========================================================================
+    // splitdrive Tests
+    // =========================================================================
+
+    #[cfg(windows)]
+    #[test]
+    fn test_splitdrive_windows_drive() {
+        let (drive, tail) = splitdrive("C:\\foo\\bar");
+        assert_eq!(drive, "C:");
+        assert_eq!(tail, "\\foo\\bar");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_splitdrive_windows_no_drive() {
+        let (drive, tail) = splitdrive("\\foo\\bar");
+        // No standard drive letter — treated as relative or UNC start
+        assert!(!drive.is_empty() || tail == "\\foo\\bar");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_splitdrive_windows_drive_only() {
+        let (drive, tail) = splitdrive("C:");
+        assert_eq!(drive, "C:");
+        assert_eq!(tail, "");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_splitdrive_unix_no_drive() {
+        let (drive, tail) = splitdrive("/foo/bar");
+        assert_eq!(drive, "");
+        assert_eq!(tail, "/foo/bar");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_splitdrive_unix_relative() {
+        let (drive, tail) = splitdrive("foo/bar");
+        assert_eq!(drive, "");
+        assert_eq!(tail, "foo/bar");
+    }
+
+    #[test]
+    fn test_splitdrive_empty() {
+        let (drive, tail) = splitdrive("");
+        assert_eq!(drive, "");
+        assert_eq!(tail, "");
+    }
+
+    #[test]
+    fn test_splitdrive_single_char() {
+        let (drive, tail) = splitdrive("a");
+        assert_eq!(drive, "");
+        assert_eq!(tail, "a");
+    }
+
+    #[test]
+    fn test_splitdrive_dot() {
+        let (drive, tail) = splitdrive(".");
+        assert_eq!(drive, "");
+        assert_eq!(tail, ".");
     }
 }
