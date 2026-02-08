@@ -18,6 +18,18 @@ smallvec = "1.13"
 # Math functions (gamma, erf, etc.)
 libm = "0.2"
 
+# Regex engine - guaranteed O(m*n) performance
+regex = "1.10"
+# Extended regex with backreferences/lookaround
+fancy-regex = "0.13"
+
+# Platform-specific time APIs
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Time", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 criterion = "0.5"
 prism_parser.workspace = true
