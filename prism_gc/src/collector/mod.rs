@@ -29,16 +29,22 @@
 //! └─────────────────────────────────────────────────────────────────────────┘
 //! ```
 
+pub mod concurrent_major;
 pub mod concurrent_marker;
 mod major;
 pub mod mark_bitmap;
 mod minor;
 
 #[cfg(test)]
+mod concurrent_major_tests;
+#[cfg(test)]
 mod concurrent_marker_tests;
 #[cfg(test)]
 mod mark_bitmap_tests;
 
+pub use concurrent_major::{
+    ConcurrentGcPhase, ConcurrentMajorCollector, ConcurrentMajorConfig, ConcurrentMajorResult,
+};
 pub use concurrent_marker::{
     ConcurrentMarker, ConcurrentMarkerConfig, MarkPtr, MarkingStats, MarkingStatsSnapshot,
     MarkingWorklist,
