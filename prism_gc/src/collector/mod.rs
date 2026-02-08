@@ -29,10 +29,22 @@
 //! └─────────────────────────────────────────────────────────────────────────┘
 //! ```
 
+pub mod concurrent_marker;
 mod major;
+pub mod mark_bitmap;
 mod minor;
 
+#[cfg(test)]
+mod concurrent_marker_tests;
+#[cfg(test)]
+mod mark_bitmap_tests;
+
+pub use concurrent_marker::{
+    ConcurrentMarker, ConcurrentMarkerConfig, MarkPtr, MarkingStats, MarkingStatsSnapshot,
+    MarkingWorklist,
+};
 pub use major::{MajorCollector, MajorResult};
+pub use mark_bitmap::AtomicMarkBitmap;
 pub use minor::{MinorCollector, MinorResult};
 
 use crate::heap::GcHeap;
