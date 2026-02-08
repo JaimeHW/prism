@@ -12,6 +12,9 @@ prism_core = { path = "../prism_core" }
 # Fast atomic operations
 crossbeam-utils = "0.8"
 
+# Work-stealing deque for concurrent marking
+crossbeam-deque = "0.8"
+
 # Fast hash maps for object tracking
 rustc-hash = "2.1"
 
