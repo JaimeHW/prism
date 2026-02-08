@@ -6,9 +6,17 @@
 
 mod card_table;
 mod remembered_set;
+pub mod satb_buffer;
+
+#[cfg(test)]
+mod satb_tests;
 
 pub use card_table::CardTable;
 pub use remembered_set::{RememberedEntry, RememberedSet};
+pub use satb_buffer::{
+    satb_capture_unconditional, satb_write_barrier, MarkingPhase, SatbBuffer, SatbMarkingState,
+    SatbQueue,
+};
 
 use crate::heap::GcHeap;
 use prism_core::Value;
