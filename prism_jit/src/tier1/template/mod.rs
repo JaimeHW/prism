@@ -20,9 +20,14 @@ pub mod calls;
 pub mod comparison;
 pub mod containers;
 pub mod control;
+pub mod dict_specialize;
 pub mod guards;
+pub mod ic_helpers;
+pub mod list_specialize;
 pub mod memory;
 pub mod objects;
+pub mod specialize_common;
+pub mod string_specialize;
 pub mod values;
 
 use crate::backend::x64::{Assembler, Label};
@@ -63,6 +68,9 @@ pub mod value_tags {
 
     /// Tag for False boolean.
     pub const FALSE_TAG: u64 = 0x0005_0000_0000_0000;
+
+    /// Tag for string values (interned string pointer).
+    pub const STRING_TAG: u64 = 0x0006_0000_0000_0000;
 
     /// Payload mask (lower 48 bits).
     pub const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
