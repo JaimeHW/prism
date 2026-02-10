@@ -7,6 +7,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
+use super::profile_data::ProfileData;
+
 // =============================================================================
 // Compilation Request
 // =============================================================================
@@ -24,6 +26,8 @@ pub struct CompilationRequest {
     pub priority: u32,
     /// Optional OSR entry offset (for loop compilation).
     pub osr_offset: Option<u32>,
+    /// Profile data from Tier 1 execution (drives PGO in Tier 2).
+    pub profile_data: Option<ProfileData>,
 }
 
 impl CompilationRequest {
@@ -35,6 +39,7 @@ impl CompilationRequest {
             tier,
             priority: 0,
             osr_offset: None,
+            profile_data: None,
         }
     }
 
@@ -47,6 +52,12 @@ impl CompilationRequest {
     /// Set OSR offset for loop-entry compilation.
     pub fn with_osr_offset(mut self, offset: u32) -> Self {
         self.osr_offset = Some(offset);
+        self
+    }
+
+    /// Attach profile data for PGO-guided Tier 2 compilation.
+    pub fn with_profile(mut self, profile: ProfileData) -> Self {
+        self.profile_data = Some(profile);
         self
     }
 }
@@ -342,5 +353,108 @@ mod tests {
 
         // try_get should work
         assert!(queue.try_get().is_none());
+    }
+
+    // =========================================================================
+    // PGO Profile Data Integration Tests
+    // =========================================================================
+
+    #[test]
+    fn test_compilation_request_default_no_profile() {
+        let req = CompilationRequest::new(1, vec![0x00], CompilationTier::Baseline);
+        assert!(req.profile_data.is_none());
+    }
+
+    #[test]
+    fn test_compilation_request_with_profile() {
+        let mut profile = ProfileData::new(1);
+        profile.record_branch(10, true);
+        profile.record_branch(10, true);
+        profile.record_branch(10, false);
+
+        let req = CompilationRequest::new(42, vec![0xCC], CompilationTier::Optimized)
+            .with_profile(profile);
+
+        assert!(req.profile_data.is_some());
+        let data = req.profile_data.as_ref().unwrap();
+        assert_eq!(data.code_id(), 1);
+        assert_eq!(data.branch_count(), 1);
+    }
+
+    #[test]
+    fn test_compilation_request_full_builder_chain() {
+        let mut profile = ProfileData::new(99);
+        for _ in 0..100 {
+            profile.record_execution();
+        }
+        profile.record_branch(5, true);
+        profile.record_branch(5, false);
+
+        let req = CompilationRequest::new(7, vec![0x01, 0x02], CompilationTier::Optimized)
+            .with_priority(100)
+            .with_osr_offset(42)
+            .with_profile(profile);
+
+        assert_eq!(req.code_id, 7);
+        assert_eq!(req.priority, 100);
+        assert_eq!(req.osr_offset, Some(42));
+        assert!(req.profile_data.is_some());
+
+        let data = req.profile_data.unwrap();
+        assert_eq!(data.execution_count(), 100);
+        assert_eq!(data.branch_count(), 1);
+    }
+
+    #[test]
+    fn test_compilation_request_tier2_with_profile_pattern() {
+        // Simulates the canonical Tier 1 → Tier 2 promotion pattern
+        let mut profile = ProfileData::new(42);
+        // Simulate hot function (1000 executions)
+        for _ in 0..1000 {
+            profile.record_execution();
+        }
+        // Simulate biased branch at offset 15
+        for _ in 0..980 {
+            profile.record_branch(15, true);
+        }
+        for _ in 0..20 {
+            profile.record_branch(15, false);
+        }
+        // Simulate loop with avg 50 trips
+        for _ in 0..50_000 {
+            profile.record_loop_iteration(20);
+        }
+
+        assert!(profile.is_hot(100));
+        assert_eq!(profile.loop_count(20), 50_000);
+
+        let req = CompilationRequest::new(42, vec![], CompilationTier::Optimized)
+            .with_priority(50)
+            .with_profile(profile);
+
+        // Verify the profile is carried through
+        let data = req.profile_data.as_ref().unwrap();
+        assert_eq!(data.execution_count(), 1000);
+        let branch = data.branch_at(15).unwrap();
+        assert!(
+            branch.taken > branch.not_taken * 10,
+            "Branch should be heavily biased toward taken"
+        );
+    }
+
+    #[test]
+    fn test_compilation_request_clone_with_profile() {
+        let mut profile = ProfileData::new(1);
+        profile.record_branch(0, true);
+
+        let req =
+            CompilationRequest::new(1, vec![], CompilationTier::Optimized).with_profile(profile);
+
+        let cloned = req.clone();
+        assert!(cloned.profile_data.is_some());
+        assert_eq!(
+            cloned.profile_data.as_ref().unwrap().branch_count(),
+            req.profile_data.as_ref().unwrap().branch_count()
+        );
     }
 }
