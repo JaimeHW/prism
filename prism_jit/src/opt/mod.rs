@@ -39,6 +39,7 @@ pub mod unroll;
 // PGO optimization passes
 pub mod branch_probability;
 pub mod hot_cold;
+pub mod speculation;
 
 // Re-export key types
 pub use dse::{Dse, DseConfig, DseStats};
@@ -47,13 +48,14 @@ pub use inline::{Inline, InlineConfig};
 pub use instcombine::{InstCombine, InstCombineConfig, InstCombineStats};
 pub use licm::Licm;
 pub use loop_analyzer::LoopInvariantAnalysis;
-pub use pipeline::{OptPipeline, PipelineConfig};
+pub use pipeline::{OptPipeline, PipelineConfig, optimize_with_profile};
 pub use pre::{Pre, PreConfig, PreStats};
 pub use rce::{
     InductionAnalysis, InductionDetector, InductionDirection, InductionInit, InductionStep,
     InductionVariable, RangeCheckElimination,
 };
 pub use sccp::{Sccp, SccpConfig};
+pub use speculation::{NoSpeculation, PgoSpeculationProvider, SpeculationProvider};
 pub use strength_reduce::{StrengthReduce, StrengthReduceConfig};
 pub use tailcall::{TailCallOpt, TcoConfig};
 

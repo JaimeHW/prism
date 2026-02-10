@@ -298,6 +298,41 @@ impl OptPipeline {
         pipeline
     }
 
+    /// Create a pipeline with profile data for PGO-guided optimization.
+    ///
+    /// This is the primary entry point for Tier 2 compilation with PGO.
+    /// Profile data is injected into the `BranchProbabilityPass` so that
+    /// measured branch frequencies override static heuristics.
+    pub fn with_profile(
+        config: PipelineConfig,
+        profile: crate::runtime::profile_data::ProfileData,
+    ) -> Self {
+        let mut pipeline = Self::with_config(config);
+        pipeline.inject_profile(profile);
+        pipeline
+    }
+
+    /// Inject profile data into the `BranchProbabilityPass`.
+    ///
+    /// Scans the registered passes and injects the profile data into
+    /// any `BranchProbabilityPass` found. This allows downstream passes
+    /// (e.g., `HotColdPass`) to consume PGO-annotated probabilities.
+    pub fn inject_profile(&mut self, profile: crate::runtime::profile_data::ProfileData) {
+        for entry in &mut self.passes {
+            if entry.pass.name() == "BranchProbability" {
+                // Replace the existing BranchProbabilityPass with one carrying profile data
+                entry.pass = Box::new(BranchProbabilityPass::with_profile(profile));
+                return;
+            }
+        }
+
+        // If branch probability was disabled, register it now with profile data
+        self.passes.push(PassEntry::new(
+            BranchProbabilityPass::with_profile(profile),
+            PassPhase::ProfileGuided,
+        ));
+    }
+
     /// Register the default set of optimization passes.
     ///
     /// Pass ordering is critical for effectiveness:
@@ -608,6 +643,19 @@ pub fn optimize_minimal(graph: &mut Graph) -> PipelineStats {
 /// Run default optimization pipeline on a graph.
 pub fn optimize(graph: &mut Graph) -> PipelineStats {
     let mut pipeline = OptPipeline::new();
+    pipeline.run(graph)
+}
+
+/// Run full optimization pipeline with PGO profile data.
+///
+/// This is the primary entry point for Tier 2 compilation. Profile data
+/// from Tier 1 execution is used to guide branch probability estimation,
+/// hot/cold splitting, and loop frequency calculations.
+pub fn optimize_with_profile(
+    graph: &mut Graph,
+    profile: crate::runtime::profile_data::ProfileData,
+) -> PipelineStats {
+    let mut pipeline = OptPipeline::with_profile(PipelineConfig::full(), profile);
     pipeline.run(graph)
 }
 
@@ -1045,5 +1093,121 @@ mod tests {
         // With all optimizations, should be able to reduce some redundancy
         // (exact reduction depends on graph structure)
         assert!(stats.initial_size == initial_size);
+    }
+
+    // =========================================================================
+    // PGO Pipeline Integration Tests
+    // =========================================================================
+
+    #[test]
+    fn test_pipeline_with_profile_constructor() {
+        let profile = crate::runtime::profile_data::ProfileData::new(1);
+        let pipeline = OptPipeline::with_profile(PipelineConfig::default(), profile);
+
+        // Should have registered passes including BranchProbabilityPass
+        let stats = pipeline.pass_stats();
+        let bp_pass = stats.iter().find(|s| s.name == "BranchProbability");
+        assert!(
+            bp_pass.is_some(),
+            "Pipeline with profile should have BranchProbability pass"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_inject_profile() {
+        let mut pipeline = OptPipeline::new();
+
+        // Verify BranchProbability pass exists
+        let has_bp_before = pipeline
+            .pass_stats()
+            .iter()
+            .any(|s| s.name == "BranchProbability");
+        assert!(has_bp_before);
+
+        // Inject profile
+        let mut profile = crate::runtime::profile_data::ProfileData::new(1);
+        profile.record_branch(0, true);
+        pipeline.inject_profile(profile);
+
+        // BranchProbability pass should still exist
+        let has_bp_after = pipeline
+            .pass_stats()
+            .iter()
+            .any(|s| s.name == "BranchProbability");
+        assert!(has_bp_after);
+    }
+
+    #[test]
+    fn test_pipeline_inject_profile_when_disabled() {
+        // Create a config with branch probability disabled
+        let config = PipelineConfig {
+            enable_branch_probability: false,
+            ..PipelineConfig::minimal()
+        };
+        let mut pipeline = OptPipeline::with_config(config);
+
+        // Should NOT have BranchProbability initially
+        let has_bp_before = pipeline
+            .pass_stats()
+            .iter()
+            .any(|s| s.name == "BranchProbability");
+        assert!(
+            !has_bp_before,
+            "BranchProbability should be disabled initially"
+        );
+
+        // Inject profile should register the pass
+        let profile = crate::runtime::profile_data::ProfileData::new(1);
+        pipeline.inject_profile(profile);
+
+        let has_bp_after = pipeline
+            .pass_stats()
+            .iter()
+            .any(|s| s.name == "BranchProbability");
+        assert!(
+            has_bp_after,
+            "inject_profile should register BranchProbability even if disabled"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_run_with_profile() {
+        let mut profile = crate::runtime::profile_data::ProfileData::new(1);
+        for _ in 0..100 {
+            profile.record_execution();
+        }
+        for _ in 0..90 {
+            profile.record_branch(3, true);
+        }
+        for _ in 0..10 {
+            profile.record_branch(3, false);
+        }
+
+        let mut builder = GraphBuilder::new(2, 2);
+        let p0 = builder.parameter(0).unwrap();
+        let p1 = builder.parameter(1).unwrap();
+        let sum = builder.int_add(p0, p1);
+        builder.return_value(sum);
+
+        let mut graph = builder.finish();
+
+        let mut pipeline = OptPipeline::with_profile(PipelineConfig::default(), profile);
+        let stats = pipeline.run(&mut graph);
+
+        // Pipeline should complete
+        assert!(stats.total_iterations >= 1);
+        assert!(stats.phases_run >= 1);
+    }
+
+    #[test]
+    fn test_optimize_with_profile_convenience() {
+        let mut profile = crate::runtime::profile_data::ProfileData::new(1);
+        profile.record_branch(0, true);
+
+        let builder = GraphBuilder::new(0, 0);
+        let mut graph = builder.finish();
+
+        let stats = optimize_with_profile(&mut graph, profile);
+        assert!(stats.total_iterations >= 1);
     }
 }

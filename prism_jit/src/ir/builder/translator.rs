@@ -2,18 +2,31 @@ use crate::ir::builder::{
     ArithmeticBuilder, ContainerBuilder, ControlBuilder, GraphBuilder, ObjectBuilder,
 };
 use crate::ir::graph::Graph;
+use crate::opt::speculation::SpeculationProvider;
 use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
 
 /// Translator from Bytecode to Sea-of-Nodes IR.
 pub struct BytecodeTranslator<'a> {
     builder: GraphBuilder,
     code: &'a CodeObject,
+    /// Optional speculation provider for PGO-guided branch seeding.
+    speculation: Option<Box<dyn SpeculationProvider>>,
 }
 
 impl<'a> BytecodeTranslator<'a> {
     /// Create a new translator.
     pub fn new(builder: GraphBuilder, code: &'a CodeObject) -> Self {
-        BytecodeTranslator { builder, code }
+        BytecodeTranslator {
+            builder,
+            code,
+            speculation: None,
+        }
+    }
+
+    /// Attach a speculation provider for PGO-guided IR construction.
+    pub fn with_speculation(mut self, provider: Box<dyn SpeculationProvider>) -> Self {
+        self.speculation = Some(provider);
+        self
     }
 
     /// Translate the bytecode to a Graph.
