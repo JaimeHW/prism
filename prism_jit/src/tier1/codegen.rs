@@ -92,6 +92,8 @@ impl TemplateCompiler {
         let cc = JitCallingConvention::host();
         let mut bc_to_native = HashMap::new();
         let mut deopt_gen = DeoptStubGenerator::new();
+        let function_end_bc_offset = (instructions.len() as u32) * 4;
+        let epilogue_label = asm.create_label();
 
         // Create deopt labels first
         let mut deopt_labels = Vec::with_capacity(instructions.len());
@@ -104,7 +106,12 @@ impl TemplateCompiler {
         for instr in instructions {
             if let Some(target) = instr.jump_target() {
                 if !labels.contains_key(&target) {
-                    labels.insert(target, asm.create_label());
+                    let label = if target == function_end_bc_offset {
+                        epilogue_label
+                    } else {
+                        asm.create_label()
+                    };
+                    labels.insert(target, label);
                 }
             }
         }
@@ -135,10 +142,20 @@ impl TemplateCompiler {
                 }
 
                 // Emit the template
-                self.emit_instruction(&mut ctx, instr, &labels, idx);
+                self.emit_instruction(
+                    &mut ctx,
+                    instr,
+                    &labels,
+                    idx,
+                    epilogue_label,
+                    idx + 1 == instructions.len(),
+                );
             }
         }
         // ctx is dropped here, releasing the borrow on asm
+
+        // Common return target for explicit returns and jumps to end-of-function sentinel.
+        asm.bind_label(epilogue_label);
 
         // Emit epilogue
         self.emit_epilogue(&mut asm, &frame);
@@ -207,6 +224,8 @@ impl TemplateCompiler {
         instr: &TemplateInstruction,
         labels: &HashMap<u32, Label>,
         deopt_idx: usize,
+        epilogue_label: Label,
+        is_last_instruction: bool,
     ) {
         match instr {
             TemplateInstruction::LoadInt { dst, value, .. } => {
@@ -739,9 +758,17 @@ impl TemplateCompiler {
             }
             TemplateInstruction::Return { value, .. } => {
                 ReturnTemplate { value_reg: *value }.emit(ctx);
+                // Prevent fallthrough into subsequent bytecode blocks after return.
+                if !is_last_instruction {
+                    ctx.asm.jmp(epilogue_label);
+                }
             }
             TemplateInstruction::ReturnNone { .. } => {
                 ReturnNoneTemplate.emit(ctx);
+                // Prevent fallthrough into subsequent bytecode blocks after return.
+                if !is_last_instruction {
+                    ctx.asm.jmp(epilogue_label);
+                }
             }
             // Integer comparisons
             TemplateInstruction::IntLt { dst, lhs, rhs, .. } => {
@@ -2287,6 +2314,42 @@ mod tests {
         ];
 
         let result = compiler.compile(4, &instrs);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compile_jump_to_end_sentinel() {
+        let compiler = TemplateCompiler::new_for_testing();
+        let instrs = vec![
+            TemplateInstruction::Jump {
+                bc_offset: 0,
+                target: 8,
+            },
+            TemplateInstruction::ReturnNone { bc_offset: 4 },
+        ];
+
+        let result = compiler.compile(1, &instrs);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compile_branch_to_end_sentinel() {
+        let compiler = TemplateCompiler::new_for_testing();
+        let instrs = vec![
+            TemplateInstruction::LoadBool {
+                bc_offset: 0,
+                dst: 0,
+                value: true,
+            },
+            TemplateInstruction::BranchIfTrue {
+                bc_offset: 4,
+                cond: 0,
+                target: 12,
+            },
+            TemplateInstruction::ReturnNone { bc_offset: 8 },
+        ];
+
+        let result = compiler.compile(1, &instrs);
         assert!(result.is_ok());
     }
 
