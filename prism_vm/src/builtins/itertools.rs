@@ -92,6 +92,10 @@ pub fn builtin_iter(args: &[Value]) -> Result<Value, BuiltinError> {
     match args.len() {
         1 => {
             // iter(object) - standard form
+            // Python semantics: iter(iterator) returns the same iterator object.
+            if super::iter_dispatch::is_iterator(&args[0]) {
+                return Ok(args[0]);
+            }
             let iter = super::iter_dispatch::value_to_iterator(&args[0])?;
             Ok(super::iter_dispatch::iterator_to_value(iter))
         }
@@ -956,6 +960,34 @@ mod tests {
         // func is a placeholder
         let result = builtin_map(&[Value::none(), value]);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_iter_on_iterator_returns_same_object() {
+        let list = ListObject::from_slice(&[Value::int(1).unwrap(), Value::int(2).unwrap()]);
+        let list_ptr = Box::leak(Box::new(list)) as *mut ListObject as *const ();
+        let list_value = Value::object_ptr(list_ptr);
+
+        let iter1 = builtin_iter(&[list_value]).unwrap();
+        let iter2 = builtin_iter(&[iter1]).unwrap();
+        assert_eq!(iter1, iter2);
+    }
+
+    #[test]
+    fn test_iter_on_iterator_preserves_state() {
+        let list = ListObject::from_slice(&[Value::int(10).unwrap(), Value::int(20).unwrap()]);
+        let list_ptr = Box::leak(Box::new(list)) as *mut ListObject as *const ();
+        let list_value = Value::object_ptr(list_ptr);
+
+        let iter = builtin_iter(&[list_value]).unwrap();
+        let first = builtin_next(&[iter]).unwrap();
+        assert_eq!(first.as_int(), Some(10));
+
+        let iter_again = builtin_iter(&[iter]).unwrap();
+        assert_eq!(iter_again, iter);
+
+        let second = builtin_next(&[iter_again]).unwrap();
+        assert_eq!(second.as_int(), Some(20));
     }
 
     #[test]
