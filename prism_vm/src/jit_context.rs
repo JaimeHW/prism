@@ -26,7 +26,7 @@ use crate::error::RuntimeError;
 use crate::frame::Frame;
 use crate::jit_bridge::{BridgeConfig, JitBridge};
 use crate::jit_executor::{DeoptReason, ExecutionResult, JitFrameState};
-use crate::profiler::TierUpDecision;
+use crate::profiler::{CodeId, Profiler, TierUpDecision};
 
 // =============================================================================
 // JIT Configuration
@@ -355,9 +355,15 @@ impl JitContext {
             }
         } else {
             // Queue for background compilation
-            self.bridge.compile_async(Arc::clone(code));
+            self.bridge.compile_async(Arc::clone(code), tier);
             true
         }
+    }
+
+    /// Query tier-up policy using the active bridge configuration.
+    #[inline]
+    pub fn check_tier_up(&self, profiler: &Profiler, code_id: CodeId) -> TierUpDecision {
+        self.bridge.check_tier_up(profiler, code_id)
     }
 
     // =========================================================================
@@ -540,5 +546,25 @@ mod tests {
             ProcessedResult::Resume { bc_offset } => assert_eq!(bc_offset, 100),
             _ => panic!("Expected Resume"),
         }
+    }
+
+    #[test]
+    fn test_check_tier_up_uses_runtime_config_thresholds() {
+        let ctx = JitContext::for_testing();
+        let mut profiler = Profiler::new();
+        let code_id = CodeId::new(42);
+
+        for _ in 0..9 {
+            profiler.record_call(code_id);
+            assert_eq!(ctx.check_tier_up(&profiler, code_id), TierUpDecision::None);
+        }
+
+        profiler.record_call(code_id);
+        assert_eq!(ctx.check_tier_up(&profiler, code_id), TierUpDecision::Tier1);
+
+        for _ in 0..90 {
+            profiler.record_call(code_id);
+        }
+        assert_eq!(ctx.check_tier_up(&profiler, code_id), TierUpDecision::Tier2);
     }
 }

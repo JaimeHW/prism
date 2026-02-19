@@ -132,19 +132,12 @@ impl Profiler {
     // Call Counting
     // =========================================================================
 
-    /// Record a function call, returning true if threshold crossed.
+    /// Record a function call and return the current call count.
     #[inline]
-    pub fn record_call(&mut self, code_id: CodeId) -> TierUpDecision {
+    pub fn record_call(&mut self, code_id: CodeId) -> u64 {
         let count = self.call_counts.entry(code_id).or_insert(0);
         *count += 1;
-
-        if *count == TIER2_THRESHOLD {
-            TierUpDecision::Tier2
-        } else if *count == TIER1_THRESHOLD {
-            TierUpDecision::Tier1
-        } else {
-            TierUpDecision::None
-        }
+        *count
     }
 
     /// Get call count for a function.
@@ -268,14 +261,12 @@ mod tests {
         let mut profiler = Profiler::new();
         let code_id = CodeId(12345);
 
-        // Count up to threshold - 1
-        for _ in 0..(TIER1_THRESHOLD - 1) {
-            assert_eq!(profiler.record_call(code_id), TierUpDecision::None);
+        // Call count should increase monotonically.
+        for i in 1..=16 {
+            assert_eq!(profiler.record_call(code_id), i);
         }
 
-        // Should trigger Tier 1
-        assert_eq!(profiler.record_call(code_id), TierUpDecision::Tier1);
-        assert_eq!(profiler.call_count(code_id), TIER1_THRESHOLD);
+        assert_eq!(profiler.call_count(code_id), 16);
     }
 
     #[test]

@@ -542,10 +542,12 @@ impl VirtualMachine {
 
         // Record call for profiling
         let code_id = CodeId::from_ptr(Arc::as_ptr(&code) as *const ());
-        let tier_decision = self.profiler.record_call(code_id);
+        self.profiler.record_call(code_id);
 
         // Handle JIT: check for compiled code, handle tier-up, and try execution
         if let Some(jit) = &mut self.jit {
+            let tier_decision = jit.check_tier_up(&self.profiler, code_id);
+
             // Handle tier-up decision (may trigger compilation)
             if tier_decision != TierUpDecision::None {
                 jit.handle_tier_up(&code, tier_decision);
