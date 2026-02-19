@@ -33,10 +33,11 @@ use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
-use prism_core::intern::intern;
+use prism_core::intern::{InternedString, intern, interned_by_ptr};
 use prism_runtime::object::class::{ClassDict, PyClassObject};
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_obj::TypeId;
+use prism_runtime::types::string::StringObject;
 use std::sync::Arc;
 
 // =============================================================================
@@ -164,23 +165,19 @@ pub fn build_class(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 ///
 /// Supports both interned strings (small) and heap-allocated strings.
 #[inline]
-fn extract_string_name(val: Value) -> Option<prism_core::intern::InternedString> {
-    // Check if it's a constant string from the constant pool
-    // For now, check if it's an object pointer and try to extract
-    if let Some(ptr) = val.as_object_ptr() {
-        // Try to get string content
-        // TODO: Implement proper string extraction from Python string objects
-        // For now, use a placeholder approach
-        let _ = ptr;
+fn extract_string_name(val: Value) -> Option<InternedString> {
+    if val.is_string() {
+        let ptr = val.as_string_object_ptr()?;
+        return interned_by_ptr(ptr as *const u8);
     }
 
-    // For interned string constants, they may be encoded directly
-    // Check if it's a small int that could be an interned string index
-    // This depends on how the compiler encodes string constants
+    let ptr = val.as_object_ptr()?;
+    if extract_type_id(ptr) != TypeId::STR {
+        return None;
+    }
 
-    // Fallback: If we can't extract a proper name, use a default
-    // This is temporary until we implement proper string handling
-    Some(intern("__unnamed_class__"))
+    let string = unsafe { &*(ptr as *const StringObject) };
+    Some(intern(string.as_str()))
 }
 
 /// Extract ClassId from a class object Value.
@@ -263,10 +260,26 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_string_name_fallback() {
-        // Currently returns placeholder - will be improved
+    fn test_extract_string_name_tagged() {
+        let name = extract_string_name(Value::string(intern("TaggedClass")));
+        assert_eq!(name.unwrap().as_ref(), "TaggedClass");
+    }
+
+    #[test]
+    fn test_extract_string_name_heap_string() {
+        let ptr = Box::into_raw(Box::new(StringObject::new("HeapClass")));
+        let value = Value::object_ptr(ptr as *const ());
+        let name = extract_string_name(value);
+        assert_eq!(name.unwrap().as_ref(), "HeapClass");
+        unsafe {
+            drop(Box::from_raw(ptr));
+        }
+    }
+
+    #[test]
+    fn test_extract_string_name_invalid_returns_none() {
         let name = extract_string_name(Value::none());
-        assert!(name.is_some());
+        assert!(name.is_none());
     }
 
     // =========================================================================
