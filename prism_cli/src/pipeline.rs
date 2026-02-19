@@ -3,9 +3,9 @@
 //! Provides the core execution functions used by every CLI mode
 //! (script, command string, stdin, REPL).
 
+use crate::args::OptimizationLevel as CliOptimizationLevel;
 use crate::config::RuntimeConfig;
 use crate::error;
-use crate::args::OptimizationLevel as CliOptimizationLevel;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -54,7 +54,11 @@ pub fn run_string(code: &str, config: &RuntimeConfig) -> ExitCode {
 }
 
 /// Run a command string with explicit `sys.argv` values.
-pub fn run_string_with_args(code: &str, config: &RuntimeConfig, script_args: &[String]) -> ExitCode {
+pub fn run_string_with_args(
+    code: &str,
+    config: &RuntimeConfig,
+    script_args: &[String],
+) -> ExitCode {
     execute_source_with_args(code, "<string>", config, script_args)
 }
 
@@ -125,9 +129,7 @@ fn execute_source_with_args(
     // Phase 2: Compile.
     let optimize = compiler_optimization_level(config.optimize);
     let code = match prism_compiler::Compiler::compile_module_with_optimization(
-        &module,
-        filename,
-        optimize,
+        &module, filename, optimize,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -212,7 +214,11 @@ fn module_search_paths() -> Vec<PathBuf> {
 
 fn resolve_module_path_in_search_paths(module: &str, search_paths: &[PathBuf]) -> Option<PathBuf> {
     let parts: Vec<&str> = module.split('.').collect();
-    if parts.is_empty() || parts.iter().any(|segment| !is_valid_module_segment(segment)) {
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|segment| !is_valid_module_segment(segment))
+    {
         return None;
     }
 
@@ -579,7 +585,8 @@ mod tests {
         let temp = TestTempDir::new();
         write_file(&temp.path.join("demo.py"), "x = 1\n");
 
-        let resolved = resolve_module_path_in_search_paths("demo", std::slice::from_ref(&temp.path));
+        let resolved =
+            resolve_module_path_in_search_paths("demo", std::slice::from_ref(&temp.path));
         assert_eq!(resolved, Some(temp.path.join("demo.py")));
     }
 
@@ -598,9 +605,15 @@ mod tests {
         let paths = vec![temp.path.clone()];
 
         assert_eq!(resolve_module_path_in_search_paths("", &paths), None);
-        assert_eq!(resolve_module_path_in_search_paths("pkg..mod", &paths), None);
+        assert_eq!(
+            resolve_module_path_in_search_paths("pkg..mod", &paths),
+            None
+        );
         assert_eq!(resolve_module_path_in_search_paths("1bad", &paths), None);
-        assert_eq!(resolve_module_path_in_search_paths("../escape", &paths), None);
+        assert_eq!(
+            resolve_module_path_in_search_paths("../escape", &paths),
+            None
+        );
     }
 
     #[test]
@@ -609,7 +622,8 @@ mod tests {
         write_file(&temp.path.join("mymodule.py"), "x = 123\n");
 
         let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
-        let code = run_module_with_search_paths("mymodule", &config, std::slice::from_ref(&temp.path));
+        let code =
+            run_module_with_search_paths("mymodule", &config, std::slice::from_ref(&temp.path));
         assert_eq!(code, ExitCode::from(0));
     }
 
@@ -656,8 +670,11 @@ mod tests {
     fn test_run_module_missing_returns_error() {
         let temp = TestTempDir::new();
         let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
-        let code =
-            run_module_with_search_paths("missing_module", &config, std::slice::from_ref(&temp.path));
+        let code = run_module_with_search_paths(
+            "missing_module",
+            &config,
+            std::slice::from_ref(&temp.path),
+        );
         assert_eq!(code, ExitCode::from(error::EXIT_ERROR));
     }
 
@@ -707,36 +724,36 @@ mod tests {
     #[test]
     fn test_run_string_with_args_populates_sys_argv() {
         let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
-        let script_args = vec![
-            "prog.py".to_string(),
-            "one".to_string(),
-            "two".to_string(),
-        ];
-        let code = run_string_with_args("import sys\nassert len(sys.argv) == 3\n", &config, &script_args);
+        let script_args = vec!["prog.py".to_string(), "one".to_string(), "two".to_string()];
+        let code = run_string_with_args(
+            "import sys\nassert len(sys.argv) == 3\n",
+            &config,
+            &script_args,
+        );
         assert_eq!(code, ExitCode::from(0));
     }
 
     #[test]
     fn test_run_string_with_args_supports_from_import() {
         let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
-        let script_args = vec![
-            "prog.py".to_string(),
-            "one".to_string(),
-            "two".to_string(),
-        ];
-        let code = run_string_with_args("from sys import argv\nassert len(argv) == 3\n", &config, &script_args);
+        let script_args = vec!["prog.py".to_string(), "one".to_string(), "two".to_string()];
+        let code = run_string_with_args(
+            "from sys import argv\nassert len(argv) == 3\n",
+            &config,
+            &script_args,
+        );
         assert_eq!(code, ExitCode::from(0));
     }
 
     #[test]
     fn test_run_string_with_args_supports_import_star() {
         let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
-        let script_args = vec![
-            "prog.py".to_string(),
-            "one".to_string(),
-            "two".to_string(),
-        ];
-        let code = run_string_with_args("from sys import *\nassert len(argv) == 3\n", &config, &script_args);
+        let script_args = vec!["prog.py".to_string(), "one".to_string(), "two".to_string()];
+        let code = run_string_with_args(
+            "from sys import *\nassert len(argv) == 3\n",
+            &config,
+            &script_args,
+        );
         assert_eq!(code, ExitCode::from(0));
     }
 }

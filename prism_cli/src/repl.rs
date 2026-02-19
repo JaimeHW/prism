@@ -110,11 +110,7 @@ pub fn run_repl(config: &RuntimeConfig) -> ExitCode {
 // =============================================================================
 
 /// Execute a single REPL input, displaying results or errors.
-fn execute_repl_input(
-    source: &str,
-    vm: &mut prism_vm::VirtualMachine,
-    config: &RuntimeConfig,
-) {
+fn execute_repl_input(source: &str, vm: &mut prism_vm::VirtualMachine, config: &RuntimeConfig) {
     // Parse.
     let module = match prism_parser::parse(source) {
         Ok(m) => m,
@@ -131,9 +127,7 @@ fn execute_repl_input(
         crate::args::OptimizationLevel::Full => prism_compiler::OptimizationLevel::Full,
     };
     let code = match prism_compiler::Compiler::compile_module_with_optimization(
-        &module,
-        "<stdin>",
-        optimize,
+        &module, "<stdin>", optimize,
     ) {
         Ok(c) => c,
         Err(e) => {
