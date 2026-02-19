@@ -2,7 +2,7 @@
 
 use super::BuiltinError;
 use prism_core::Value;
-use prism_core::intern::interned_len_by_ptr;
+use prism_core::intern::{interned_by_ptr, interned_len_by_ptr};
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::dict::DictObject;
 use prism_runtime::types::list::ListObject;
@@ -10,6 +10,7 @@ use prism_runtime::types::range::RangeObject;
 use prism_runtime::types::set::SetObject;
 use prism_runtime::types::string::StringObject;
 use prism_runtime::types::tuple::TupleObject;
+use std::hash::{Hash, Hasher};
 
 // =============================================================================
 // len
@@ -613,34 +614,86 @@ pub fn builtin_hash(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    let obj = args[0];
+    let hash = hash_value(args[0])?;
+    let mut signed = lower_48_signed(hash);
+    if signed == -1 {
+        signed = -2;
+    }
+    Value::int(signed).ok_or_else(|| BuiltinError::OverflowError("hash overflow".to_string()))
+}
 
-    // Hashable primitives
-    if obj.is_none() {
-        // hash(None) = 0 in Python, but we'll use a distinct value
-        return Ok(Value::int(0x_C0FFEE).unwrap());
+#[inline]
+fn hash_value(value: Value) -> Result<u64, BuiltinError> {
+    if value.is_none()
+        || value.as_bool().is_some()
+        || value.as_int().is_some()
+        || value.as_float().is_some()
+    {
+        return Ok(hash_with_default_hasher(&value));
     }
 
-    if let Some(b) = obj.as_bool() {
-        return Ok(Value::int(if b { 1 } else { 0 }).unwrap());
+    if value.is_string() {
+        let ptr = value
+            .as_string_object_ptr()
+            .ok_or_else(|| BuiltinError::TypeError("invalid interned string".to_string()))?;
+        let interned = interned_by_ptr(ptr as *const u8)
+            .ok_or_else(|| BuiltinError::TypeError("invalid interned string".to_string()))?;
+        return Ok(hash_with_default_hasher(&interned.as_str()));
     }
 
-    if let Some(i) = obj.as_int() {
-        // Python's hash for small ints is the int itself (with some adjustments for -1)
-        let h = if i == -1 { -2 } else { i };
-        return Value::int(h)
-            .ok_or_else(|| BuiltinError::OverflowError("hash overflow".to_string()));
+    let ptr = value
+        .as_object_ptr()
+        .ok_or_else(|| BuiltinError::TypeError("unhashable type".to_string()))?;
+    let type_id = crate::ops::objects::extract_type_id(ptr);
+    match type_id {
+        TypeId::LIST | TypeId::DICT | TypeId::SET => Err(BuiltinError::TypeError(format!(
+            "unhashable type: '{}'",
+            type_id.name()
+        ))),
+        TypeId::STR => {
+            let string = unsafe { &*(ptr as *const StringObject) };
+            Ok(hash_with_default_hasher(&string.as_str()))
+        }
+        TypeId::TUPLE => {
+            let tuple = unsafe { &*(ptr as *const TupleObject) };
+            hash_tuple(tuple)
+        }
+        _ => Ok(hash_with_default_hasher(&(ptr as usize))),
     }
+}
 
-    if let Some(f) = obj.as_float() {
-        // Hash float by its bits
-        let h = f.to_bits() as i64;
-        return Value::int(h)
-            .ok_or_else(|| BuiltinError::OverflowError("hash overflow".to_string()));
+#[inline]
+fn hash_tuple(tuple: &TupleObject) -> Result<u64, BuiltinError> {
+    // CPython-inspired tuple hash combiner.
+    let mut acc: u64 = 0x345678;
+    let len = tuple.len();
+    for (index, item) in tuple.iter().copied().enumerate() {
+        let item_hash = hash_value(item)?;
+        acc = (acc ^ item_hash).wrapping_mul(1_000_003);
+        acc = acc.wrapping_add((index as u64).wrapping_mul(2).wrapping_add(82_520));
     }
+    acc ^= len as u64;
+    if acc == u64::MAX {
+        acc = u64::MAX - 1;
+    }
+    Ok(acc)
+}
 
-    // TODO: Handle strings and tuples via object pointer
-    Err(BuiltinError::TypeError("unhashable type".to_string()))
+#[inline]
+fn hash_with_default_hasher<T: Hash>(value: &T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[inline]
+fn lower_48_signed(value: u64) -> i64 {
+    let masked = value & ((1u64 << 48) - 1);
+    if (masked & (1u64 << 47)) != 0 {
+        masked as i64 - (1i64 << 48)
+    } else {
+        masked as i64
+    }
 }
 
 // =============================================================================
@@ -709,11 +762,22 @@ pub fn builtin_callable(args: &[Value]) -> Result<Value, BuiltinError> {
     if obj.is_none() || obj.is_bool() || obj.is_int() || obj.is_float() {
         return Ok(Value::bool(false));
     }
+    if obj.is_string() {
+        return Ok(Value::bool(false));
+    }
 
-    // TODO: Check TypeSlots.tp_call for objects
-    // For now, assume object pointers might be callable (functions, classes)
-    if obj.is_object() {
-        return Ok(Value::bool(true)); // Optimistic assumption
+    if let Some(ptr) = obj.as_object_ptr() {
+        let type_id = crate::ops::objects::extract_type_id(ptr);
+        let is_callable = matches!(
+            type_id,
+            TypeId::FUNCTION
+                | TypeId::METHOD
+                | TypeId::CLOSURE
+                | TypeId::TYPE
+                | TypeId::BUILTIN_FUNCTION
+                | TypeId::EXCEPTION_TYPE
+        );
+        return Ok(Value::bool(is_callable));
     }
 
     Ok(Value::bool(false))
@@ -761,8 +825,10 @@ pub fn builtin_ascii(args: &[Value]) -> Result<Value, BuiltinError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtins::BuiltinFunctionObject;
     use prism_core::intern::intern;
     use prism_core::value::SMALL_INT_MAX;
+    use prism_runtime::object::ObjectHeader;
 
     fn boxed_value<T>(obj: T) -> (Value, *mut T) {
         let ptr = Box::into_raw(Box::new(obj));
@@ -1100,7 +1166,78 @@ mod tests {
     #[test]
     fn test_hash_int() {
         let result = builtin_hash(&[Value::int(42).unwrap()]).unwrap();
-        assert_eq!(result.as_int(), Some(42));
+        assert!(result.as_int().is_some());
+    }
+
+    #[test]
+    fn test_hash_int_float_equivalence() {
+        let int_hash = builtin_hash(&[Value::int(42).unwrap()]).unwrap();
+        let float_hash = builtin_hash(&[Value::float(42.0)]).unwrap();
+        assert_eq!(int_hash.as_int(), float_hash.as_int());
+    }
+
+    #[test]
+    fn test_hash_tagged_string_by_content() {
+        let a = builtin_hash(&[Value::string(intern("alpha"))]).unwrap();
+        let b = builtin_hash(&[Value::string(intern("alpha"))]).unwrap();
+        assert_eq!(a.as_int(), b.as_int());
+    }
+
+    #[test]
+    fn test_hash_runtime_string_matches_tagged_string() {
+        let tagged = builtin_hash(&[Value::string(intern("runtime"))]).unwrap();
+        let (runtime_value, ptr) = boxed_value(StringObject::new("runtime"));
+        let runtime = builtin_hash(&[runtime_value]).unwrap();
+        assert_eq!(tagged.as_int(), runtime.as_int());
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_hash_tuple_by_contents() {
+        let tuple1 = TupleObject::from_slice(&[Value::int(1).unwrap(), Value::int(2).unwrap()]);
+        let (tuple1_value, tuple1_ptr) = boxed_value(tuple1);
+        let hash1 = builtin_hash(&[tuple1_value]).unwrap();
+
+        let tuple2 = TupleObject::from_slice(&[Value::int(1).unwrap(), Value::int(2).unwrap()]);
+        let (tuple2_value, tuple2_ptr) = boxed_value(tuple2);
+        let hash2 = builtin_hash(&[tuple2_value]).unwrap();
+
+        assert_eq!(hash1.as_int(), hash2.as_int());
+        unsafe { drop_boxed(tuple1_ptr) };
+        unsafe { drop_boxed(tuple2_ptr) };
+    }
+
+    #[test]
+    fn test_hash_tuple_unhashable_member_error() {
+        let list = ListObject::from_slice(&[Value::int(1).unwrap()]);
+        let (list_value, list_ptr) = boxed_value(list);
+        let tuple = TupleObject::from_slice(&[list_value]);
+        let (tuple_value, tuple_ptr) = boxed_value(tuple);
+
+        let err = builtin_hash(&[tuple_value]).unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        assert!(err.to_string().contains("unhashable type"));
+
+        unsafe { drop_boxed(tuple_ptr) };
+        unsafe { drop_boxed(list_ptr) };
+    }
+
+    #[test]
+    fn test_hash_unhashable_containers_error() {
+        let (list_value, list_ptr) = boxed_value(ListObject::new());
+        let list_err = builtin_hash(&[list_value]).unwrap_err();
+        assert!(list_err.to_string().contains("unhashable type: 'list'"));
+        unsafe { drop_boxed(list_ptr) };
+
+        let (dict_value, dict_ptr) = boxed_value(DictObject::new());
+        let dict_err = builtin_hash(&[dict_value]).unwrap_err();
+        assert!(dict_err.to_string().contains("unhashable type: 'dict'"));
+        unsafe { drop_boxed(dict_ptr) };
+
+        let (set_value, set_ptr) = boxed_value(SetObject::new());
+        let set_err = builtin_hash(&[set_value]).unwrap_err();
+        assert!(set_err.to_string().contains("unhashable type: 'set'"));
+        unsafe { drop_boxed(set_ptr) };
     }
 
     #[test]
@@ -1109,6 +1246,49 @@ mod tests {
         assert!(!result.is_truthy());
 
         let result = builtin_callable(&[Value::none()]).unwrap();
+        assert!(!result.is_truthy());
+    }
+
+    fn dummy_builtin(_args: &[Value]) -> Result<Value, BuiltinError> {
+        Ok(Value::none())
+    }
+
+    #[test]
+    fn test_callable_builtin_function_true() {
+        let builtin = BuiltinFunctionObject::new("dummy".into(), dummy_builtin);
+        let (value, ptr) = boxed_value(builtin);
+        let result = builtin_callable(&[value]).unwrap();
+        assert!(result.is_truthy());
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_callable_type_object_true() {
+        #[repr(C)]
+        struct DummyTypeObject {
+            header: ObjectHeader,
+        }
+
+        let dummy = DummyTypeObject {
+            header: ObjectHeader::new(TypeId::TYPE),
+        };
+        let (value, ptr) = boxed_value(dummy);
+        let result = builtin_callable(&[value]).unwrap();
+        assert!(result.is_truthy());
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_callable_non_callable_object_false() {
+        let (value, ptr) = boxed_value(ListObject::new());
+        let result = builtin_callable(&[value]).unwrap();
+        assert!(!result.is_truthy());
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_callable_string_false() {
+        let result = builtin_callable(&[Value::string(intern("name"))]).unwrap();
         assert!(!result.is_truthy());
     }
 }
