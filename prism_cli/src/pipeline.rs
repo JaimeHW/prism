@@ -216,7 +216,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "VM does not yet support len() on strings"]
     fn test_execute_string_operations() {
         let code = execute_with_default_config("s = 'hello'\nx = len(s)", "<test>");
         assert_eq!(code, ExitCode::from(0));
@@ -250,7 +249,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "VM does not yet support list comprehensions"]
     fn test_execute_list_comprehension() {
         let code = execute_with_default_config("squares = [x * x for x in range(5)]", "<test>");
         assert_eq!(code, ExitCode::from(0));
@@ -327,7 +325,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "VM does not yet support tuple unpacking assignment"]
     fn test_execute_tuple_unpacking() {
         let code = execute_with_default_config("a, b = 1, 2", "<test>");
         assert_eq!(code, ExitCode::from(0));
