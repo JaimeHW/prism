@@ -46,7 +46,7 @@ pub mod type_feedback;
 #[cfg(test)]
 mod profile_data_tests;
 
-pub use code_cache::{CodeCache, CompiledEntry};
+pub use code_cache::{CodeCache, CompiledEntry, ReturnAbi};
 pub use compiler_thread::{CompilationRequest, CompilerThread};
 pub use entry_stub::{EntryStub, ExitReason};
 pub use profile_data::{

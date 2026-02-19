@@ -23,7 +23,7 @@ use prism_jit::ir::GraphBuilder;
 use prism_jit::ir::builder::translator::BytecodeTranslator;
 use prism_jit::opt::OptPipeline;
 use prism_jit::regalloc::{AllocatorConfig, LinearScanAllocator, LivenessAnalysis};
-use prism_jit::runtime::{CodeCache, CompiledEntry, RuntimeConfig};
+use prism_jit::runtime::{CodeCache, CompiledEntry, ReturnAbi, RuntimeConfig};
 use prism_jit::tier1::codegen::TemplateCompiler;
 use prism_jit::tier2::{CodeEmitter, InstructionSelector};
 
@@ -325,7 +325,9 @@ impl JitBridge {
             CodeEmitter::emit(&mfunc).map_err(|e| format!("Tier 2 code emission failed: {}", e))?;
 
         // Create cache entry with Tier 2 marker
-        let entry = CompiledEntry::from_executable_buffer(code_id, compiled.code).with_tier(2);
+        let entry = CompiledEntry::from_executable_buffer(code_id, compiled.code)
+            .with_tier(2)
+            .with_return_abi(ReturnAbi::EncodedExitReason);
 
         // Insert into cache
         self.code_cache.insert(entry);

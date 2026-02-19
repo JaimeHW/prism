@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use prism_core::Value;
-use prism_jit::runtime::{CodeCache, CompiledEntry, ExitReason};
+use prism_jit::runtime::{CodeCache, CompiledEntry, ExitReason, ReturnAbi};
 
 use crate::error::RuntimeError;
 use crate::frame::Frame;
@@ -218,9 +218,9 @@ impl JitExecutor {
         // Execute compiled code
         let result = unsafe { entry_fn(&mut self.frame_state) };
 
-        // Tier 1 baseline JIT currently returns raw Prism Value bits in RAX.
-        // Handle this path directly to avoid interpreting valid values as exit reasons.
-        if entry.tier() == 1 {
+        // Some JIT tiers return raw Prism Value bits in RAX.
+        // Handle those paths directly to avoid interpreting valid values as exit reasons.
+        if entry.return_abi() == ReturnAbi::RawValueBits {
             self.restore_frame_state(frame);
             return ExecutionResult::Return(Value::from_bits(result));
         }
@@ -310,8 +310,8 @@ impl JitExecutor {
         // Execute from OSR entry
         let result = unsafe { osr_entry_fn(&mut self.frame_state) };
 
-        // Tier 1 baseline JIT returns raw Prism Value bits.
-        if entry.tier() == 1 {
+        // Some JIT tiers return raw Prism Value bits in RAX.
+        if entry.return_abi() == ReturnAbi::RawValueBits {
             self.restore_frame_state(frame);
             return ExecutionResult::Return(Value::from_bits(result));
         }

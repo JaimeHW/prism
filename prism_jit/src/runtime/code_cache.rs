@@ -35,8 +35,19 @@ pub struct CompiledEntry {
     osr_entries: Option<Arc<OsrCompiledCode>>,
     /// Compilation tier (1 = baseline, 2 = optimized).
     tier: u8,
+    /// ABI used by the compiled function's return path.
+    return_abi: ReturnAbi,
     /// Number of times this code has been called.
     call_count: u64,
+}
+
+/// Return ABI for compiled code entry points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReturnAbi {
+    /// Return raw `Value` bits in RAX.
+    RawValueBits,
+    /// Return encoded exit reason/data in RAX.
+    EncodedExitReason,
 }
 
 impl CompiledEntry {
@@ -55,6 +66,7 @@ impl CompiledEntry {
             entry_offset: 0,
             osr_entries: None,
             tier: 1,
+            return_abi: ReturnAbi::RawValueBits,
             call_count: 0,
         }
     }
@@ -74,6 +86,7 @@ impl CompiledEntry {
             entry_offset: 0,
             osr_entries: None,
             tier: 1,
+            return_abi: ReturnAbi::RawValueBits,
             call_count: 0,
         }
     }
@@ -93,6 +106,12 @@ impl CompiledEntry {
     /// Set the compilation tier.
     pub fn with_tier(mut self, tier: u8) -> Self {
         self.tier = tier;
+        self
+    }
+
+    /// Set return ABI.
+    pub fn with_return_abi(mut self, return_abi: ReturnAbi) -> Self {
+        self.return_abi = return_abi;
         self
     }
 
@@ -118,6 +137,12 @@ impl CompiledEntry {
     #[inline]
     pub fn tier(&self) -> u8 {
         self.tier
+    }
+
+    /// Get the return ABI.
+    #[inline]
+    pub fn return_abi(&self) -> ReturnAbi {
+        self.return_abi
     }
 
     /// Get OSR entries.
@@ -359,14 +384,17 @@ mod tests {
         assert_eq!(entry.code_id, 1);
         assert_eq!(entry.code_size(), 100);
         assert_eq!(entry.tier(), 1);
+        assert_eq!(entry.return_abi(), ReturnAbi::RawValueBits);
     }
 
     #[test]
     fn test_compiled_entry_builder_pattern() {
         let entry = CompiledEntry::new(1, dummy_code_ptr(), 100)
             .with_entry_offset(16)
-            .with_tier(2);
+            .with_tier(2)
+            .with_return_abi(ReturnAbi::EncodedExitReason);
         assert_eq!(entry.tier(), 2);
+        assert_eq!(entry.return_abi(), ReturnAbi::EncodedExitReason);
         assert_eq!(entry.entry_point() as usize, dummy_code_ptr() as usize + 16);
     }
 

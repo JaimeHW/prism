@@ -334,7 +334,10 @@ impl JitContext {
         if self.config.eager_compilation || !self.config.background_compilation {
             // Synchronous compilation - dispatch based on tier
             let result = if tier >= 2 {
-                self.bridge.compile_tier2(code)
+                // Tier 2 remains correctness-gated until full value-tag/ABI
+                // parity is guaranteed across the optimizing pipeline.
+                // Keep execution on the validated synchronous tier.
+                self.bridge.compile_sync(code)
             } else {
                 self.bridge.compile_sync(code)
             };
