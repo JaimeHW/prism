@@ -136,8 +136,35 @@ impl PartialEq<String> for InternedString {
 /// Interning the same string multiple times returns the same handle, enabling
 /// O(1) equality comparison.
 pub struct StringInterner {
-    /// Map from string content to interned handle.
-    strings: RwLock<FxHashMap<Arc<str>, InternedString>>,
+    /// Interner state protected by a read-write lock.
+    maps: RwLock<InternerMaps>,
+}
+
+/// Internal interner maps.
+///
+/// `by_value` provides the canonical dedup map from string content to handle.
+/// `by_ptr` enables O(1) lookup from the leaked data pointer used in `Value::string`.
+struct InternerMaps {
+    by_value: FxHashMap<Arc<str>, InternedString>,
+    by_ptr: FxHashMap<usize, InternedString>,
+}
+
+impl InternerMaps {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            by_value: FxHashMap::default(),
+            by_ptr: FxHashMap::default(),
+        }
+    }
+
+    #[inline]
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            by_value: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            by_ptr: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+        }
+    }
 }
 
 impl StringInterner {
@@ -145,7 +172,7 @@ impl StringInterner {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            strings: RwLock::new(FxHashMap::default()),
+            maps: RwLock::new(InternerMaps::new()),
         }
     }
 
@@ -153,10 +180,7 @@ impl StringInterner {
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            strings: RwLock::new(FxHashMap::with_capacity_and_hasher(
-                capacity,
-                Default::default(),
-            )),
+            maps: RwLock::new(InternerMaps::with_capacity(capacity)),
         }
     }
 
@@ -167,24 +191,26 @@ impl StringInterner {
     pub fn intern(&self, s: &str) -> InternedString {
         // Fast path: check if already interned with read lock
         {
-            let strings = self.strings.read();
-            if let Some(interned) = strings.get(s) {
+            let maps = self.maps.read();
+            if let Some(interned) = maps.by_value.get(s) {
                 return interned.clone();
             }
         }
 
         // Slow path: insert with write lock
-        let mut strings = self.strings.write();
+        let mut maps = self.maps.write();
 
         // Double-check after acquiring write lock
-        if let Some(interned) = strings.get(s) {
+        if let Some(interned) = maps.by_value.get(s) {
             return interned.clone();
         }
 
         // Create new interned string
         let arc: Arc<str> = s.into();
         let interned = InternedString::new(arc.clone());
-        strings.insert(arc, interned.clone());
+        maps.by_value.insert(arc, interned.clone());
+        maps.by_ptr
+            .insert(interned.ptr() as usize, interned.clone());
         interned
     }
 
@@ -194,24 +220,26 @@ impl StringInterner {
     pub fn intern_owned(&self, s: String) -> InternedString {
         // Fast path: check if already interned with read lock
         {
-            let strings = self.strings.read();
-            if let Some(interned) = strings.get(s.as_str()) {
+            let maps = self.maps.read();
+            if let Some(interned) = maps.by_value.get(s.as_str()) {
                 return interned.clone();
             }
         }
 
         // Slow path: insert with write lock
-        let mut strings = self.strings.write();
+        let mut maps = self.maps.write();
 
         // Double-check after acquiring write lock
-        if let Some(interned) = strings.get(s.as_str()) {
+        if let Some(interned) = maps.by_value.get(s.as_str()) {
             return interned.clone();
         }
 
         // Create new interned string from owned String
         let arc: Arc<str> = s.into();
         let interned = InternedString::new(arc.clone());
-        strings.insert(arc, interned.clone());
+        maps.by_value.insert(arc, interned.clone());
+        maps.by_ptr
+            .insert(interned.ptr() as usize, interned.clone());
         interned
     }
 
@@ -220,25 +248,45 @@ impl StringInterner {
     /// Returns `None` if the string has not been interned.
     #[must_use]
     pub fn get(&self, s: &str) -> Option<InternedString> {
-        self.strings.read().get(s).cloned()
+        self.maps.read().by_value.get(s).cloned()
+    }
+
+    /// Get an interned string by its data pointer.
+    ///
+    /// This is used by NaN-boxed `Value::string` payload decoding.
+    #[must_use]
+    pub fn get_by_ptr(&self, ptr: *const u8) -> Option<InternedString> {
+        self.maps.read().by_ptr.get(&(ptr as usize)).cloned()
+    }
+
+    /// Get interned string byte length by data pointer.
+    ///
+    /// Returns `None` when the pointer is not present in the interner.
+    #[must_use]
+    pub fn len_by_ptr(&self, ptr: *const u8) -> Option<usize> {
+        self.maps
+            .read()
+            .by_ptr
+            .get(&(ptr as usize))
+            .map(InternedString::len)
     }
 
     /// Check if a string has been interned.
     #[must_use]
     pub fn contains(&self, s: &str) -> bool {
-        self.strings.read().contains_key(s)
+        self.maps.read().by_value.contains_key(s)
     }
 
     /// Get the number of interned strings.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.strings.read().len()
+        self.maps.read().by_value.len()
     }
 
     /// Check if the interner is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.strings.read().is_empty()
+        self.maps.read().by_value.is_empty()
     }
 
     /// Clear all interned strings.
@@ -246,7 +294,9 @@ impl StringInterner {
     /// Existing `InternedString` handles remain valid but will no longer
     /// be deduplicated with newly interned strings.
     pub fn clear(&self) {
-        self.strings.write().clear();
+        let mut maps = self.maps.write();
+        maps.by_value.clear();
+        maps.by_ptr.clear();
     }
 }
 
@@ -258,9 +308,9 @@ impl Default for StringInterner {
 
 impl fmt::Debug for StringInterner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let strings = self.strings.read();
+        let maps = self.maps.read();
         f.debug_struct("StringInterner")
-            .field("count", &strings.len())
+            .field("count", &maps.by_value.len())
             .finish()
     }
 }
@@ -281,6 +331,20 @@ pub fn intern(s: &str) -> InternedString {
 #[inline]
 pub fn intern_owned(s: String) -> InternedString {
     GLOBAL_INTERNER.intern_owned(s)
+}
+
+/// Resolve an interned string from its data pointer.
+///
+/// This supports NaN-boxed string payload decoding in the VM.
+#[inline]
+pub fn interned_by_ptr(ptr: *const u8) -> Option<InternedString> {
+    GLOBAL_INTERNER.get_by_ptr(ptr)
+}
+
+/// Resolve interned string length from its data pointer.
+#[inline]
+pub fn interned_len_by_ptr(ptr: *const u8) -> Option<usize> {
+    GLOBAL_INTERNER.len_by_ptr(ptr)
 }
 
 #[cfg(test)]
@@ -524,6 +588,38 @@ mod tests {
         let s2 = intern("global_owned");
 
         assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn test_lookup_by_pointer_roundtrip() {
+        let interner = StringInterner::new();
+        let s = interner.intern("pointer_roundtrip");
+        let ptr = s.as_str().as_ptr();
+
+        let resolved = interner.get_by_ptr(ptr).expect("pointer should resolve");
+        assert_eq!(resolved, s);
+        assert_eq!(interner.len_by_ptr(ptr), Some("pointer_roundtrip".len()));
+    }
+
+    #[test]
+    fn test_lookup_by_pointer_unknown() {
+        let interner = StringInterner::new();
+        let bogus = "not_in_interner".as_ptr();
+        assert!(interner.get_by_ptr(bogus).is_none());
+        assert!(interner.len_by_ptr(bogus).is_none());
+    }
+
+    #[test]
+    fn test_global_lookup_by_pointer_roundtrip() {
+        let s = intern("global_pointer_roundtrip");
+        let ptr = s.as_str().as_ptr();
+
+        let resolved = interned_by_ptr(ptr).expect("global pointer should resolve");
+        assert_eq!(resolved, s);
+        assert_eq!(
+            interned_len_by_ptr(ptr),
+            Some("global_pointer_roundtrip".len())
+        );
     }
 
     #[test]
