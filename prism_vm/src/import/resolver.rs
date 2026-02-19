@@ -493,7 +493,11 @@ impl ImportResolver {
 
     /// Resolve a raw object pointer to an imported module, if it is a known module.
     pub fn module_from_ptr(&self, ptr: *const ()) -> Option<Arc<ModuleObject>> {
-        self.module_ptrs.read().unwrap().get(&(ptr as usize)).cloned()
+        self.module_ptrs
+            .read()
+            .unwrap()
+            .get(&(ptr as usize))
+            .cloned()
     }
 
     /// Add a search path for source files.
@@ -744,11 +748,11 @@ mod tests {
 
     #[test]
     fn test_with_sys_args_populates_imported_sys_argv() {
-        let resolver = ImportResolver::with_sys_args(vec![
-            "prog.py".to_string(),
-            "--fast".to_string(),
-        ]);
-        let sys = resolver.import_module("sys").expect("sys import should succeed");
+        let resolver =
+            ImportResolver::with_sys_args(vec!["prog.py".to_string(), "--fast".to_string()]);
+        let sys = resolver
+            .import_module("sys")
+            .expect("sys import should succeed");
         let argv = sys.get_attr("argv").expect("sys.argv should be present");
 
         let argv_ptr = argv
@@ -762,19 +766,21 @@ mod tests {
 
         let arg0_ptr = arg0
             .as_string_object_ptr()
-            .expect("argv[0] should be string")
-            as *const u8;
+            .expect("argv[0] should be string") as *const u8;
         let arg1_ptr = arg1
             .as_string_object_ptr()
-            .expect("argv[1] should be string")
-            as *const u8;
+            .expect("argv[1] should be string") as *const u8;
 
         assert_eq!(
-            interned_by_ptr(arg0_ptr).expect("argv[0] should resolve").as_ref(),
+            interned_by_ptr(arg0_ptr)
+                .expect("argv[0] should resolve")
+                .as_ref(),
             "prog.py"
         );
         assert_eq!(
-            interned_by_ptr(arg1_ptr).expect("argv[1] should resolve").as_ref(),
+            interned_by_ptr(arg1_ptr)
+                .expect("argv[1] should resolve")
+                .as_ref(),
             "--fast"
         );
     }
@@ -782,7 +788,9 @@ mod tests {
     #[test]
     fn test_module_from_ptr_resolves_cached_module() {
         let resolver = ImportResolver::new();
-        let math = resolver.import_module("math").expect("math import should succeed");
+        let math = resolver
+            .import_module("math")
+            .expect("math import should succeed");
         let ptr = Arc::as_ptr(&math) as *const ();
 
         let resolved = resolver

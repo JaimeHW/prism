@@ -418,14 +418,22 @@ mod tests {
         let second = list.get(1).expect("sys.path[1] should exist");
         let first_ptr = first
             .as_string_object_ptr()
-            .expect("sys.path[0] should be string")
-            as *const u8;
+            .expect("sys.path[0] should be string") as *const u8;
         let second_ptr = second
             .as_string_object_ptr()
-            .expect("sys.path[1] should be string")
-            as *const u8;
+            .expect("sys.path[1] should be string") as *const u8;
 
-        assert_eq!(interned_by_ptr(first_ptr).expect("path[0] should resolve").as_ref(), "/a");
-        assert_eq!(interned_by_ptr(second_ptr).expect("path[1] should resolve").as_ref(), "/b");
+        assert_eq!(
+            interned_by_ptr(first_ptr)
+                .expect("path[0] should resolve")
+                .as_ref(),
+            "/a"
+        );
+        assert_eq!(
+            interned_by_ptr(second_ptr)
+                .expect("path[1] should resolve")
+                .as_ref(),
+            "/b"
+        );
     }
 }

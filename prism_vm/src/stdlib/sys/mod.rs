@@ -400,27 +400,30 @@ mod tests {
 
         let first_ptr = first
             .as_string_object_ptr()
-            .expect("argv[0] should be interned string")
-            as *const u8;
+            .expect("argv[0] should be interned string") as *const u8;
         let second_ptr = second
             .as_string_object_ptr()
-            .expect("argv[1] should be interned string")
-            as *const u8;
+            .expect("argv[1] should be interned string") as *const u8;
         let third_ptr = third
             .as_string_object_ptr()
-            .expect("argv[2] should be interned string")
-            as *const u8;
+            .expect("argv[2] should be interned string") as *const u8;
 
         assert_eq!(
-            interned_by_ptr(first_ptr).expect("argv[0] should resolve").as_ref(),
+            interned_by_ptr(first_ptr)
+                .expect("argv[0] should resolve")
+                .as_ref(),
             "script.py"
         );
         assert_eq!(
-            interned_by_ptr(second_ptr).expect("argv[1] should resolve").as_ref(),
+            interned_by_ptr(second_ptr)
+                .expect("argv[1] should resolve")
+                .as_ref(),
             "--flag"
         );
         assert_eq!(
-            interned_by_ptr(third_ptr).expect("argv[2] should resolve").as_ref(),
+            interned_by_ptr(third_ptr)
+                .expect("argv[2] should resolve")
+                .as_ref(),
             "value"
         );
     }
@@ -441,13 +444,15 @@ mod tests {
             .as_object_ptr()
             .expect("sys.path should be represented as list object");
         let list = unsafe { &*(ptr as *const ListObject) };
-        assert!(!list.is_empty(), "sys.path should include at least one entry");
+        assert!(
+            !list.is_empty(),
+            "sys.path should include at least one entry"
+        );
 
         let first = list.get(0).expect("sys.path[0] should exist");
         let first_ptr = first
             .as_string_object_ptr()
-            .expect("sys.path[0] should be interned string")
-            as *const u8;
+            .expect("sys.path[0] should be interned string") as *const u8;
         assert_eq!(
             interned_by_ptr(first_ptr)
                 .expect("sys.path[0] should resolve")
