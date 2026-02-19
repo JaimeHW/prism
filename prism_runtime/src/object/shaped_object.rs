@@ -25,7 +25,35 @@ use crate::object::type_obj::TypeId;
 use prism_core::Value;
 use prism_core::intern::InternedString;
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+/// Marker payload used to represent a deleted inline attribute slot.
+///
+/// Deleted attributes must be distinguishable from attributes explicitly set
+/// to `None`, so we store a private marker object in inline slots.
+#[repr(C)]
+struct DeletedPropertyMarker {
+    header: ObjectHeader,
+}
+
+static DELETED_PROPERTY_MARKER_PTR: LazyLock<usize> = LazyLock::new(|| {
+    let marker = DeletedPropertyMarker {
+        header: ObjectHeader::new(TypeId::OBJECT),
+    };
+    Box::into_raw(Box::new(marker)) as usize
+});
+
+#[inline(always)]
+fn deleted_property_value() -> Value {
+    Value::object_ptr(*DELETED_PROPERTY_MARKER_PTR as *const ())
+}
+
+#[inline(always)]
+fn is_deleted_property(value: Value) -> bool {
+    value
+        .as_object_ptr()
+        .is_some_and(|ptr| ptr as usize == *DELETED_PROPERTY_MARKER_PTR)
+}
 
 // =============================================================================
 // Inline Slots
@@ -221,21 +249,8 @@ impl ShapedObject {
     ///
     /// Returns None if the property doesn't exist.
     pub fn get_property(&self, name: &str) -> Option<Value> {
-        // First check inline slots via shape lookup
-        if let Some(slot_index) = self.shape.lookup(name) {
-            if (slot_index as usize) < MAX_INLINE_SLOTS {
-                return Some(self.inline_slots.get(slot_index));
-            }
-        }
-
-        // Check overflow storage
-        if let Some(overflow) = &self.overflow {
-            // For overflow, we need an InternedString - intern it
-            let interned = prism_core::intern::intern(name);
-            return overflow.get(&interned).copied();
-        }
-
-        None
+        let interned = prism_core::intern::intern(name);
+        self.get_property_interned(&interned)
     }
 
     /// Get a property using an interned name (faster).
@@ -244,8 +259,14 @@ impl ShapedObject {
         // Fast path: shape lookup with interned name
         if let Some(slot_index) = self.shape.lookup_interned(name) {
             if (slot_index as usize) < MAX_INLINE_SLOTS {
-                return Some(self.inline_slots.get(slot_index));
+                let value = self.inline_slots.get(slot_index);
+                return if is_deleted_property(value) {
+                    None
+                } else {
+                    Some(value)
+                };
             }
+            return self.overflow.as_ref().and_then(|overflow| overflow.get(name).copied());
         }
 
         // Check overflow storage
@@ -285,14 +306,12 @@ impl ShapedObject {
                 self.inline_slots.set(slot_index, value);
                 return None;
             }
-        }
-
-        // Check overflow storage for existing property
-        if let Some(overflow) = &mut self.overflow {
-            if overflow.contains(&name) {
-                overflow.set(name, value);
-                return None;
-            }
+            // Property exists in overflow storage for current shape.
+            let overflow = self
+                .overflow
+                .get_or_insert_with(|| Box::new(OverflowStorage::new()));
+            overflow.set(name, value);
+            return None;
         }
 
         // Property is new - create transition
@@ -331,13 +350,11 @@ impl ShapedObject {
                 self.inline_slots.set(slot_index, value);
                 return None;
             }
-        }
-
-        if let Some(overflow) = &mut self.overflow {
-            if overflow.contains(&name) {
-                overflow.set(name, value);
-                return None;
-            }
+            let overflow = self
+                .overflow
+                .get_or_insert_with(|| Box::new(OverflowStorage::new()));
+            overflow.set(name, value);
+            return None;
         }
 
         // Create transition with custom flags
@@ -371,39 +388,82 @@ impl ShapedObject {
 
     /// Check if a property exists.
     pub fn has_property(&self, name: &str) -> bool {
-        if self.shape.lookup(name).is_some() {
-            return true;
+        let interned = prism_core::intern::intern(name);
+        self.has_property_interned(&interned)
+    }
+
+    /// Check if a property exists using an interned name.
+    pub fn has_property_interned(&self, name: &InternedString) -> bool {
+        if let Some(slot_index) = self.shape.lookup_interned(name) {
+            if (slot_index as usize) < MAX_INLINE_SLOTS {
+                return !is_deleted_property(self.inline_slots.get(slot_index));
+            }
+            return self
+                .overflow
+                .as_ref()
+                .is_some_and(|overflow| overflow.contains(name));
         }
-        if let Some(overflow) = &self.overflow {
-            let interned = prism_core::intern::intern(name);
-            return overflow.contains(&interned);
-        }
-        false
+        self.overflow
+            .as_ref()
+            .is_some_and(|overflow| overflow.contains(name))
     }
 
     /// Delete a property.
     ///
-    /// Note: This doesn't change the shape - the slot is just set to None.
+    /// Note: This doesn't change the shape. Inline slots use a private tombstone
+    /// marker so deletion is distinct from assigning `None`.
     /// A more sophisticated implementation could use "delete shapes" like V8.
     pub fn delete_property(&mut self, name: &str) -> bool {
-        if let Some(slot_index) = self.shape.lookup(name) {
+        let interned = prism_core::intern::intern(name);
+        self.delete_property_interned(&interned)
+    }
+
+    /// Delete a property by interned name.
+    ///
+    /// For inline slots we install a tombstone marker so deleted attributes are
+    /// not confused with attributes explicitly set to `None`.
+    pub fn delete_property_interned(&mut self, name: &InternedString) -> bool {
+        if let Some(slot_index) = self.shape.lookup_interned(name) {
             if (slot_index as usize) < MAX_INLINE_SLOTS {
-                self.inline_slots.set(slot_index, Value::none());
+                let current = self.inline_slots.get(slot_index);
+                if is_deleted_property(current) {
+                    return false;
+                }
+                self.inline_slots
+                    .set(slot_index, deleted_property_value());
                 return true;
             }
+            return self
+                .overflow
+                .as_mut()
+                .is_some_and(|overflow| overflow.remove(name).is_some());
         }
 
-        if let Some(overflow) = &mut self.overflow {
-            let interned = prism_core::intern::intern(name);
-            return overflow.remove(&interned).is_some();
-        }
-
-        false
+        self.overflow
+            .as_mut()
+            .is_some_and(|overflow| overflow.remove(name).is_some())
     }
 
     /// Get all property names in definition order.
     pub fn property_names(&self) -> Vec<InternedString> {
-        let mut names = self.shape.property_names();
+        let mut names = Vec::new();
+        for name in self.shape.property_names() {
+            if let Some(slot_index) = self.shape.lookup_interned(&name) {
+                if (slot_index as usize) < MAX_INLINE_SLOTS {
+                    if !is_deleted_property(self.inline_slots.get(slot_index)) {
+                        names.push(name);
+                    }
+                    continue;
+                }
+            }
+            if self
+                .overflow
+                .as_ref()
+                .is_some_and(|overflow| overflow.contains(&name))
+            {
+                names.push(name);
+            }
+        }
 
         if let Some(overflow) = &self.overflow {
             for (name, _) in overflow.iter() {
@@ -419,11 +479,18 @@ impl ShapedObject {
 
     /// Get total property count.
     pub fn property_count(&self) -> usize {
-        let shape_count = self.shape.property_count() as usize;
+        let mut inline_count = 0usize;
+        for name in self.shape.property_names() {
+            if let Some(slot_index) = self.shape.lookup_interned(&name) {
+                if (slot_index as usize) < MAX_INLINE_SLOTS
+                    && !is_deleted_property(self.inline_slots.get(slot_index))
+                {
+                    inline_count += 1;
+                }
+            }
+        }
         let overflow_count = self.overflow.as_ref().map_or(0, |o| o.len());
-        // Overflow properties are those beyond MAX_INLINE_SLOTS
-        // which are already counted in shape_count
-        shape_count.max(shape_count + overflow_count - MAX_INLINE_SLOTS.min(shape_count))
+        inline_count + overflow_count
     }
 
     /// Check if object uses only inline storage.
@@ -438,7 +505,10 @@ impl ShapedObject {
         let inline_iter = shape_props.into_iter().filter_map(|name| {
             if let Some(slot_index) = self.shape.lookup_interned(&name) {
                 if (slot_index as usize) < MAX_INLINE_SLOTS {
-                    return Some((name, self.inline_slots.get(slot_index)));
+                    let value = self.inline_slots.get(slot_index);
+                    if !is_deleted_property(value) {
+                        return Some((name, value));
+                    }
                 }
             }
             None
@@ -699,8 +769,9 @@ mod tests {
         obj.set_property(intern("x"), val(1), &registry);
         assert!(obj.delete_property("x"));
 
-        // Property still "exists" in shape, but value is None
-        assert_eq!(obj.get_property("x"), Some(Value::none()));
+        // Attribute must be absent after deletion.
+        assert_eq!(obj.get_property("x"), None);
+        assert!(!obj.has_property("x"));
     }
 
     #[test]
@@ -709,6 +780,26 @@ mod tests {
         let mut obj = ShapedObject::new(TypeId::OBJECT, registry.empty_shape());
 
         assert!(!obj.delete_property("nonexistent"));
+    }
+
+    #[test]
+    fn test_shaped_object_delete_twice_returns_false_second_time() {
+        let registry = ShapeRegistry::new();
+        let mut obj = ShapedObject::new(TypeId::OBJECT, registry.empty_shape());
+
+        obj.set_property(intern("x"), val(1), &registry);
+        assert!(obj.delete_property("x"));
+        assert!(!obj.delete_property("x"));
+    }
+
+    #[test]
+    fn test_shaped_object_none_value_is_not_deleted() {
+        let registry = ShapeRegistry::new();
+        let mut obj = ShapedObject::new(TypeId::OBJECT, registry.empty_shape());
+
+        obj.set_property(intern("x"), Value::none(), &registry);
+        assert!(obj.has_property("x"));
+        assert_eq!(obj.get_property("x"), Some(Value::none()));
     }
 
     #[test]
@@ -725,6 +816,21 @@ mod tests {
         assert_eq!(names[0].as_str(), "first");
         assert_eq!(names[1].as_str(), "second");
         assert_eq!(names[2].as_str(), "third");
+    }
+
+    #[test]
+    fn test_shaped_object_property_names_exclude_deleted() {
+        let registry = ShapeRegistry::new();
+        let mut obj = ShapedObject::new(TypeId::OBJECT, registry.empty_shape());
+
+        obj.set_property(intern("first"), val(1), &registry);
+        obj.set_property(intern("second"), val(2), &registry);
+        assert!(obj.delete_property("first"));
+
+        let names = obj.property_names();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].as_str(), "second");
+        assert_eq!(obj.property_count(), 1);
     }
 
     // -------------------------------------------------------------------------
@@ -772,6 +878,27 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn test_shaped_object_readd_deleted_overflow_property_reuses_shape() {
+        let registry = ShapeRegistry::new();
+        let mut obj = ShapedObject::new(TypeId::OBJECT, registry.empty_shape());
+
+        for i in 0..=MAX_INLINE_SLOTS {
+            obj.set_property(intern(&format!("prop{}", i)), val(i as i64), &registry);
+        }
+
+        let overflow_name = format!("prop{}", MAX_INLINE_SLOTS);
+        assert!(obj.delete_property(&overflow_name));
+        assert_eq!(obj.get_property(&overflow_name), None);
+        let shape_before = obj.shape_id();
+
+        obj.set_property(intern(&overflow_name), val(999), &registry);
+        let shape_after = obj.shape_id();
+
+        assert_eq!(shape_before, shape_after);
+        assert_eq!(obj.get_property(&overflow_name), Some(val(999)));
     }
 
     // -------------------------------------------------------------------------
