@@ -99,7 +99,7 @@ pub fn run_repl(config: &RuntimeConfig) -> ExitCode {
         }
 
         // Execute the input.
-        execute_repl_input(&source, &mut vm);
+        execute_repl_input(&source, &mut vm, config);
     }
 
     ExitCode::from(crate::error::EXIT_SUCCESS)
@@ -110,7 +110,11 @@ pub fn run_repl(config: &RuntimeConfig) -> ExitCode {
 // =============================================================================
 
 /// Execute a single REPL input, displaying results or errors.
-fn execute_repl_input(source: &str, vm: &mut prism_vm::VirtualMachine) {
+fn execute_repl_input(
+    source: &str,
+    vm: &mut prism_vm::VirtualMachine,
+    config: &RuntimeConfig,
+) {
     // Parse.
     let module = match prism_parser::parse(source) {
         Ok(m) => m,
@@ -121,7 +125,16 @@ fn execute_repl_input(source: &str, vm: &mut prism_vm::VirtualMachine) {
     };
 
     // Compile.
-    let code = match prism_compiler::Compiler::compile_module(&module, "<stdin>") {
+    let optimize = match config.optimize {
+        crate::args::OptimizationLevel::None => prism_compiler::OptimizationLevel::None,
+        crate::args::OptimizationLevel::Basic => prism_compiler::OptimizationLevel::Basic,
+        crate::args::OptimizationLevel::Full => prism_compiler::OptimizationLevel::Full,
+    };
+    let code = match prism_compiler::Compiler::compile_module_with_optimization(
+        &module,
+        "<stdin>",
+        optimize,
+    ) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("SyntaxError: {}", e.message);
@@ -386,26 +399,30 @@ mod tests {
     #[test]
     fn test_execute_repl_assignment() {
         let mut vm = prism_vm::VirtualMachine::new();
+        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
         // Should not panic.
-        execute_repl_input("x = 42\n", &mut vm);
+        execute_repl_input("x = 42\n", &mut vm, &config);
     }
 
     #[test]
     fn test_execute_repl_syntax_error() {
         let mut vm = prism_vm::VirtualMachine::new();
+        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
         // Should print error but not panic.
-        execute_repl_input("def\n", &mut vm);
+        execute_repl_input("def\n", &mut vm, &config);
     }
 
     #[test]
     fn test_execute_repl_print() {
         let mut vm = prism_vm::VirtualMachine::new();
-        execute_repl_input("print('hello')\n", &mut vm);
+        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
+        execute_repl_input("print('hello')\n", &mut vm, &config);
     }
 
     #[test]
     fn test_execute_repl_multiline_function() {
         let mut vm = prism_vm::VirtualMachine::new();
-        execute_repl_input("def foo():\n    return 42\n\n", &mut vm);
+        let config = RuntimeConfig::from_args(&crate::args::PrismArgs::default());
+        execute_repl_input("def foo():\n    return 42\n\n", &mut vm, &config);
     }
 }

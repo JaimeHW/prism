@@ -46,13 +46,15 @@ fn main() -> ExitCode {
 
     // Dispatch to the appropriate execution mode.
     match &parsed.mode {
-        ExecutionMode::Script(path) => pipeline::run_file(path, &config),
-        ExecutionMode::Command(cmd) => pipeline::run_string(cmd, &config),
-        ExecutionMode::Stdin => pipeline::run_stdin(&config),
+        ExecutionMode::Script(path) => {
+            pipeline::run_file_with_args(path, &config, &parsed.script_args)
+        }
+        ExecutionMode::Command(cmd) => {
+            pipeline::run_string_with_args(cmd, &config, &parsed.script_args)
+        }
+        ExecutionMode::Stdin => pipeline::run_stdin_with_args(&config, &parsed.script_args),
         ExecutionMode::Module(name) => {
-            // Module execution (-m) is not yet implemented. Stub for now.
-            eprintln!("prism: No module named '{}'", name);
-            ExitCode::from(error::EXIT_ERROR)
+            pipeline::run_module_with_args(name, &config, &parsed.script_args)
         }
         ExecutionMode::Repl => repl::run_repl(&config),
         ExecutionMode::PrintVersion | ExecutionMode::PrintHelp => {
