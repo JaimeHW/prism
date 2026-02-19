@@ -86,6 +86,15 @@ pub struct StdlibRegistry {
 impl StdlibRegistry {
     /// Create a new registry with all stdlib modules.
     pub fn new() -> Self {
+        Self::with_optional_sys_args(None)
+    }
+
+    /// Create a registry with an explicit `sys.argv` payload.
+    pub fn with_sys_args(args: Vec<String>) -> Self {
+        Self::with_optional_sys_args(Some(args))
+    }
+
+    fn with_optional_sys_args(sys_args: Option<Vec<String>>) -> Self {
         let mut modules: std::collections::HashMap<Arc<str>, Box<dyn Module + Send + Sync>> =
             std::collections::HashMap::new();
 
@@ -96,7 +105,11 @@ impl StdlibRegistry {
         modules.insert(Arc::from("os"), Box::new(os::OsModule::new()));
 
         // Register sys module
-        modules.insert(Arc::from("sys"), Box::new(sys::SysModule::new()));
+        let sys_module = match sys_args {
+            Some(args) => sys::SysModule::with_args(args),
+            None => sys::SysModule::new(),
+        };
+        modules.insert(Arc::from("sys"), Box::new(sys_module));
 
         // Register time module
         modules.insert(Arc::from("time"), Box::new(time::TimeModule::new()));

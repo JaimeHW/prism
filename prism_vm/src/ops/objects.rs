@@ -61,13 +61,30 @@ pub fn extract_type_id(ptr: *const ()) -> TypeId {
 /// - Custom types: User-defined objects with __dict__
 #[inline(always)]
 pub fn get_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame();
-    let obj = frame.get_reg(inst.src1().0);
-    let name_idx = inst.src2().0 as u16;
-    let name = frame.get_name(name_idx).clone();
+    let (obj, name) = {
+        let frame = vm.current_frame();
+        let obj = frame.get_reg(inst.src1().0);
+        let name_idx = inst.src2().0 as u16;
+        let name = frame.get_name(name_idx).clone();
+        (obj, name)
+    };
 
     // Handle different object types
     if let Some(ptr) = obj.as_object_ptr() {
+        // Imported modules are non-GC objects, so resolve them first
+        // before reading an ObjectHeader from the pointer.
+        if !vm.heap().heap().contains(ptr) {
+            if let Some(module) = vm.import_resolver.module_from_ptr(ptr) {
+                return match module.get_attr(&name) {
+                    Some(value) => {
+                        vm.current_frame_mut().set_reg(inst.dst().0, value);
+                        ControlFlow::Continue
+                    }
+                    None => ControlFlow::Error(RuntimeError::attribute_error("module", name)),
+                };
+            }
+        }
+
         let type_id = extract_type_id(ptr);
 
         match type_id {
@@ -156,13 +173,24 @@ pub fn get_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// - Custom types: User-defined objects with __dict__
 #[inline(always)]
 pub fn set_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame();
-    let obj = frame.get_reg(inst.dst().0);
-    let value = frame.get_reg(inst.src2().0);
-    let name_idx = inst.src1().0 as u16;
-    let name = frame.get_name(name_idx).clone();
+    let (obj, value, name) = {
+        let frame = vm.current_frame();
+        let obj = frame.get_reg(inst.dst().0);
+        let value = frame.get_reg(inst.src2().0);
+        let name_idx = inst.src1().0 as u16;
+        let name = frame.get_name(name_idx).clone();
+        (obj, value, name)
+    };
 
     if let Some(ptr) = obj.as_object_ptr() {
+        // Imported modules are non-GC objects.
+        if !vm.heap().heap().contains(ptr) {
+            if let Some(module) = vm.import_resolver.module_from_ptr(ptr) {
+                module.set_attr(&name, value);
+                return ControlFlow::Continue;
+            }
+        }
+
         let type_id = extract_type_id(ptr);
 
         match type_id {
@@ -253,12 +281,26 @@ pub fn set_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// - Custom types: User-defined objects with __dict__
 #[inline(always)]
 pub fn del_attr(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame();
-    let obj = frame.get_reg(inst.src1().0);
-    let name_idx = inst.src2().0 as u16;
-    let name = frame.get_name(name_idx).clone();
+    let (obj, name) = {
+        let frame = vm.current_frame();
+        let obj = frame.get_reg(inst.src1().0);
+        let name_idx = inst.src2().0 as u16;
+        let name = frame.get_name(name_idx).clone();
+        (obj, name)
+    };
 
     if let Some(ptr) = obj.as_object_ptr() {
+        // Imported modules are non-GC objects.
+        if !vm.heap().heap().contains(ptr) {
+            if let Some(module) = vm.import_resolver.module_from_ptr(ptr) {
+                return if module.del_attr(&name) {
+                    ControlFlow::Continue
+                } else {
+                    ControlFlow::Error(RuntimeError::attribute_error("module", name))
+                };
+            }
+        }
+
         let type_id = extract_type_id(ptr);
 
         match type_id {

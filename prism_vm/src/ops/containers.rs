@@ -489,15 +489,20 @@ pub fn import_name(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame();
     let module_name = frame.get_name(name_idx).clone();
 
-    // Use the VM's import resolver to import the module
-    match vm.import_resolver.import_module(&module_name) {
+    // Use dotted import resolution when needed.
+    let import_result = if module_name.contains('.') {
+        vm.import_resolver.import_dotted(&module_name)
+    } else {
+        vm.import_resolver.import_module(&module_name)
+    };
+
+    match import_result {
         Ok(module) => {
-            // Create a Value from the module
-            // For now, we'll store a placeholder - proper object representation TBD
-            // TODO: Convert Arc<ModuleObject> to Value with proper heap allocation
-            let module_ptr = std::sync::Arc::into_raw(module) as u64;
-            let value = Value::from_bits(module_ptr | 0x0004_0000_0000_0000); // Object tag
-            vm.current_frame_mut().set_reg(dst.0, value);
+            // Store a stable pointer to the cached ModuleObject.
+            // ImportResolver owns the Arc in sys.modules, so this pointer stays valid.
+            let module_ptr = std::sync::Arc::as_ptr(&module) as *const ();
+            vm.current_frame_mut()
+                .set_reg(dst.0, Value::object_ptr(module_ptr));
             ControlFlow::Continue
         }
         Err(err) => ControlFlow::Error(RuntimeError::new(
@@ -523,22 +528,23 @@ pub fn import_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let attr_name = frame.get_name(attr_idx).clone();
     let module_value = frame.get_reg(module_reg_idx);
 
-    // Get the module from the value
-    // TODO: Proper object system integration
-    let module_ptr =
-        (module_value.to_bits() & 0x0000_FFFF_FFFF_FFFF) as *const crate::import::ModuleObject;
-
-    if module_ptr.is_null() {
+    let Some(module_ptr) = module_value.as_object_ptr() else {
         return ControlFlow::Error(RuntimeError::new(
             crate::error::RuntimeErrorKind::ImportError {
                 module: "<unknown>".into(),
                 message: "Cannot import from None".into(),
             },
         ));
-    }
+    };
 
-    // Safety: We trust the module pointer from a previous ImportName
-    let module = unsafe { &*module_ptr };
+    let Some(module) = vm.import_resolver.module_from_ptr(module_ptr) else {
+        return ControlFlow::Error(RuntimeError::new(
+            crate::error::RuntimeErrorKind::ImportError {
+                module: "<unknown>".into(),
+                message: "cannot import from non-module object".into(),
+            },
+        ));
+    };
 
     // Get the attribute from the module
     match module.get_attr(&attr_name) {
@@ -548,7 +554,7 @@ pub fn import_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         }
         None => ControlFlow::Error(RuntimeError::new(
             crate::error::RuntimeErrorKind::ImportError {
-                module: module.name().to_string().into(),
+                module: module.name().into(),
                 message: format!(
                     "cannot import name '{}' from '{}'",
                     attr_name,
@@ -571,21 +577,23 @@ pub fn import_star(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let frame = vm.current_frame();
     let module_value = frame.get_reg(module_reg_idx);
 
-    // Get the module from the value
-    let module_ptr =
-        (module_value.to_bits() & 0x0000_FFFF_FFFF_FFFF) as *const crate::import::ModuleObject;
-
-    if module_ptr.is_null() {
+    let Some(module_ptr) = module_value.as_object_ptr() else {
         return ControlFlow::Error(RuntimeError::new(
             crate::error::RuntimeErrorKind::ImportError {
                 module: "<unknown>".into(),
                 message: "Cannot import * from None".into(),
             },
         ));
-    }
+    };
 
-    // Safety: We trust the module pointer from a previous ImportName
-    let module = unsafe { &*module_ptr };
+    let Some(module) = vm.import_resolver.module_from_ptr(module_ptr) else {
+        return ControlFlow::Error(RuntimeError::new(
+            crate::error::RuntimeErrorKind::ImportError {
+                module: "<unknown>".into(),
+                message: "cannot import * from non-module object".into(),
+            },
+        ));
+    };
 
     // Get all public names from the module
     // If __all__ is defined, use it; otherwise use all non-underscore names

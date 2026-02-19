@@ -35,6 +35,8 @@ pub struct SysModule {
     executable: Arc<str>,
     /// Command-line arguments
     argv: SysArgv,
+    /// Cached Python list value for `sys.argv`.
+    argv_value: Value,
     /// Module search paths
     path: SysPaths,
     /// Recursion limit
@@ -45,28 +47,34 @@ impl SysModule {
     /// Create a new sys module with default configuration.
     #[inline]
     pub fn new() -> Self {
+        let argv = SysArgv::from_env();
+        let path = SysPaths::from_env();
         Self {
             platform: Platform::detect(),
             executable: std::env::current_exe()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| String::new())
                 .into(),
-            argv: SysArgv::from_env(),
-            path: SysPaths::default(),
+            argv_value: argv.to_value(),
+            argv,
+            path,
             recursion_limit: RecursionLimit::new(),
         }
     }
 
     /// Create sys module with custom arguments (for testing).
     pub fn with_args(args: Vec<String>) -> Self {
+        let argv = SysArgv::new(args);
+        let path = SysPaths::from_env();
         Self {
             platform: Platform::detect(),
             executable: std::env::current_exe()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| String::new())
                 .into(),
-            argv: SysArgv::new(args),
-            path: SysPaths::default(),
+            argv_value: argv.to_value(),
+            argv,
+            path,
             recursion_limit: RecursionLimit::new(),
         }
     }
@@ -162,16 +170,52 @@ impl Module for SysModule {
             // Hooks - return None placeholder
             "displayhook" | "excepthook" => Ok(Value::none()),
 
-            // Path list - return None placeholder (would be list)
-            "path" | "argv" => {
-                Ok(Value::none()) // TODO: Return list objects
-            }
+            // Path list
+            "path" => Ok(self.path.to_value()),
+            // Command-line arguments
+            "argv" => Ok(self.argv_value),
 
             _ => Err(ModuleError::AttributeError(format!(
                 "module 'sys' has no attribute '{}'",
                 name
             ))),
         }
+    }
+
+    fn dir(&self) -> Vec<Arc<str>> {
+        vec![
+            Arc::from("hexversion"),
+            Arc::from("api_version"),
+            Arc::from("maxsize"),
+            Arc::from("maxunicode"),
+            Arc::from("recursion_limit"),
+            Arc::from("version"),
+            Arc::from("platform"),
+            Arc::from("executable"),
+            Arc::from("byteorder"),
+            Arc::from("copyright"),
+            Arc::from("version_info"),
+            Arc::from("implementation"),
+            Arc::from("float_info"),
+            Arc::from("int_info"),
+            Arc::from("hash_info"),
+            Arc::from("stdin"),
+            Arc::from("stdout"),
+            Arc::from("stderr"),
+            Arc::from("__stdin__"),
+            Arc::from("__stdout__"),
+            Arc::from("__stderr__"),
+            Arc::from("displayhook"),
+            Arc::from("excepthook"),
+            Arc::from("path"),
+            Arc::from("argv"),
+            Arc::from("exit"),
+            Arc::from("getrecursionlimit"),
+            Arc::from("setrecursionlimit"),
+            Arc::from("getsizeof"),
+            Arc::from("getrefcount"),
+            Arc::from("intern"),
+        ]
     }
 }
 
@@ -182,6 +226,8 @@ impl Module for SysModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::intern::interned_by_ptr;
+    use prism_runtime::types::list::ListObject;
 
     // =========================================================================
     // SysModule Creation Tests
@@ -321,6 +367,93 @@ mod tests {
         let sys = SysModule::new();
         let exit = sys.get_attr("exit").unwrap();
         assert!(exit.is_none()); // Placeholder for callable
+    }
+
+    #[test]
+    fn test_argv_attribute_is_list() {
+        let sys = SysModule::new();
+        let argv = sys.get_attr("argv").unwrap();
+        let ptr = argv
+            .as_object_ptr()
+            .expect("sys.argv should be a list object");
+        let list = unsafe { &*(ptr as *const ListObject) };
+        assert!(!list.is_empty(), "sys.argv should include at least argv[0]");
+    }
+
+    #[test]
+    fn test_with_args_populates_argv_values() {
+        let sys = SysModule::with_args(vec![
+            "script.py".to_string(),
+            "--flag".to_string(),
+            "value".to_string(),
+        ]);
+        let argv = sys.get_attr("argv").unwrap();
+        let ptr = argv
+            .as_object_ptr()
+            .expect("sys.argv should be a list object");
+        let list = unsafe { &*(ptr as *const ListObject) };
+        assert_eq!(list.len(), 3);
+
+        let first = list.get(0).expect("argv[0] should exist");
+        let second = list.get(1).expect("argv[1] should exist");
+        let third = list.get(2).expect("argv[2] should exist");
+
+        let first_ptr = first
+            .as_string_object_ptr()
+            .expect("argv[0] should be interned string")
+            as *const u8;
+        let second_ptr = second
+            .as_string_object_ptr()
+            .expect("argv[1] should be interned string")
+            as *const u8;
+        let third_ptr = third
+            .as_string_object_ptr()
+            .expect("argv[2] should be interned string")
+            as *const u8;
+
+        assert_eq!(
+            interned_by_ptr(first_ptr).expect("argv[0] should resolve").as_ref(),
+            "script.py"
+        );
+        assert_eq!(
+            interned_by_ptr(second_ptr).expect("argv[1] should resolve").as_ref(),
+            "--flag"
+        );
+        assert_eq!(
+            interned_by_ptr(third_ptr).expect("argv[2] should resolve").as_ref(),
+            "value"
+        );
+    }
+
+    #[test]
+    fn test_dir_contains_argv_and_path() {
+        let sys = SysModule::new();
+        let names = sys.dir();
+        assert!(names.iter().any(|name| name.as_ref() == "argv"));
+        assert!(names.iter().any(|name| name.as_ref() == "path"));
+    }
+
+    #[test]
+    fn test_path_attribute_includes_current_directory_entry() {
+        let sys = SysModule::new();
+        let path = sys.get_attr("path").expect("sys.path should exist");
+        let ptr = path
+            .as_object_ptr()
+            .expect("sys.path should be represented as list object");
+        let list = unsafe { &*(ptr as *const ListObject) };
+        assert!(!list.is_empty(), "sys.path should include at least one entry");
+
+        let first = list.get(0).expect("sys.path[0] should exist");
+        let first_ptr = first
+            .as_string_object_ptr()
+            .expect("sys.path[0] should be interned string")
+            as *const u8;
+        assert_eq!(
+            interned_by_ptr(first_ptr)
+                .expect("sys.path[0] should resolve")
+                .as_ref(),
+            ""
+        );
     }
 
     // =========================================================================

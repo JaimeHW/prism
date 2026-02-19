@@ -3,6 +3,9 @@
 //! Provides zero-copy access to command-line arguments with
 //! efficient sharing via Arc<str>.
 
+use prism_core::Value;
+use prism_core::intern::intern;
+use prism_runtime::types::list::ListObject;
 use std::sync::Arc;
 
 /// Command-line arguments container.
@@ -73,6 +76,20 @@ impl SysArgv {
     pub fn as_slice(&self) -> &[Arc<str>] {
         &self.args
     }
+
+    /// Convert argv to a Python list value (`list[str]`).
+    ///
+    /// This builds a list of interned string Values and returns it as an object Value.
+    pub fn to_value(&self) -> Value {
+        let values: Vec<Value> = self
+            .args
+            .iter()
+            .map(|arg| Value::string(intern(arg.as_ref())))
+            .collect();
+        let list = ListObject::from_slice(&values);
+        let ptr = Box::into_raw(Box::new(list)) as *const ();
+        Value::object_ptr(ptr)
+    }
 }
 
 impl Default for SysArgv {
@@ -97,6 +114,7 @@ impl<'a> IntoIterator for &'a SysArgv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::intern::interned_by_ptr;
 
     // =========================================================================
     // Construction Tests
@@ -278,5 +296,50 @@ mod tests {
             "C:\\Windows\\file".to_string(),
         ]);
         assert_eq!(argv.len(), 4);
+    }
+
+    #[test]
+    fn test_to_value_roundtrip_strings() {
+        let argv = SysArgv::new(vec![
+            "script.py".to_string(),
+            "--flag".to_string(),
+            "value".to_string(),
+        ]);
+
+        let value = argv.to_value();
+        let ptr = value.as_object_ptr().expect("argv should be a list object");
+        let list = unsafe { &*(ptr as *const ListObject) };
+
+        assert_eq!(list.len(), 3);
+
+        let first = list.get(0).expect("argv[0] should exist");
+        let second = list.get(1).expect("argv[1] should exist");
+        let third = list.get(2).expect("argv[2] should exist");
+
+        let first_ptr = first
+            .as_string_object_ptr()
+            .expect("argv[0] should be an interned string")
+            as *const u8;
+        let second_ptr = second
+            .as_string_object_ptr()
+            .expect("argv[1] should be an interned string")
+            as *const u8;
+        let third_ptr = third
+            .as_string_object_ptr()
+            .expect("argv[2] should be an interned string")
+            as *const u8;
+
+        assert_eq!(
+            interned_by_ptr(first_ptr).expect("argv[0] should resolve").as_ref(),
+            "script.py"
+        );
+        assert_eq!(
+            interned_by_ptr(second_ptr).expect("argv[1] should resolve").as_ref(),
+            "--flag"
+        );
+        assert_eq!(
+            interned_by_ptr(third_ptr).expect("argv[2] should resolve").as_ref(),
+            "value"
+        );
     }
 }

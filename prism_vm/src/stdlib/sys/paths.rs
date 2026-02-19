@@ -3,6 +3,9 @@
 //! Manages sys.path for module importing with efficient
 //! path manipulation and caching.
 
+use prism_core::Value;
+use prism_core::intern::intern;
+use prism_runtime::types::list::ListObject;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -116,6 +119,18 @@ impl SysPaths {
         &self.paths
     }
 
+    /// Convert sys.path to a Python list value (`list[str]`).
+    pub fn to_value(&self) -> Value {
+        let values: Vec<Value> = self
+            .paths
+            .iter()
+            .map(|path| Value::string(intern(path.as_ref())))
+            .collect();
+        let list = ListObject::from_slice(&values);
+        let ptr = Box::into_raw(Box::new(list)) as *const ();
+        Value::object_ptr(ptr)
+    }
+
     /// Resolve a module name to a path.
     ///
     /// Searches paths in order for a matching module file.
@@ -186,6 +201,7 @@ const fn path_separator() -> char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::intern::interned_by_ptr;
 
     // =========================================================================
     // Construction Tests
@@ -386,5 +402,30 @@ mod tests {
         let paths = SysPaths::with_paths(vec!["".to_string()]);
         assert_eq!(paths.len(), 1);
         assert!(paths.contains(""));
+    }
+
+    #[test]
+    fn test_to_value_roundtrip_paths() {
+        let paths = SysPaths::with_paths(vec!["/a".to_string(), "/b".to_string()]);
+        let value = paths.to_value();
+        let ptr = value
+            .as_object_ptr()
+            .expect("sys.path should convert to list object");
+        let list = unsafe { &*(ptr as *const ListObject) };
+        assert_eq!(list.len(), 2);
+
+        let first = list.get(0).expect("sys.path[0] should exist");
+        let second = list.get(1).expect("sys.path[1] should exist");
+        let first_ptr = first
+            .as_string_object_ptr()
+            .expect("sys.path[0] should be string")
+            as *const u8;
+        let second_ptr = second
+            .as_string_object_ptr()
+            .expect("sys.path[1] should be string")
+            as *const u8;
+
+        assert_eq!(interned_by_ptr(first_ptr).expect("path[0] should resolve").as_ref(), "/a");
+        assert_eq!(interned_by_ptr(second_ptr).expect("path[1] should resolve").as_ref(), "/b");
     }
 }

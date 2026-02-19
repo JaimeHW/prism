@@ -164,26 +164,37 @@ pub struct ImportResolver {
     /// Maps module name to ImportState which tracks the loading thread and provides
     /// a Condvar for other threads to wait on.
     loading: RwLock<FxHashMap<InternedString, Arc<ImportState>>>,
+
+    /// Fast pointer lookup for imported module objects.
+    ///
+    /// Keys are raw `ModuleObject` pointers cast to usize. This lets opcode handlers
+    /// validate and resolve module pointers without unsafe casting.
+    module_ptrs: RwLock<FxHashMap<usize, Arc<ModuleObject>>>,
 }
 
 impl ImportResolver {
     /// Create a new import resolver with default configuration.
     pub fn new() -> Self {
-        Self {
-            sys_modules: RwLock::new(FxHashMap::default()),
-            stdlib: StdlibRegistry::new(),
-            search_paths: RwLock::new(Vec::new()),
-            loading: RwLock::new(FxHashMap::default()),
-        }
+        Self::with_stdlib_and_paths(StdlibRegistry::new(), Vec::new())
+    }
+
+    /// Create a new import resolver with explicit `sys.argv`.
+    pub fn with_sys_args(args: Vec<String>) -> Self {
+        Self::with_stdlib_and_paths(StdlibRegistry::with_sys_args(args), Vec::new())
     }
 
     /// Create a resolver with custom search paths.
     pub fn with_paths(paths: Vec<Arc<str>>) -> Self {
+        Self::with_stdlib_and_paths(StdlibRegistry::new(), paths)
+    }
+
+    fn with_stdlib_and_paths(stdlib: StdlibRegistry, paths: Vec<Arc<str>>) -> Self {
         Self {
             sys_modules: RwLock::new(FxHashMap::default()),
-            stdlib: StdlibRegistry::new(),
+            stdlib,
             search_paths: RwLock::new(paths),
             loading: RwLock::new(FxHashMap::default()),
+            module_ptrs: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -267,6 +278,7 @@ impl ImportResolver {
                 .write()
                 .unwrap()
                 .insert(key.clone(), Arc::clone(module));
+            self.register_module_ptr(module);
         }
 
         // 8. Signal waiting threads that import is complete
@@ -460,7 +472,11 @@ impl ImportResolver {
     /// This is useful for injecting modules programmatically.
     pub fn insert_module(&self, name: &str, module: Arc<ModuleObject>) {
         let key = intern(name);
-        self.sys_modules.write().unwrap().insert(key, module);
+        self.sys_modules
+            .write()
+            .unwrap()
+            .insert(key, Arc::clone(&module));
+        self.register_module_ptr(&module);
     }
 
     /// Remove a module from sys.modules.
@@ -468,7 +484,16 @@ impl ImportResolver {
     /// Returns the module if it was cached, `None` otherwise.
     pub fn remove_module(&self, name: &str) -> Option<Arc<ModuleObject>> {
         let key = intern(name);
-        self.sys_modules.write().unwrap().remove(&key)
+        let removed = self.sys_modules.write().unwrap().remove(&key);
+        if let Some(ref module) = removed {
+            self.unregister_module_ptr(module);
+        }
+        removed
+    }
+
+    /// Resolve a raw object pointer to an imported module, if it is a known module.
+    pub fn module_from_ptr(&self, ptr: *const ()) -> Option<Arc<ModuleObject>> {
+        self.module_ptrs.read().unwrap().get(&(ptr as usize)).cloned()
     }
 
     /// Add a search path for source files.
@@ -496,6 +521,20 @@ impl ImportResolver {
         let key = intern(name);
         self.sys_modules.read().unwrap().contains_key(&key) || self.stdlib.contains(name)
     }
+
+    fn register_module_ptr(&self, module: &Arc<ModuleObject>) {
+        self.module_ptrs
+            .write()
+            .unwrap()
+            .insert(Arc::as_ptr(module) as usize, Arc::clone(module));
+    }
+
+    fn unregister_module_ptr(&self, module: &Arc<ModuleObject>) {
+        self.module_ptrs
+            .write()
+            .unwrap()
+            .remove(&(Arc::as_ptr(module) as usize));
+    }
 }
 
 impl Default for ImportResolver {
@@ -511,6 +550,8 @@ impl Default for ImportResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::intern::interned_by_ptr;
+    use prism_runtime::types::list::ListObject;
 
     #[test]
     fn test_import_resolver_new() {
@@ -699,6 +740,56 @@ mod tests {
         let resolver = ImportResolver::with_paths(paths);
 
         assert_eq!(resolver.search_paths().len(), 2);
+    }
+
+    #[test]
+    fn test_with_sys_args_populates_imported_sys_argv() {
+        let resolver = ImportResolver::with_sys_args(vec![
+            "prog.py".to_string(),
+            "--fast".to_string(),
+        ]);
+        let sys = resolver.import_module("sys").expect("sys import should succeed");
+        let argv = sys.get_attr("argv").expect("sys.argv should be present");
+
+        let argv_ptr = argv
+            .as_object_ptr()
+            .expect("sys.argv should be represented as list object");
+        let list = unsafe { &*(argv_ptr as *const ListObject) };
+        assert_eq!(list.len(), 2);
+
+        let arg0 = list.get(0).expect("argv[0] should exist");
+        let arg1 = list.get(1).expect("argv[1] should exist");
+
+        let arg0_ptr = arg0
+            .as_string_object_ptr()
+            .expect("argv[0] should be string")
+            as *const u8;
+        let arg1_ptr = arg1
+            .as_string_object_ptr()
+            .expect("argv[1] should be string")
+            as *const u8;
+
+        assert_eq!(
+            interned_by_ptr(arg0_ptr).expect("argv[0] should resolve").as_ref(),
+            "prog.py"
+        );
+        assert_eq!(
+            interned_by_ptr(arg1_ptr).expect("argv[1] should resolve").as_ref(),
+            "--fast"
+        );
+    }
+
+    #[test]
+    fn test_module_from_ptr_resolves_cached_module() {
+        let resolver = ImportResolver::new();
+        let math = resolver.import_module("math").expect("math import should succeed");
+        let ptr = Arc::as_ptr(&math) as *const ();
+
+        let resolved = resolver
+            .module_from_ptr(ptr)
+            .expect("module pointer should resolve");
+        assert_eq!(resolved.name(), "math");
+        assert!(Arc::ptr_eq(&math, &resolved));
     }
 
     #[test]
