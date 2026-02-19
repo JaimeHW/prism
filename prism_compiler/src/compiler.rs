@@ -44,6 +44,23 @@ impl std::error::Error for CompileError {}
 /// Result type for compilation.
 pub type CompileResult<T> = Result<T, CompileError>;
 
+/// Compiler optimization level.
+///
+/// Mirrors Python's `-O` / `-OO` behavior:
+/// - `None`: no optimization
+/// - `Basic` (`-O`): strip assert statements
+/// - `Full` (`-OO`): strip asserts and docstrings
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum OptimizationLevel {
+    /// No optimization.
+    #[default]
+    None = 0,
+    /// `-O`: strip assert statements.
+    Basic = 1,
+    /// `-OO`: strip asserts and docstrings.
+    Full = 2,
+}
+
 // =============================================================================
 // Loop Context for break/continue
 // =============================================================================
@@ -84,11 +101,21 @@ pub struct Compiler {
     /// Whether we are inside a function/generator context.
     /// This is used to validate `yield` expressions.
     in_function_context: bool,
+    /// Compiler optimization level.
+    optimize: OptimizationLevel,
 }
 
 impl Compiler {
     /// Create a new compiler for a module.
     pub fn new(filename: impl Into<Arc<str>>) -> Self {
+        Self::new_with_optimization(filename, OptimizationLevel::None)
+    }
+
+    /// Create a new compiler for a module with an explicit optimization level.
+    pub fn new_with_optimization(
+        filename: impl Into<Arc<str>>,
+        optimize: OptimizationLevel,
+    ) -> Self {
         let filename = filename.into();
         Self {
             builder: FunctionBuilder::new("<module>"),
@@ -97,11 +124,21 @@ impl Compiler {
             loop_stack: LoopStack::new(),
             in_async_context: false,
             in_function_context: false,
+            optimize,
         }
     }
 
     /// Compile a module to bytecode.
     pub fn compile_module(module: &Module, filename: &str) -> CompileResult<CodeObject> {
+        Self::compile_module_with_optimization(module, filename, OptimizationLevel::None)
+    }
+
+    /// Compile a module to bytecode with an explicit optimization level.
+    pub fn compile_module_with_optimization(
+        module: &Module,
+        filename: &str,
+        optimize: OptimizationLevel,
+    ) -> CompileResult<CodeObject> {
         // Phase 1: Scope analysis
         let symbol_table = ScopeAnalyzer::new().analyze(module, "<module>");
 
@@ -113,12 +150,16 @@ impl Compiler {
             loop_stack: LoopStack::new(),
             in_async_context: false,
             in_function_context: false,
+            optimize,
         };
 
         compiler.builder.set_filename(filename);
         compiler.builder.add_flags(CodeFlags::MODULE);
 
-        for stmt in &module.body {
+        for (index, stmt) in module.body.iter().enumerate() {
+            if compiler.should_strip_docstring_stmt(index, stmt) {
+                continue;
+            }
             compiler.compile_stmt(stmt)?;
         }
 
@@ -126,6 +167,18 @@ impl Compiler {
         compiler.builder.emit_return_none();
 
         Ok(compiler.builder.finish())
+    }
+
+    /// Whether this statement is a docstring candidate.
+    #[inline]
+    fn is_docstring_stmt(stmt: &Stmt) -> bool {
+        matches!(&stmt.kind, StmtKind::Expr(expr) if matches!(&expr.kind, ExprKind::String(_)))
+    }
+
+    /// Whether to strip this statement as a docstring under `-OO`.
+    #[inline]
+    fn should_strip_docstring_stmt(&self, index: usize, stmt: &Stmt) -> bool {
+        self.optimize >= OptimizationLevel::Full && index == 0 && Self::is_docstring_stmt(stmt)
     }
 
     /// Resolve a variable name to its location.
@@ -523,7 +576,10 @@ impl Compiler {
                 let parent_builder = std::mem::replace(&mut self.builder, class_builder);
 
                 // Compile class body statements (method definitions, class variables, etc.)
-                for stmt in body {
+                for (index, stmt) in body.iter().enumerate() {
+                    if self.should_strip_docstring_stmt(index, stmt) {
+                        continue;
+                    }
                     self.compile_stmt(stmt)?;
                 }
 
@@ -718,6 +774,11 @@ impl Compiler {
             }
 
             StmtKind::Assert { test, msg } => {
+                // `-O`/`-OO`: strip assert statements entirely.
+                if self.optimize >= OptimizationLevel::Basic {
+                    return Ok(());
+                }
+
                 let pass_label = self.builder.create_label();
 
                 let cond_reg = self.compile_expr(test)?;
@@ -2909,7 +2970,10 @@ impl Compiler {
         self.in_function_context = true;
 
         // Compile function body
-        for stmt in body {
+        for (index, stmt) in body.iter().enumerate() {
+            if self.should_strip_docstring_stmt(index, stmt) {
+                continue;
+            }
             self.compile_stmt(stmt)?;
         }
 
@@ -3564,6 +3628,12 @@ mod tests {
         Compiler::compile_module(&module, "<test>").expect("compile error")
     }
 
+    fn compile_with_optimization(source: &str, optimize: OptimizationLevel) -> CodeObject {
+        let module = prism_parser::parse(source).expect("parse error");
+        Compiler::compile_module_with_optimization(&module, "<test>", optimize)
+            .expect("compile error")
+    }
+
     fn try_compile(source: &str) -> Result<CodeObject, CompileError> {
         let module = prism_parser::parse(source).expect("parse error");
         Compiler::compile_module(&module, "<test>")
@@ -3628,6 +3698,81 @@ mod tests {
             .find(|inst| inst.opcode() == Opcode::Call as u8)
             .expect("assert with message should emit Call");
         assert_eq!(call.src2().0, 1, "assert message should be passed as 1 call arg");
+    }
+
+    #[test]
+    fn test_compile_assert_stripped_with_optimize_basic() {
+        let code = compile_with_optimization("assert False", OptimizationLevel::Basic);
+        let opcodes: Vec<u8> = code.instructions.iter().map(|inst| inst.opcode()).collect();
+
+        assert!(
+            !opcodes.iter().any(|op| *op == Opcode::Raise as u8),
+            "assert should be stripped under -O"
+        );
+    }
+
+    #[test]
+    fn test_compile_module_docstring_stripped_with_optimize_full() {
+        let source = r#"
+"""module doc"""
+x = 1
+"#;
+        let unoptimized = compile_with_optimization(source, OptimizationLevel::None);
+        let optimized = compile_with_optimization(source, OptimizationLevel::Full);
+
+        let unoptimized_load_consts = unoptimized
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::LoadConst as u8)
+            .count();
+        let optimized_load_consts = optimized
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::LoadConst as u8)
+            .count();
+
+        assert!(
+            optimized_load_consts < unoptimized_load_consts,
+            "module docstring should be removed under -OO"
+        );
+    }
+
+    #[test]
+    fn test_compile_function_docstring_stripped_with_optimize_full() {
+        let source = r#"
+def f():
+    """function doc"""
+    return 1
+"#;
+        let unoptimized = compile_with_optimization(source, OptimizationLevel::None);
+        let optimized = compile_with_optimization(source, OptimizationLevel::Full);
+
+        let fn_unoptimized = unoptimized
+            .nested_code_objects
+            .first()
+            .map(Arc::as_ref)
+            .expect("expected nested function code object");
+        let fn_optimized = optimized
+            .nested_code_objects
+            .first()
+            .map(Arc::as_ref)
+            .expect("expected nested function code object");
+
+        let unoptimized_load_consts = fn_unoptimized
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::LoadConst as u8)
+            .count();
+        let optimized_load_consts = fn_optimized
+            .instructions
+            .iter()
+            .filter(|inst| inst.opcode() == Opcode::LoadConst as u8)
+            .count();
+
+        assert!(
+            optimized_load_consts < unoptimized_load_consts,
+            "function docstring should be removed under -OO"
+        );
     }
 
     #[test]

@@ -850,10 +850,10 @@ impl FunctionBuilder {
             Opcode::GetAttr,
             dst.0,
             obj.0,
-            (name_idx >> 8) as u8,
+            (name_idx & 0xFF) as u8,
         ));
-        // Note: This uses a compressed format. For full 16-bit name indices,
-        // we'd need a different encoding.
+        // Note: GetAttr currently uses compact 8-bit name encoding.
+        // Full 16-bit name indices require an extended instruction format.
     }
 
     /// Get item: dst = obj[key].
@@ -1339,6 +1339,20 @@ mod tests {
         assert_eq!(r0.0, 0);
         assert_eq!(r1.0, 1);
         assert_eq!(r2.0, 0); // Reused
+    }
+
+    #[test]
+    fn test_emit_get_attr_uses_low_byte_of_name_index() {
+        let mut builder = FunctionBuilder::new("attr");
+        let dst = builder.alloc_register();
+        let obj = builder.alloc_register();
+
+        builder.emit_get_attr(dst, obj, 0x0123);
+        let code = builder.finish();
+        let inst = code.instructions[0];
+
+        assert_eq!(inst.opcode(), Opcode::GetAttr as u8);
+        assert_eq!(inst.src2().0, 0x23);
     }
 
     // =========================================================================

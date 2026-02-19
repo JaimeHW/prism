@@ -53,7 +53,7 @@ pub use bytecode::{
     InstructionFormat, Label, LineTableEntry, LocalSlot, Opcode, Register, disassemble,
 };
 pub use class_compiler::{ClassCompiler, ClassInfo};
-pub use compiler::Compiler;
+pub use compiler::{Compiler, OptimizationLevel};
 pub use function_compiler::{
     ClosureInfo, FunctionContext, VarLocation, VariableEmitter, VariableResolver,
 };
