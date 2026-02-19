@@ -51,20 +51,16 @@ fn emit_int_compare(
     // Compare
     ctx.asm.cmp_rr(acc, scratch2);
 
-    // Set result based on condition using setcc (sets lower byte)
-    ctx.asm.xor_rr(scratch1, scratch1); // Zero scratch1
-    ctx.asm.setcc(condition, scratch1); // Set low byte to 0 or 1
-
-    // Convert 0/1 to False/True boxed boolean
+    // Materialize boxed boolean from comparison flags.
     let true_val = value_tags::true_value() as i64;
     let false_val = value_tags::false_value() as i64;
 
-    // If scratch1 == 0, result = FALSE, else result = TRUE
-    ctx.asm.test_rr(scratch1, scratch1);
-    ctx.asm.mov_ri64(acc, false_val);
-
+    let true_label = ctx.asm.create_label();
     let done_label = ctx.asm.create_label();
-    ctx.asm.jz(done_label); // If zero, keep false
+    ctx.asm.jcc(condition, true_label);
+    ctx.asm.mov_ri64(acc, false_val);
+    ctx.asm.jmp(done_label);
+    ctx.asm.bind_label(true_label);
     ctx.asm.mov_ri64(acc, true_val);
     ctx.asm.bind_label(done_label);
 
