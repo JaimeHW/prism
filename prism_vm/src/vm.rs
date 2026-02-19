@@ -585,56 +585,56 @@ impl VirtualMachine {
                 // Handle tier-up decision (may trigger compilation)
                 if tier_decision != TierUpDecision::None {
                     jit.handle_tier_up(&code, tier_decision);
-            }
-
-            // Get code pointer ID for cache lookup
-            let code_ptr_id = Arc::as_ptr(&code) as u64;
-
-            // Try to execute compiled code if available
-            if jit.lookup(code_ptr_id).is_some() {
-                // Create temporary frame for JIT execution
-                let return_frame_idx = if self.frames.is_empty() {
-                    None
-                } else {
-                    Some(self.current_frame_idx as u32)
-                };
-                let mut jit_frame = Frame::new(Arc::clone(&code), return_frame_idx, return_reg);
-
-                // Execute compiled code
-                match jit.try_execute(code_ptr_id, &mut jit_frame) {
-                    Some(ExecutionResult::Return(value)) => {
-                        // JIT completed successfully - handle return value
-                        if self.frames.is_empty() {
-                            // Root frame execution - store value for execute() to retrieve
-                            self.jit_return_value = Some(value);
-                        } else {
-                            // Nested call - store return value in caller's register
-                            self.frames[self.current_frame_idx].set_reg(return_reg, value);
-                        }
-                        // Don't push a frame - JIT handled everything
-                        return Ok(());
-                    }
-                    Some(ExecutionResult::Deopt { bc_offset, reason }) => {
-                        // Deoptimization - resume interpreter at bc_offset
-                        jit.handle_deopt(code_ptr_id, reason);
-                        jit_frame.ip = bc_offset;
-                        self.frames.push(jit_frame);
-                        self.current_frame_idx = self.frames.len() - 1;
-                        return Ok(());
-                    }
-                    Some(ExecutionResult::Exception(err)) => {
-                        return Err(err);
-                    }
-                    Some(ExecutionResult::TailCall { .. }) => {
-                        // Tail call - fall through to interpreter for now
-                        // TODO: Implement tail call optimization
-                        jit.record_miss();
-                    }
-                    None => {
-                        // Execution didn't happen - fall through
-                        jit.record_miss();
-                    }
                 }
+
+                // Get code pointer ID for cache lookup
+                let code_ptr_id = Arc::as_ptr(&code) as u64;
+
+                // Try to execute compiled code if available
+                if jit.lookup(code_ptr_id).is_some() {
+                    // Create temporary frame for JIT execution
+                    let return_frame_idx = if self.frames.is_empty() {
+                        None
+                    } else {
+                        Some(self.current_frame_idx as u32)
+                    };
+                    let mut jit_frame = Frame::new(Arc::clone(&code), return_frame_idx, return_reg);
+
+                    // Execute compiled code
+                    match jit.try_execute(code_ptr_id, &mut jit_frame) {
+                        Some(ExecutionResult::Return(value)) => {
+                            // JIT completed successfully - handle return value
+                            if self.frames.is_empty() {
+                                // Root frame execution - store value for execute() to retrieve
+                                self.jit_return_value = Some(value);
+                            } else {
+                                // Nested call - store return value in caller's register
+                                self.frames[self.current_frame_idx].set_reg(return_reg, value);
+                            }
+                            // Don't push a frame - JIT handled everything
+                            return Ok(());
+                        }
+                        Some(ExecutionResult::Deopt { bc_offset, reason }) => {
+                            // Deoptimization - resume interpreter at bc_offset
+                            jit.handle_deopt(code_ptr_id, reason);
+                            jit_frame.ip = bc_offset;
+                            self.frames.push(jit_frame);
+                            self.current_frame_idx = self.frames.len() - 1;
+                            return Ok(());
+                        }
+                        Some(ExecutionResult::Exception(err)) => {
+                            return Err(err);
+                        }
+                        Some(ExecutionResult::TailCall { .. }) => {
+                            // Tail call - fall through to interpreter for now
+                            // TODO: Implement tail call optimization
+                            jit.record_miss();
+                        }
+                        None => {
+                            // Execution didn't happen - fall through
+                            jit.record_miss();
+                        }
+                    }
                 } else {
                     jit.record_miss();
                 }

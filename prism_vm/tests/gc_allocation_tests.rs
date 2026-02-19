@@ -435,7 +435,10 @@ assert f({positional_args}, p65=66) == 132
 "#
     );
 
-    assert_executes(&source, "function_many_params_keyword_binding_over_u64_bitmap");
+    assert_executes(
+        &source,
+        "function_many_params_keyword_binding_over_u64_bitmap",
+    );
 }
 
 #[test]

@@ -78,7 +78,8 @@ pub(crate) fn lower_code_to_templates(
 
             Opcode::LoadConst => {
                 let dst = inst.dst().0;
-                let (template, ty) = load_const_template(code, bc_offset, dst, inst.imm16(), index)?;
+                let (template, ty) =
+                    load_const_template(code, bc_offset, dst, inst.imm16(), index)?;
                 set_reg_type(&mut reg_types, dst, ty);
                 template
             }
@@ -665,7 +666,10 @@ fn load_const_template(
     })?;
 
     if value.is_none() {
-        Ok((TemplateInstruction::LoadNone { bc_offset, dst }, KnownType::None))
+        Ok((
+            TemplateInstruction::LoadNone { bc_offset, dst },
+            KnownType::None,
+        ))
     } else if let Some(b) = value.as_bool() {
         Ok((
             TemplateInstruction::LoadBool {

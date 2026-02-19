@@ -15,8 +15,8 @@ use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use crate::frame::ClosureEnv;
 use prism_compiler::bytecode::{CodeFlags, CodeObject, Instruction};
-use prism_core::intern::{intern, interned_by_ptr};
 use prism_core::Value;
+use prism_core::intern::{intern, interned_by_ptr};
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use prism_runtime::types::Cell;
@@ -116,9 +116,7 @@ pub fn call(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
                     let closure = vm.lookup_function_closure(ptr);
                     let caller_frame_idx = vm.call_depth() - 1;
 
-                    if let Err(e) =
-                        vm.push_frame_with_closure(Arc::clone(code), dst_reg, closure)
-                    {
+                    if let Err(e) = vm.push_frame_with_closure(Arc::clone(code), dst_reg, closure) {
                         return ControlFlow::Error(e);
                     }
 
@@ -885,7 +883,8 @@ pub fn make_closure(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     };
 
     vm.register_function_closure(func_ptr, Arc::clone(&captured_closure));
-    vm.current_frame_mut().set_reg(dst, Value::object_ptr(func_ptr));
+    vm.current_frame_mut()
+        .set_reg(dst, Value::object_ptr(func_ptr));
     ControlFlow::Continue
 }
 
