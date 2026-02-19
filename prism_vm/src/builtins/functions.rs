@@ -228,23 +228,139 @@ pub fn builtin_sum(args: &[Value]) -> Result<Value, BuiltinError> {
         )));
     }
 
-    // Get start value (default 0)
-    let start = if args.len() == 2 {
-        args[1].as_int().unwrap_or(0)
+    let mut acc = if args.len() == 2 {
+        NumericAccumulator::from_start(args[1])?
     } else {
-        0
+        NumericAccumulator::Int(0)
     };
 
-    // TODO: Iterate over first argument when iteration protocol is wired
-    // For now, if first arg is an int, just return start + arg (simplified)
-    if let Some(i) = args[0].as_int() {
-        return Value::int(start + i)
-            .ok_or_else(|| BuiltinError::OverflowError("integer overflow in sum".to_string()));
+    let mut iter = super::iter_dispatch::value_to_iterator(&args[0]).map_err(BuiltinError::from)?;
+    while let Some(item) = iter.next() {
+        acc.add(item)?;
     }
 
-    Err(BuiltinError::NotImplemented(
-        "sum() for iterables not yet implemented".to_string(),
-    ))
+    acc.into_value()
+}
+
+#[derive(Clone, Copy)]
+enum NumericAccumulator {
+    Int(i64),
+    Float(f64),
+}
+
+impl NumericAccumulator {
+    #[inline]
+    fn from_start(value: Value) -> Result<Self, BuiltinError> {
+        if value.is_string() || is_str_object(value) {
+            return Err(BuiltinError::TypeError(
+                "sum() can't sum strings [use ''.join(seq) instead]".to_string(),
+            ));
+        }
+
+        if let Some(i) = value.as_int() {
+            return Ok(Self::Int(i));
+        }
+        if let Some(f) = value.as_float() {
+            return Ok(Self::Float(f));
+        }
+        if let Some(b) = value.as_bool() {
+            return Ok(Self::Int(if b { 1 } else { 0 }));
+        }
+
+        Err(BuiltinError::TypeError(format!(
+            "sum() start value must be a number, not {}",
+            value_type_name(value)
+        )))
+    }
+
+    #[inline]
+    fn add(&mut self, value: Value) -> Result<(), BuiltinError> {
+        let rhs = if let Some(i) = value.as_int() {
+            NumericAccumulator::Int(i)
+        } else if let Some(f) = value.as_float() {
+            NumericAccumulator::Float(f)
+        } else if let Some(b) = value.as_bool() {
+            NumericAccumulator::Int(if b { 1 } else { 0 })
+        } else if value.is_string() || is_str_object(value) {
+            return Err(BuiltinError::TypeError(
+                "sum() can't sum strings [use ''.join(seq) instead]".to_string(),
+            ));
+        } else {
+            return Err(BuiltinError::TypeError(format!(
+                "unsupported operand type(s) for +: '{}' and '{}'",
+                self.type_name(),
+                value_type_name(value)
+            )));
+        };
+
+        match (*self, rhs) {
+            (NumericAccumulator::Int(lhs), NumericAccumulator::Int(rhs_i)) => {
+                let sum = lhs.checked_add(rhs_i).ok_or_else(|| {
+                    BuiltinError::OverflowError("integer overflow in sum".to_string())
+                })?;
+                if Value::int(sum).is_none() {
+                    return Err(BuiltinError::OverflowError(
+                        "integer overflow in sum".to_string(),
+                    ));
+                }
+                *self = NumericAccumulator::Int(sum);
+            }
+            (NumericAccumulator::Int(lhs), NumericAccumulator::Float(rhs_f)) => {
+                *self = NumericAccumulator::Float(lhs as f64 + rhs_f);
+            }
+            (NumericAccumulator::Float(lhs), NumericAccumulator::Int(rhs_i)) => {
+                *self = NumericAccumulator::Float(lhs + rhs_i as f64);
+            }
+            (NumericAccumulator::Float(lhs), NumericAccumulator::Float(rhs_f)) => {
+                *self = NumericAccumulator::Float(lhs + rhs_f);
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn type_name(self) -> &'static str {
+        match self {
+            NumericAccumulator::Int(_) => "int",
+            NumericAccumulator::Float(_) => "float",
+        }
+    }
+
+    #[inline]
+    fn into_value(self) -> Result<Value, BuiltinError> {
+        match self {
+            NumericAccumulator::Int(i) => Value::int(i)
+                .ok_or_else(|| BuiltinError::OverflowError("integer overflow in sum".to_string())),
+            NumericAccumulator::Float(f) => Ok(Value::float(f)),
+        }
+    }
+}
+
+#[inline]
+fn is_str_object(value: Value) -> bool {
+    if let Some(ptr) = value.as_object_ptr() {
+        return crate::ops::objects::extract_type_id(ptr) == TypeId::STR;
+    }
+    false
+}
+
+#[inline]
+fn value_type_name(value: Value) -> &'static str {
+    if value.is_none() {
+        "NoneType"
+    } else if value.as_bool().is_some() {
+        "bool"
+    } else if value.as_int().is_some() {
+        "int"
+    } else if value.as_float().is_some() {
+        "float"
+    } else if value.is_string() {
+        "str"
+    } else if let Some(ptr) = value.as_object_ptr() {
+        crate::ops::objects::extract_type_id(ptr).name()
+    } else {
+        "object"
+    }
 }
 
 // =============================================================================
@@ -584,6 +700,7 @@ pub fn builtin_ascii(args: &[Value]) -> Result<Value, BuiltinError> {
 mod tests {
     use super::*;
     use prism_core::intern::intern;
+    use prism_core::value::SMALL_INT_MAX;
 
     fn boxed_value<T>(obj: T) -> (Value, *mut T) {
         let ptr = Box::into_raw(Box::new(obj));
@@ -724,6 +841,123 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(result.as_int(), Some(8));
+    }
+
+    #[test]
+    fn test_sum_int_list() {
+        let list = ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+            Value::int(4).unwrap(),
+        ]);
+        let (value, ptr) = boxed_value(list);
+        let result = builtin_sum(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(10));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_sum_float_list() {
+        let list =
+            ListObject::from_slice(&[Value::float(1.5), Value::float(2.0), Value::float(3.5)]);
+        let (value, ptr) = boxed_value(list);
+        let result = builtin_sum(&[value]).unwrap();
+        assert_eq!(result.as_float(), Some(7.0));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_sum_mixed_numeric_promotes_to_float() {
+        let list = ListObject::from_slice(&[Value::int(1).unwrap(), Value::float(2.5)]);
+        let (value, ptr) = boxed_value(list);
+        let result = builtin_sum(&[value]).unwrap();
+        assert_eq!(result.as_float(), Some(3.5));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_sum_bool_items() {
+        let list =
+            ListObject::from_slice(&[Value::bool(true), Value::bool(false), Value::bool(true)]);
+        let (value, ptr) = boxed_value(list);
+        let result = builtin_sum(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(2));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_sum_with_int_start() {
+        let list = ListObject::from_slice(&[Value::int(2).unwrap(), Value::int(3).unwrap()]);
+        let (value, ptr) = boxed_value(list);
+        let result = builtin_sum(&[value, Value::int(10).unwrap()]).unwrap();
+        assert_eq!(result.as_int(), Some(15));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_sum_with_float_start() {
+        let list = ListObject::from_slice(&[Value::int(1).unwrap(), Value::int(2).unwrap()]);
+        let (value, ptr) = boxed_value(list);
+        let result = builtin_sum(&[value, Value::float(0.5)]).unwrap();
+        assert_eq!(result.as_float(), Some(3.5));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_sum_range() {
+        let range = RangeObject::new(1, 5, 1);
+        let (value, ptr) = boxed_value(range);
+        let result = builtin_sum(&[value]).unwrap();
+        assert_eq!(result.as_int(), Some(10));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_sum_non_iterable_error() {
+        let err = builtin_sum(&[Value::int(42).unwrap()]).unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+    }
+
+    #[test]
+    fn test_sum_non_numeric_start_error() {
+        let list = ListObject::from_slice(&[Value::int(1).unwrap()]);
+        let (value, ptr) = boxed_value(list);
+        let err = builtin_sum(&[value, Value::none()]).unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_sum_string_start_error() {
+        let list = ListObject::from_slice(&[Value::int(1).unwrap()]);
+        let (value, ptr) = boxed_value(list);
+        let err = builtin_sum(&[value, Value::string(intern("x"))]).unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("can't sum strings"));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_sum_string_item_error() {
+        let list = ListObject::from_slice(&[Value::int(1).unwrap(), Value::string(intern("x"))]);
+        let (value, ptr) = boxed_value(list);
+        let err = builtin_sum(&[value]).unwrap_err();
+        assert!(matches!(err, BuiltinError::TypeError(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("can't sum strings"));
+        unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_sum_overflow_small_int_domain() {
+        let list =
+            ListObject::from_slice(&[Value::int(SMALL_INT_MAX).unwrap(), Value::int(1).unwrap()]);
+        let (value, ptr) = boxed_value(list);
+        let err = builtin_sum(&[value]).unwrap_err();
+        assert!(matches!(err, BuiltinError::OverflowError(_)));
+        unsafe { drop_boxed(ptr) };
     }
 
     #[test]
