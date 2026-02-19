@@ -17,6 +17,8 @@
 
 use super::BuiltinError;
 use prism_core::Value;
+use prism_core::intern::{intern, interned_by_ptr};
+use prism_runtime::object::type_obj::TypeId;
 
 // =============================================================================
 // Lookup Tables (Zero-Branch Hex Conversion)
@@ -136,9 +138,10 @@ pub fn builtin_bin(args: &[Value]) -> Result<Value, BuiltinError> {
     }
 
     // TODO: Handle objects with __index__ protocol
-    Err(BuiltinError::TypeError(
-        "'float' object cannot be interpreted as an integer".to_string(),
-    ))
+    Err(BuiltinError::TypeError(format!(
+        "'{}' object cannot be interpreted as an integer",
+        type_name_of(&args[0])
+    )))
 }
 
 /// Format an i64 as binary string "0b...".
@@ -177,14 +180,7 @@ fn format_binary(n: i64) -> Result<Value, BuiltinError> {
         buf.push(b'-');
     }
 
-    // Create string Value
-    // TODO: Return StringObject when string values are wired
-    // For now, we allocate a String (this will be optimized later)
-    let s = buf.as_str().to_string();
-
-    // Return as a string representation (placeholder until StringObject)
-    // We store length as int for now to verify the logic works
-    Ok(Value::none()) // TODO: Replace with Value::string(s)
+    Ok(interned_string_value(buf.as_str()))
 }
 
 // =============================================================================
@@ -225,9 +221,10 @@ pub fn builtin_hex(args: &[Value]) -> Result<Value, BuiltinError> {
         return format_hex(if b { 1 } else { 0 });
     }
 
-    Err(BuiltinError::TypeError(
-        "'float' object cannot be interpreted as an integer".to_string(),
-    ))
+    Err(BuiltinError::TypeError(format!(
+        "'{}' object cannot be interpreted as an integer",
+        type_name_of(&args[0])
+    )))
 }
 
 /// Format an i64 as hexadecimal string "0x...".
@@ -262,8 +259,7 @@ fn format_hex(n: i64) -> Result<Value, BuiltinError> {
         buf.push(b'-');
     }
 
-    let _s = buf.as_str().to_string();
-    Ok(Value::none()) // TODO: Replace with Value::string(s)
+    Ok(interned_string_value(buf.as_str()))
 }
 
 // =============================================================================
@@ -302,9 +298,10 @@ pub fn builtin_oct(args: &[Value]) -> Result<Value, BuiltinError> {
         return format_oct(if b { 1 } else { 0 });
     }
 
-    Err(BuiltinError::TypeError(
-        "'float' object cannot be interpreted as an integer".to_string(),
-    ))
+    Err(BuiltinError::TypeError(format!(
+        "'{}' object cannot be interpreted as an integer",
+        type_name_of(&args[0])
+    )))
 }
 
 /// Format an i64 as octal string "0o...".
@@ -336,8 +333,12 @@ fn format_oct(n: i64) -> Result<Value, BuiltinError> {
         buf.push(b'-');
     }
 
-    let _s = buf.as_str().to_string();
-    Ok(Value::none()) // TODO: Replace with Value::string(s)
+    Ok(interned_string_value(buf.as_str()))
+}
+
+#[inline]
+fn interned_string_value(s: &str) -> Value {
+    Value::string(intern(s))
 }
 
 // =============================================================================
@@ -423,7 +424,10 @@ fn type_name_of(val: &Value) -> &'static str {
     } else if val.is_float() {
         "float"
     } else if val.is_object() {
-        "object" // TODO: Get actual type name from object
+        val.as_object_ptr()
+            .map(crate::ops::objects::extract_type_id)
+            .map(TypeId::name)
+            .unwrap_or("object")
     } else {
         "unknown"
     }
@@ -536,6 +540,15 @@ pub fn format_oct_string(n: i64) -> String {
 mod tests {
     use super::*;
 
+    fn tagged_string_value_to_rust_string(value: Value) -> String {
+        let ptr = value
+            .as_string_object_ptr()
+            .expect("expected interned string value");
+        let interned =
+            interned_by_ptr(ptr as *const u8).expect("interned string pointer should resolve");
+        interned.as_str().to_string()
+    }
+
     // =========================================================================
     // FormatBuffer Tests
     // =========================================================================
@@ -604,6 +617,12 @@ mod tests {
             }
             _ => panic!("Expected TypeError"),
         }
+    }
+
+    #[test]
+    fn test_bin_returns_tagged_string_value() {
+        let result = builtin_bin(&[Value::int(13).unwrap()]).unwrap();
+        assert_eq!(tagged_string_value_to_rust_string(result), "0b1101");
     }
 
     #[test]
@@ -720,6 +739,12 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_hex_returns_tagged_string_value() {
+        let result = builtin_hex(&[Value::int(255).unwrap()]).unwrap();
+        assert_eq!(tagged_string_value_to_rust_string(result), "0xff");
+    }
+
     // =========================================================================
     // hex() Formatting Tests
     // =========================================================================
@@ -808,6 +833,12 @@ mod tests {
     fn test_oct_float_error() {
         let result = builtin_oct(&[Value::float(3.14)]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_oct_returns_tagged_string_value() {
+        let result = builtin_oct(&[Value::int(9).unwrap()]).unwrap();
+        assert_eq!(tagged_string_value_to_rust_string(result), "0o11");
     }
 
     // =========================================================================
@@ -909,26 +940,26 @@ mod tests {
 
     #[test]
     fn test_bin_bool_true() {
-        let result = builtin_bin(&[Value::bool(true)]);
-        assert!(result.is_ok());
+        let result = builtin_bin(&[Value::bool(true)]).unwrap();
+        assert_eq!(tagged_string_value_to_rust_string(result), "0b1");
     }
 
     #[test]
     fn test_bin_bool_false() {
-        let result = builtin_bin(&[Value::bool(false)]);
-        assert!(result.is_ok());
+        let result = builtin_bin(&[Value::bool(false)]).unwrap();
+        assert_eq!(tagged_string_value_to_rust_string(result), "0b0");
     }
 
     #[test]
     fn test_hex_bool_true() {
-        let result = builtin_hex(&[Value::bool(true)]);
-        assert!(result.is_ok());
+        let result = builtin_hex(&[Value::bool(true)]).unwrap();
+        assert_eq!(tagged_string_value_to_rust_string(result), "0x1");
     }
 
     #[test]
     fn test_oct_bool_true() {
-        let result = builtin_oct(&[Value::bool(true)]);
-        assert!(result.is_ok());
+        let result = builtin_oct(&[Value::bool(true)]).unwrap();
+        assert_eq!(tagged_string_value_to_rust_string(result), "0o1");
     }
 
     // =========================================================================
