@@ -402,11 +402,14 @@ pub fn unpack_ex(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     ControlFlow::Continue
 }
 
-/// BuildSlice: dst = slice(src1, src2)
+/// BuildSlice: dst = slice(src1, src2[, step])
 ///
 /// Creates a SliceObject from start and stop values.
-/// For 3-arg slices (start, stop, step), a subsequent extension instruction
-/// provides the step value.
+/// For 3-arg slices, the compiler emits an extension instruction immediately
+/// after BuildSlice:
+/// - opcode: CallKwEx
+/// - dst: step register index
+/// - src1/src2: marker bytes ('S','L')
 ///
 /// # Value Interpretation
 ///
@@ -422,12 +425,35 @@ pub fn unpack_ex(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 pub fn build_slice(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     use prism_runtime::types::SliceObject;
 
+    const STEP_EXT_TAG_A: u8 = b'S';
+    const STEP_EXT_TAG_B: u8 = b'L';
+
     // Read values from frame (borrow then release)
     let (start_val, stop_val) = {
         let frame = vm.current_frame();
         (frame.get_reg(inst.src1().0), frame.get_reg(inst.src2().0))
     };
     let dst = inst.dst().0;
+
+    // Optional step from extension instruction.
+    let mut step: Option<i64> = None;
+    {
+        let frame = vm.current_frame_mut();
+        if (frame.ip as usize) < frame.code.instructions.len() {
+            let next = frame.code.instructions[frame.ip as usize];
+            if next.opcode() == prism_compiler::bytecode::Opcode::CallKwEx as u8
+                && next.src1().0 == STEP_EXT_TAG_A
+                && next.src2().0 == STEP_EXT_TAG_B
+            {
+                let ext = frame.fetch();
+                let step_val = frame.get_reg(ext.dst().0);
+                step = match value_to_slice_index(step_val) {
+                    Ok(v) => v,
+                    Err(cf) => return cf,
+                };
+            }
+        }
+    }
 
     // Convert Values to Option<i64> with explicit error handling
     let start = match value_to_slice_index(start_val) {
@@ -438,9 +464,12 @@ pub fn build_slice(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
         Ok(v) => v,
         Err(cf) => return cf,
     };
+    if step == Some(0) {
+        return ControlFlow::Error(RuntimeError::value_error("slice step cannot be zero"));
+    }
 
     // Create slice on GC heap
-    let slice = SliceObject::new(start, stop, None);
+    let slice = SliceObject::new(start, stop, step);
     let ptr = match vm.allocator().alloc(slice) {
         Some(p) => p as *const (),
         None => {

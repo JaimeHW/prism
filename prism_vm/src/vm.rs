@@ -20,6 +20,7 @@ use crate::profiler::{CodeId, Profiler, TierUpDecision};
 use crate::speculative::SpeculationCache;
 use prism_compiler::bytecode::CodeObject;
 use prism_core::{PrismResult, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The Prism virtual machine.
@@ -53,6 +54,11 @@ pub struct VirtualMachine {
     jit: Option<JitContext>,
     /// Temporary storage for JIT return value when root frame executes via JIT.
     jit_return_value: Option<Value>,
+    /// Captured closure environments keyed by function object pointer.
+    ///
+    /// Function objects currently do not carry VM-native closure environments,
+    /// so MakeClosure registers captured cells here and call dispatch looks them up.
+    function_closures: HashMap<*const (), Arc<crate::frame::ClosureEnv>>,
 
     // =========================================================================
     // GC Integration
@@ -94,6 +100,7 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit: None,
             jit_return_value: None,
+            function_closures: HashMap::new(),
             heap: ManagedHeap::with_defaults(),
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
@@ -118,6 +125,7 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit: Some(JitContext::with_defaults()),
             jit_return_value: None,
+            function_closures: HashMap::new(),
             heap: ManagedHeap::with_defaults(),
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
@@ -147,6 +155,7 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit,
             jit_return_value: None,
+            function_closures: HashMap::new(),
             heap: ManagedHeap::with_defaults(),
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
@@ -171,6 +180,7 @@ impl VirtualMachine {
             speculation_cache: SpeculationCache::new(),
             jit: None,
             jit_return_value: None,
+            function_closures: HashMap::new(),
             heap: ManagedHeap::with_defaults(),
             exc_state: ExceptionState::default(),
             handler_stack: HandlerStack::new(),
@@ -535,6 +545,29 @@ impl VirtualMachine {
     /// 4. On deopt, create frame and resume interpreter
     /// 5. On miss, fall through to interpreter
     pub fn push_frame(&mut self, code: Arc<CodeObject>, return_reg: u8) -> VmResult<()> {
+        self.push_frame_internal(code, return_reg, None, true)
+    }
+
+    /// Push a new frame with an optional captured closure environment.
+    ///
+    /// This path intentionally bypasses JIT dispatch because call opcodes must
+    /// bind arguments into frame registers before execution starts.
+    pub fn push_frame_with_closure(
+        &mut self,
+        code: Arc<CodeObject>,
+        return_reg: u8,
+        closure: Option<Arc<crate::frame::ClosureEnv>>,
+    ) -> VmResult<()> {
+        self.push_frame_internal(code, return_reg, closure, false)
+    }
+
+    fn push_frame_internal(
+        &mut self,
+        code: Arc<CodeObject>,
+        return_reg: u8,
+        closure: Option<Arc<crate::frame::ClosureEnv>>,
+        allow_jit: bool,
+    ) -> VmResult<()> {
         // Check recursion limit
         if self.frames.len() >= MAX_RECURSION_DEPTH {
             return Err(RuntimeError::recursion_error(self.frames.len()));
@@ -545,12 +578,13 @@ impl VirtualMachine {
         self.profiler.record_call(code_id);
 
         // Handle JIT: check for compiled code, handle tier-up, and try execution
-        if let Some(jit) = &mut self.jit {
-            let tier_decision = jit.check_tier_up(&self.profiler, code_id);
+        if allow_jit && closure.is_none() {
+            if let Some(jit) = &mut self.jit {
+                let tier_decision = jit.check_tier_up(&self.profiler, code_id);
 
-            // Handle tier-up decision (may trigger compilation)
-            if tier_decision != TierUpDecision::None {
-                jit.handle_tier_up(&code, tier_decision);
+                // Handle tier-up decision (may trigger compilation)
+                if tier_decision != TierUpDecision::None {
+                    jit.handle_tier_up(&code, tier_decision);
             }
 
             // Get code pointer ID for cache lookup
@@ -601,8 +635,9 @@ impl VirtualMachine {
                         jit.record_miss();
                     }
                 }
-            } else {
-                jit.record_miss();
+                } else {
+                    jit.record_miss();
+                }
             }
         }
 
@@ -613,7 +648,10 @@ impl VirtualMachine {
             Some(self.current_frame_idx as u32)
         };
 
-        let frame = Frame::new(code, return_frame, return_reg);
+        let frame = match closure {
+            Some(closure_env) => Frame::with_closure(code, return_frame, return_reg, closure_env),
+            None => Frame::new(code, return_frame, return_reg),
+        };
         self.frames.push(frame);
         self.current_frame_idx = self.frames.len() - 1;
 
@@ -672,6 +710,7 @@ impl VirtualMachine {
     pub fn reset(&mut self) {
         self.frames.clear();
         self.current_frame_idx = 0;
+        self.function_closures.clear();
         self.globals = GlobalScope::new();
         self.inline_caches = InlineCacheStore::default();
     }
@@ -680,6 +719,26 @@ impl VirtualMachine {
     pub fn clear_frames(&mut self) {
         self.frames.clear();
         self.current_frame_idx = 0;
+        self.function_closures.clear();
+    }
+
+    /// Register captured closure environment for a function object.
+    #[inline]
+    pub fn register_function_closure(
+        &mut self,
+        func_ptr: *const (),
+        closure: Arc<crate::frame::ClosureEnv>,
+    ) {
+        self.function_closures.insert(func_ptr, closure);
+    }
+
+    /// Look up captured closure environment for a function object.
+    #[inline]
+    pub fn lookup_function_closure(
+        &self,
+        func_ptr: *const (),
+    ) -> Option<Arc<crate::frame::ClosureEnv>> {
+        self.function_closures.get(&func_ptr).cloned()
     }
 
     // =========================================================================

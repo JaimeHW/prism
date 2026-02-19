@@ -134,6 +134,7 @@ use crate::ops::load_store;
 use crate::ops::r#match;
 use crate::ops::method_dispatch;
 use crate::ops::objects;
+use crate::ops::subscript;
 use crate::ops::unpack;
 
 /// Build the static dispatch table.
@@ -230,9 +231,9 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::GetAttr as usize] = objects::get_attr;
     table[Opcode::SetAttr as usize] = objects::set_attr;
     table[Opcode::DelAttr as usize] = objects::del_attr;
-    table[Opcode::GetItem as usize] = objects::get_item;
-    table[Opcode::SetItem as usize] = objects::set_item;
-    table[Opcode::DelItem as usize] = objects::del_item;
+    table[Opcode::GetItem as usize] = subscript::binary_subscr;
+    table[Opcode::SetItem as usize] = subscript::store_subscr;
+    table[Opcode::DelItem as usize] = subscript::delete_subscr;
     table[Opcode::GetIter as usize] = objects::get_iter;
     table[Opcode::ForIter as usize] = objects::for_iter;
     table[Opcode::Len as usize] = objects::len;
@@ -251,6 +252,7 @@ const fn build_dispatch_table() -> [OpHandler; 256] {
     table[Opcode::CallEx as usize] = unpack::call_ex;
     table[Opcode::BuildTupleUnpack as usize] = unpack::build_tuple_unpack;
     table[Opcode::BuildDictUnpack as usize] = unpack::build_dict_unpack;
+    table[Opcode::SetFunctionDefaults as usize] = calls::set_function_defaults;
 
     // Container Operations (0x80-0x8F)
     table[Opcode::BuildList as usize] = containers::build_list;

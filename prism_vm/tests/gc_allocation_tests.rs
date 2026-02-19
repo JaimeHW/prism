@@ -11,9 +11,8 @@
 //! These tests validate the GC migration from Box::new/into_raw to
 //! vm.allocator().alloc() across all opcode handlers.
 //!
-//! Note: Some Python features are not yet fully implemented (closures with
-//! free variables, dict subscripting, negative slices, starred unpacking).
-//! Tests requiring those features are marked with #[ignore].
+//! Compatibility edge cases that were previously ignored are kept active here
+//! so regressions are caught in normal CI runs.
 
 use prism_compiler::Compiler;
 use prism_core::Value;
@@ -39,6 +38,13 @@ fn execute(source: &str) -> Result<Value, String> {
 fn assert_executes(source: &str, test_name: &str) {
     let result = execute(source);
     assert!(result.is_ok(), "{}: Failed with {:?}", test_name, result);
+}
+
+fn comma_joined<F>(count: usize, mut f: F) -> String
+where
+    F: FnMut(usize) -> String,
+{
+    (0..count).map(&mut f).collect::<Vec<_>>().join(", ")
 }
 
 // =============================================================================
@@ -316,7 +322,6 @@ result = quadruple(5)
 }
 
 #[test]
-#[ignore = "List param iteration in functions not yet working"]
 fn test_gc_function_with_local_containers() {
     assert_executes(
         r#"
@@ -368,9 +373,37 @@ fn test_gc_function_with_default_args() {
 def greet(name, times=1):
     return times
 
-result = greet("world")
+assert greet("world") == 1
+assert greet("world", 4) == 4
+assert greet(name="world") == 1
 "#,
         "function_with_default_args",
+    );
+}
+
+#[test]
+fn test_gc_function_with_kwonly_default_args() {
+    assert_executes(
+        r#"
+def add(a, *, b=10):
+    return a + b
+
+assert add(5) == 15
+assert add(5, b=7) == 12
+"#,
+        "function_with_kwonly_default_args",
+    );
+}
+
+#[test]
+fn test_gc_lambda_with_default_args() {
+    assert_executes(
+        r#"
+f = lambda x, y=3: x + y
+assert f(4) == 7
+assert f(4, 5) == 9
+"#,
+        "lambda_with_default_args",
     );
 }
 
@@ -385,6 +418,46 @@ result = add_all(1, 2, 3, 4, 5)
 "#,
         "function_many_params",
     );
+}
+
+#[test]
+fn test_gc_function_many_params_keyword_binding_over_u64_bitmap() {
+    let param_count = 66usize;
+    let params = comma_joined(param_count, |i| format!("p{}", i));
+    let positional_args = comma_joined(param_count - 1, |i| (i + 1).to_string());
+
+    let source = format!(
+        r#"
+def f({params}):
+    return p0 + p64 + p65
+
+assert f({positional_args}, p65=66) == 132
+"#
+    );
+
+    assert_executes(&source, "function_many_params_keyword_binding_over_u64_bitmap");
+}
+
+#[test]
+fn test_gc_function_defaults_over_u64_bitmap() {
+    let param_count = 66usize;
+    let mut params = (0..(param_count - 1))
+        .map(|i| format!("p{}", i))
+        .collect::<Vec<_>>();
+    params.push("p65=99".to_string());
+    let params = params.join(", ");
+    let positional_args = comma_joined(param_count - 1, |i| (i + 1).to_string());
+
+    let source = format!(
+        r#"
+def f({params}):
+    return p65
+
+assert f({positional_args}) == 99
+"#
+    );
+
+    assert_executes(&source, "function_defaults_over_u64_bitmap");
 }
 
 // =============================================================================
@@ -522,7 +595,6 @@ for i in range(50):
 // =============================================================================
 
 #[test]
-#[ignore = "List param iteration in functions not yet working"]
 fn test_gc_mixed_containers_and_functions() {
     assert_executes(
         r#"
@@ -556,7 +628,6 @@ result = make_containers()
 }
 
 #[test]
-#[ignore = "Nested function defs with closures not yet working"]
 fn test_gc_nested_function_calls_with_containers() {
     assert_executes(
         r#"
@@ -768,7 +839,6 @@ for i in range(20):
 }
 
 #[test]
-#[ignore = "Nested subscripting not yet implemented"]
 fn test_gc_nested_list_access() {
     assert_executes(
         r#"
@@ -780,7 +850,6 @@ result = matrix[0][0] + matrix[1][1] + matrix[2][2]
 }
 
 #[test]
-#[ignore = "Tuple subscripting in loop not yet working"]
 fn test_gc_list_of_tuples() {
     assert_executes(
         r#"
@@ -810,11 +879,10 @@ result = x[0] + y[0] + z[0]
 }
 
 // =============================================================================
-// Ignored Tests - Require Unimplemented Features
+// Compatibility Regression Tests
 // =============================================================================
 
 #[test]
-#[ignore = "Closures with free variables not yet implemented"]
 fn test_gc_closure_simple() {
     assert_executes(
         r#"
@@ -831,7 +899,6 @@ result = add5(10)
 }
 
 #[test]
-#[ignore = "Dict subscripting not yet implemented"]
 fn test_gc_dict_string_keys() {
     assert_executes(
         r#"
@@ -843,7 +910,6 @@ x = d["key1"]
 }
 
 #[test]
-#[ignore = "Slice objects with step not yet implemented"]
 fn test_gc_slice_with_step() {
     assert_executes(
         r#"
@@ -855,7 +921,6 @@ y = x[::2]
 }
 
 #[test]
-#[ignore = "Negative slice indices not yet implemented"]
 fn test_gc_slice_negative_indices() {
     assert_executes(
         r#"
@@ -867,7 +932,6 @@ y = x[-3:-1]
 }
 
 #[test]
-#[ignore = "Starred unpacking not yet implemented"]
 fn test_gc_unpack_starred() {
     assert_executes(
         r#"
@@ -879,7 +943,6 @@ result = first
 }
 
 #[test]
-#[ignore = "Varargs iteration not yet implemented"]
 fn test_gc_varargs_iteration() {
     assert_executes(
         r#"
@@ -896,7 +959,6 @@ x = sum_all(1, 2, 3, 4, 5)
 }
 
 #[test]
-#[ignore = "Kwargs len() not yet implemented"]
 fn test_gc_kwargs_len() {
     assert_executes(
         r#"
@@ -910,7 +972,6 @@ x = check_kwargs(a=1, b=2, c=3)
 }
 
 #[test]
-#[ignore = "Function recursion issues"]
 fn test_gc_function_recursion() {
     assert_executes(
         r#"
@@ -925,7 +986,6 @@ result = factorial(5)
 }
 
 #[test]
-#[ignore = "Tuple unpacking with addition not yet working"]
 fn test_gc_tuple_unpacking() {
     assert_executes(
         r#"
