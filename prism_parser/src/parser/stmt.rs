@@ -83,26 +83,7 @@ impl StmtParser {
     fn parse_expression_statement(parser: &mut Parser<'_>, start: u32) -> PrismResult<Stmt> {
         let first_start = parser.start_span();
         let first = ExprParser::parse(parser, Precedence::Lowest)?;
-
-        // Handle tuple targets: a, b = value
-        // After parsing first expression, check if we have a comma (tuple target)
-        let first = if parser.match_token(TokenKind::Comma) {
-            let mut elements = vec![first];
-            // Parse remaining comma-separated expressions until '=' or newline
-            while !parser.check(TokenKind::Equal)
-                && !parser.check(TokenKind::Newline)
-                && !parser.check(TokenKind::Eof)
-            {
-                elements.push(ExprParser::parse(parser, Precedence::Lowest)?);
-                if !parser.match_token(TokenKind::Comma) {
-                    break;
-                }
-            }
-            // Create tuple from collected elements
-            Expr::new(ExprKind::Tuple(elements), parser.span_from(first_start))
-        } else {
-            first
-        };
+        let first = Self::parse_comma_tuple_expr(parser, first_start, first, true)?;
 
         // Check for assignment
         if parser.match_token(TokenKind::Equal) {
@@ -110,7 +91,9 @@ impl StmtParser {
 
             // Handle chained assignment: a = b = c = value
             loop {
-                let value = ExprParser::parse(parser, Precedence::Lowest)?;
+                let value_start = parser.start_span();
+                let value_first = ExprParser::parse(parser, Precedence::Lowest)?;
+                let value = Self::parse_comma_tuple_expr(parser, value_start, value_first, true)?;
                 if parser.match_token(TokenKind::Equal) {
                     targets.push(value);
                 } else {
@@ -161,6 +144,40 @@ impl StmtParser {
         // Plain expression statement
         Ok(Stmt::new(
             StmtKind::Expr(Box::new(first)),
+            parser.span_from(start),
+        ))
+    }
+
+    /// Parse trailing comma-separated expressions into a tuple expression.
+    ///
+    /// This supports Python's implicit tuple syntax in statement contexts:
+    /// - Targets: `a, b = ...`
+    /// - Values: `a = 1, 2`
+    /// - Chained assignments: `a = b = 1, 2`
+    fn parse_comma_tuple_expr(
+        parser: &mut Parser<'_>,
+        start: u32,
+        first: Expr,
+        stop_at_equal: bool,
+    ) -> PrismResult<Expr> {
+        if !parser.match_token(TokenKind::Comma) {
+            return Ok(first);
+        }
+
+        let mut elements = vec![first];
+        while !parser.check(TokenKind::Newline) && !parser.check(TokenKind::Eof) {
+            if stop_at_equal && parser.check(TokenKind::Equal) {
+                break;
+            }
+
+            elements.push(ExprParser::parse(parser, Precedence::Lowest)?);
+            if !parser.match_token(TokenKind::Comma) {
+                break;
+            }
+        }
+
+        Ok(Expr::new(
+            ExprKind::Tuple(elements),
             parser.span_from(start),
         ))
     }
@@ -1536,6 +1553,40 @@ mod tests {
     fn test_assignment() {
         let stmt = parse_stmt("x = 1");
         assert!(matches!(stmt.kind, StmtKind::Assign { .. }));
+    }
+
+    #[test]
+    fn test_tuple_unpacking_assignment() {
+        let stmt = parse_stmt("a, b = 1, 2");
+        match stmt.kind {
+            StmtKind::Assign { targets, value } => {
+                assert_eq!(targets.len(), 1);
+                match &targets[0].kind {
+                    ExprKind::Tuple(elts) => assert_eq!(elts.len(), 2),
+                    other => panic!("expected tuple target, got {:?}", other),
+                }
+                match &value.kind {
+                    ExprKind::Tuple(elts) => assert_eq!(elts.len(), 2),
+                    other => panic!("expected tuple value, got {:?}", other),
+                }
+            }
+            other => panic!("expected assignment, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_chained_assignment_with_tuple_value() {
+        let stmt = parse_stmt("a = b = 1, 2");
+        match stmt.kind {
+            StmtKind::Assign { targets, value } => {
+                assert_eq!(targets.len(), 2);
+                match &value.kind {
+                    ExprKind::Tuple(elts) => assert_eq!(elts.len(), 2),
+                    other => panic!("expected tuple value, got {:?}", other),
+                }
+            }
+            other => panic!("expected assignment, got {:?}", other),
+        }
     }
 
     #[test]
