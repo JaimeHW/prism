@@ -235,9 +235,16 @@ pub fn builtin_sum(args: &[Value]) -> Result<Value, BuiltinError> {
         NumericAccumulator::Int(0)
     };
 
-    let mut iter = super::iter_dispatch::value_to_iterator(&args[0]).map_err(BuiltinError::from)?;
-    while let Some(item) = iter.next() {
-        acc.add(item)?;
+    if let Some(iter) = super::iter_dispatch::get_iterator_mut(&args[0]) {
+        while let Some(item) = iter.next() {
+            acc.add(item)?;
+        }
+    } else {
+        let mut iter =
+            super::iter_dispatch::value_to_iterator(&args[0]).map_err(BuiltinError::from)?;
+        while let Some(item) = iter.next() {
+            acc.add(item)?;
+        }
     }
 
     acc.into_value()
@@ -997,6 +1004,7 @@ fn escape_char(ch: char) -> String {
 mod tests {
     use super::*;
     use crate::builtins::BuiltinFunctionObject;
+    use crate::builtins::itertools::{builtin_iter, builtin_next};
     use prism_core::intern::intern;
     use prism_core::value::SMALL_INT_MAX;
     use prism_runtime::object::ObjectHeader;
@@ -1221,6 +1229,25 @@ mod tests {
         let result = builtin_sum(&[value]).unwrap();
         assert_eq!(result.as_int(), Some(10));
         unsafe { drop_boxed(ptr) };
+    }
+
+    #[test]
+    fn test_sum_iterator_consumes_iterator_state() {
+        let list = ListObject::from_slice(&[
+            Value::int(1).unwrap(),
+            Value::int(2).unwrap(),
+            Value::int(3).unwrap(),
+        ]);
+        let (list_value, list_ptr) = boxed_value(list);
+        let iter = builtin_iter(&[list_value]).unwrap();
+
+        let result = builtin_sum(&[iter]).unwrap();
+        assert_eq!(result.as_int(), Some(6));
+
+        // Iterator should be exhausted after sum consumes it.
+        let next_result = builtin_next(&[iter]);
+        assert!(next_result.is_err());
+        unsafe { drop_boxed(list_ptr) };
     }
 
     #[test]
