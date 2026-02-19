@@ -724,12 +724,55 @@ impl Compiler {
                 self.builder.emit_jump_if_true(cond_reg, pass_label);
                 self.builder.free_register(cond_reg);
 
-                // Raise AssertionError
-                if let Some(msg_expr) = msg {
-                    let _msg_reg = self.compile_expr(msg_expr)?;
-                    // TODO: Raise with message
+                // Synthesize: raise AssertionError([message])
+                // We lower through the regular call path so the raised value is a real
+                // exception object (compatible with except AssertionError as e).
+                let assertion_name_idx = self.builder.add_name(Arc::from("AssertionError"));
+                let mut ctor_reg = self.builder.alloc_register();
+                self.builder.emit_load_global(ctor_reg, assertion_name_idx);
+
+                let arg_count = if msg.is_some() { 1u8 } else { 0u8 };
+
+                let (call_dst, call_block, block_size) = if arg_count == 0 {
+                    (ctor_reg, None, 0)
+                } else {
+                    // Reserve a fresh contiguous block [dst, arg0] for Call layout.
+                    let block = self.builder.alloc_register_block(1 + arg_count);
+                    (block, Some(block), 1 + arg_count)
+                };
+
+                // If the constructor register falls within the call block, move it
+                // to a safe register to avoid clobbering.
+                if let Some(block) = call_block {
+                    let block_end = block.0 + block_size;
+                    if ctor_reg.0 >= block.0 && ctor_reg.0 < block_end {
+                        let safe_reg = self.builder.alloc_register();
+                        self.builder.emit_move(safe_reg, ctor_reg);
+                        self.builder.free_register(ctor_reg);
+                        ctor_reg = safe_reg;
+                    }
                 }
-                // TODO: Actually raise AssertionError
+
+                if let Some(msg_expr) = msg {
+                    let arg_dst = Register::new(call_dst.0 + 1);
+                    let temp = self.compile_expr(msg_expr)?;
+                    if temp != arg_dst {
+                        self.builder.emit_move(arg_dst, temp);
+                    }
+                    self.builder.free_register(temp);
+                }
+
+                self.builder.emit_call(call_dst, ctor_reg, arg_count);
+
+                if let Some(block) = call_block {
+                    if call_dst != ctor_reg {
+                        self.builder.emit_move(ctor_reg, call_dst);
+                    }
+                    self.builder.free_register_block(block, block_size);
+                }
+
+                self.builder.emit(Instruction::op_d(Opcode::Raise, ctor_reg));
+                self.builder.free_register(ctor_reg);
 
                 self.builder.bind_label(pass_label);
             }
@@ -3570,6 +3613,37 @@ mod tests {
     fn test_compile_function_call() {
         let code = compile("print(42)");
         assert!(!code.instructions.is_empty());
+    }
+
+    #[test]
+    fn test_compile_assert_emits_raise_path() {
+        let code = compile("assert False");
+        let opcodes: Vec<u8> = code.instructions.iter().map(|inst| inst.opcode()).collect();
+
+        assert!(
+            opcodes.iter().any(|op| *op == Opcode::LoadGlobal as u8),
+            "assert should load AssertionError constructor"
+        );
+        assert!(
+            opcodes.iter().any(|op| *op == Opcode::Call as u8),
+            "assert should call AssertionError constructor"
+        );
+        assert!(
+            opcodes.iter().any(|op| *op == Opcode::Raise as u8),
+            "assert should raise the constructed exception"
+        );
+    }
+
+    #[test]
+    fn test_compile_assert_with_message_emits_call_with_one_arg() {
+        let code = compile("assert False, 42");
+
+        let call = code
+            .instructions
+            .iter()
+            .find(|inst| inst.opcode() == Opcode::Call as u8)
+            .expect("assert with message should emit Call");
+        assert_eq!(call.src2().0, 1, "assert message should be passed as 1 call arg");
     }
 
     #[test]

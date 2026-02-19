@@ -358,7 +358,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "compiler assert is a stub - does not yet raise AssertionError"]
     fn test_execute_assert_fails_returns_error() {
         let code = execute_with_default_config("assert False", "<test>");
         assert_ne!(code, ExitCode::from(0));
