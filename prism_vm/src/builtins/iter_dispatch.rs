@@ -7,20 +7,20 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────────────┐
-//! │                    Iterator Protocol Dispatch                            │
+//! │                    Iterator Protocol Dispatch                           │
 //! ├─────────────────────────────────────────────────────────────────────────┤
-//! │                                                                          │
-//! │  value_to_iterator(value)                                                │
-//! │      │                                                                   │
-//! │      ├── TypeId::LIST ────────► IteratorObject::from_list(Arc<List>)     │
-//! │      ├── TypeId::TUPLE ───────► IteratorObject::from_tuple(Arc<Tuple>)   │
-//! │      ├── TypeId::STR ─────────► IteratorObject::from_string_chars(Arc)   │
-//! │      ├── TypeId::RANGE ───────► IteratorObject::from_range(RangeIter)    │
-//! │      ├── TypeId::DICT ────────► IteratorObject::from_dict_keys(Arc)      │
-//! │      ├── TypeId::SET ─────────► IteratorObject::from_set(Arc)            │
-//! │      ├── TypeId::ITERATOR ────► Already an iterator, return as-is        │
-//! │      └── Other ───────────────► call_dunder_iter() (slow path)           │
-//! │                                                                          │
+//! │                                                                         │
+//! │  value_to_iterator(value)                                               │
+//! │      │                                                                  │
+//! │      ├── TypeId::LIST ────────► IteratorObject::from_list(Arc<List>)    │
+//! │      ├── TypeId::TUPLE ───────► IteratorObject::from_tuple(Arc<Tuple>)  │
+//! │      ├── TypeId::STR ─────────► IteratorObject::from_string_chars(Arc)  │
+//! │      ├── TypeId::RANGE ───────► IteratorObject::from_range(RangeIter)   │
+//! │      ├── TypeId::DICT ────────► IteratorObject::from_dict_keys(Arc)     │
+//! │      ├── TypeId::SET ─────────► IteratorObject::from_set(Arc)           │
+//! │      ├── TypeId::ITERATOR ────► Already an iterator, return as-is       │
+//! │      └── Other ───────────────► call_dunder_iter() (slow path)          │
+//! │                                                                         │
 //! └─────────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
