@@ -3,7 +3,7 @@
 //! High-performance hash map for Python's dict type.
 
 use crate::object::type_obj::TypeId;
-use crate::object::{HASH_NOT_COMPUTED, ObjectHeader, PyObject};
+use crate::object::{ObjectHeader, PyObject};
 use prism_core::Value;
 use rustc_hash::FxHashMap;
 use std::hash::{Hash, Hasher};
@@ -20,44 +20,13 @@ struct HashableValue(Value);
 
 impl Hash for HashableValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // For integers and simple values, hash the payload directly
-        if let Some(i) = self.0.as_int() {
-            i.hash(state);
-        } else if let Some(f) = self.0.as_float() {
-            // Hash float bits (handles NaN etc)
-            f.to_bits().hash(state);
-        } else if self.0.is_none() {
-            0u64.hash(state);
-        } else if let Some(b) = self.0.as_bool() {
-            b.hash(state);
-        } else {
-            // For objects, use pointer as hash
-            if let Some(ptr) = self.0.as_object_ptr() {
-                (ptr as usize).hash(state);
-            }
-        }
+        self.0.hash(state);
     }
 }
 
 impl PartialEq for HashableValue {
     fn eq(&self, other: &Self) -> bool {
-        // Fast path: same bits
-        if let (Some(a), Some(b)) = (self.0.as_int(), other.0.as_int()) {
-            return a == b;
-        }
-        if let (Some(a), Some(b)) = (self.0.as_float(), other.0.as_float()) {
-            return a == b;
-        }
-        if self.0.is_none() && other.0.is_none() {
-            return true;
-        }
-        if let (Some(a), Some(b)) = (self.0.as_bool(), other.0.as_bool()) {
-            return a == b;
-        }
-        if let (Some(a), Some(b)) = (self.0.as_object_ptr(), other.0.as_object_ptr()) {
-            return a == b;
-        }
-        false
+        self.0 == other.0
     }
 }
 
@@ -195,6 +164,7 @@ impl PyObject for DictObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_core::intern::intern;
 
     #[test]
     fn test_dict_basic() {
@@ -246,5 +216,25 @@ mod tests {
 
         dict.set(key, Value::int(42).unwrap());
         assert_eq!(dict.get(key).unwrap().as_int(), Some(42));
+    }
+
+    #[test]
+    fn test_dict_interned_string_key_roundtrip() {
+        let mut dict = DictObject::new();
+        let key = Value::string(intern("key"));
+
+        dict.set(key, Value::int(123).unwrap());
+        assert_eq!(
+            dict.get(Value::string(intern("key"))).unwrap().as_int(),
+            Some(123)
+        );
+    }
+
+    #[test]
+    fn test_dict_int_float_key_alias() {
+        let mut dict = DictObject::new();
+        dict.set(Value::int_unchecked(1), Value::int_unchecked(99));
+
+        assert_eq!(dict.get(Value::float(1.0)).unwrap().as_int(), Some(99));
     }
 }
