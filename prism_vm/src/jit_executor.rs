@@ -428,6 +428,14 @@ impl DeoptRecovery {
 mod tests {
     use super::*;
 
+    unsafe extern "C" fn jit_stub_return_int30_bits(_state: *mut JitFrameState) -> u64 {
+        Value::int(30).unwrap().to_bits()
+    }
+
+    unsafe extern "C" fn jit_stub_return_exit_return(_state: *mut JitFrameState) -> u64 {
+        ExitReason::Return as u64
+    }
+
     #[test]
     fn test_deopt_reason_roundtrip() {
         for i in 0..=8 {
@@ -463,6 +471,49 @@ mod tests {
         let cache = Arc::new(CodeCache::new(1024 * 1024));
         let executor = JitExecutor::new(cache);
         assert!(executor.code_cache().is_empty());
+    }
+
+    #[test]
+    fn test_execute_raw_value_abi_uses_rax_bits() {
+        let cache = Arc::new(CodeCache::new(1024 * 1024));
+        let mut executor = JitExecutor::new(cache);
+
+        let code = Arc::new(prism_compiler::bytecode::CodeObject::new(
+            "jit_raw_abi_test",
+            "<test>",
+        ));
+        let mut frame = Frame::new(code, None, 0);
+
+        let entry = CompiledEntry::new(1, jit_stub_return_int30_bits as *const u8, 1)
+            .with_return_abi(ReturnAbi::RawValueBits);
+
+        let result = executor.execute(&entry, &mut frame);
+        match result {
+            ExecutionResult::Return(value) => assert_eq!(value.as_int(), Some(30)),
+            other => panic!("unexpected execution result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_execute_encoded_return_reads_frame_slot_zero() {
+        let cache = Arc::new(CodeCache::new(1024 * 1024));
+        let mut executor = JitExecutor::new(cache);
+
+        let code = Arc::new(prism_compiler::bytecode::CodeObject::new(
+            "jit_encoded_abi_test",
+            "<test>",
+        ));
+        let mut frame = Frame::new(code, None, 0);
+        frame.set_reg(0, Value::int(77).unwrap());
+
+        let entry = CompiledEntry::new(2, jit_stub_return_exit_return as *const u8, 1)
+            .with_return_abi(ReturnAbi::EncodedExitReason);
+
+        let result = executor.execute(&entry, &mut frame);
+        match result {
+            ExecutionResult::Return(value) => assert_eq!(value.as_int(), Some(77)),
+            other => panic!("unexpected execution result: {:?}", other),
+        }
     }
 
     #[test]

@@ -384,6 +384,21 @@ fn test_e2e_repeated_execution() {
     }
 }
 
+#[test]
+fn test_e2e_repeated_execution_past_tier2_threshold() {
+    let config = JitConfig::for_testing();
+    let mut vm = VirtualMachine::with_jit_config(config);
+
+    let code = create_int_add_code(10, 20);
+
+    // Exercise well beyond for_testing Tier2 threshold (100)
+    // to verify ABI behavior remains correct after tier-up.
+    for i in 0..250 {
+        let result = vm.execute(Arc::clone(&code)).unwrap();
+        assert_eq!(result.as_int(), Some(30), "Failed on iteration {}", i);
+    }
+}
+
 // =============================================================================
 // Nested Loops Test
 // =============================================================================
