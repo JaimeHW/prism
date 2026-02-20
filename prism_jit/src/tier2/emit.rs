@@ -17,7 +17,7 @@
 use super::lower::{CondCode, MachineFunction, MachineInst, MachineOp, MachineOperand};
 use super::safepoint_placement::{SafepointAnalyzer, SafepointEmitter};
 use crate::backend::x64::encoder::Condition;
-use crate::backend::x64::registers::{Gpr, MemOperand, Xmm};
+use crate::backend::x64::registers::{CallingConvention, Gpr, MemOperand, Xmm};
 use crate::backend::x64::{Assembler, ExecutableBuffer, Label};
 use crate::regalloc::PReg;
 use std::collections::{HashMap, HashSet};
@@ -107,6 +107,20 @@ pub struct CodeEmitter<'a> {
     safepoint_emitter: Option<SafepointEmitter>,
     /// Set of instruction indices where polls are needed.
     poll_indices: HashSet<usize>,
+}
+
+/// Offset of `JitFrameState.frame_base` within the runtime frame state struct.
+const JIT_FRAME_STATE_FRAME_BASE_OFFSET: i32 = 0;
+/// Dedicated scratch register carrying VM frame-base pointer for Tier2 code.
+const TIER2_FRAME_BASE_GPR: Gpr = Gpr::R11;
+
+#[inline]
+fn jit_state_arg_gpr() -> Gpr {
+    CallingConvention::host()
+        .int_arg_regs()
+        .first()
+        .copied()
+        .unwrap_or(Gpr::Rdi)
 }
 
 impl<'a> CodeEmitter<'a> {
@@ -212,6 +226,13 @@ impl<'a> CodeEmitter<'a> {
             self.asm.sub_ri(Gpr::Rsp, aligned_size as i32);
         }
 
+        // Cache `JitFrameState.frame_base` in the dedicated Tier2 scratch register.
+        let state_arg = jit_state_arg_gpr();
+        self.asm.mov_rm(
+            TIER2_FRAME_BASE_GPR,
+            &MemOperand::base_disp(state_arg, JIT_FRAME_STATE_FRAME_BASE_OFFSET),
+        );
+
         // Load safepoint page address into R15 if needed
         if let Some(ref emitter) = self.safepoint_emitter {
             if emitter.needs_safepoint_register() {
@@ -238,7 +259,14 @@ impl<'a> CodeEmitter<'a> {
                 if let MachineOperand::Label(id) = inst.dst {
                     if let Some(&label) = self.labels.get(&id) {
                         self.asm.bind_label(label);
+                    } else {
+                        return Err(format!("label {} was not created before emission", id));
                     }
+                } else {
+                    return Err(format!(
+                        "LABEL instruction requires label operand, got {:?}",
+                        inst.dst
+                    ));
                 }
             }
 
@@ -248,22 +276,21 @@ impl<'a> CodeEmitter<'a> {
             }
 
             MachineOp::Push => {
-                if let Some(gpr) = self.resolve_gpr(&inst.src1) {
-                    self.asm.push(gpr);
-                }
+                let gpr = self.resolve_gpr(&inst.src1)?;
+                self.asm.push(gpr);
             }
 
             MachineOp::Pop => {
-                if let Some(gpr) = self.resolve_gpr(&inst.dst) {
-                    self.asm.pop(gpr);
-                }
+                let gpr = self.resolve_gpr(&inst.dst)?;
+                self.asm.pop(gpr);
             }
 
             MachineOp::Lea => {
-                if let (Some(dst), MachineOperand::Mem(mem)) =
-                    (self.resolve_gpr(&inst.dst), &inst.src1)
-                {
+                let dst = self.resolve_gpr(&inst.dst)?;
+                if let MachineOperand::Mem(mem) = &inst.src1 {
                     self.asm.lea(dst, mem);
+                } else {
+                    return Err(format!("LEA requires memory source, got {:?}", inst.src1));
                 }
             }
 
@@ -281,28 +308,24 @@ impl<'a> CodeEmitter<'a> {
             }
 
             MachineOp::Neg => {
-                if let Some(dst) = self.resolve_gpr(&inst.dst) {
-                    self.asm.neg(dst);
-                }
+                let dst = self.resolve_gpr(&inst.dst)?;
+                self.asm.neg(dst);
             }
 
             MachineOp::Inc => {
-                if let Some(dst) = self.resolve_gpr(&inst.dst) {
-                    self.asm.inc(dst);
-                }
+                let dst = self.resolve_gpr(&inst.dst)?;
+                self.asm.inc(dst);
             }
 
             MachineOp::Dec => {
-                if let Some(dst) = self.resolve_gpr(&inst.dst) {
-                    self.asm.dec(dst);
-                }
+                let dst = self.resolve_gpr(&inst.dst)?;
+                self.asm.dec(dst);
             }
 
             MachineOp::Idiv => {
                 // IDIV uses RDX:RAX / src
-                if let Some(src) = self.resolve_gpr(&inst.src1) {
-                    self.asm.idiv(src);
-                }
+                let src = self.resolve_gpr(&inst.src1)?;
+                self.asm.idiv(src);
             }
 
             MachineOp::Cqo => {
@@ -327,82 +350,76 @@ impl<'a> CodeEmitter<'a> {
             }
 
             MachineOp::Not => {
-                if let Some(dst) = self.resolve_gpr(&inst.dst) {
-                    self.asm.not(dst);
-                }
+                let dst = self.resolve_gpr(&inst.dst)?;
+                self.asm.not(dst);
             }
 
             MachineOp::Shl => {
-                if let Some(dst) = self.resolve_gpr(&inst.dst) {
-                    match &inst.src2 {
-                        MachineOperand::Imm(imm) => {
-                            self.asm.shl_ri(dst, *imm as u8);
-                        }
-                        _ => {
-                            // Shift by CL
-                            self.asm.shl_cl(dst);
-                        }
+                let dst = self.resolve_gpr(&inst.dst)?;
+                match &inst.src2 {
+                    MachineOperand::Imm(imm) => {
+                        self.asm.shl_ri(dst, *imm as u8);
+                    }
+                    _ => {
+                        // Shift by CL
+                        self.asm.shl_cl(dst);
                     }
                 }
             }
 
             MachineOp::Sar => {
-                if let Some(dst) = self.resolve_gpr(&inst.dst) {
-                    match &inst.src2 {
-                        MachineOperand::Imm(imm) => {
-                            self.asm.sar_ri(dst, *imm as u8);
-                        }
-                        _ => {
-                            self.asm.sar_cl(dst);
-                        }
+                let dst = self.resolve_gpr(&inst.dst)?;
+                match &inst.src2 {
+                    MachineOperand::Imm(imm) => {
+                        self.asm.sar_ri(dst, *imm as u8);
+                    }
+                    _ => {
+                        self.asm.sar_cl(dst);
                     }
                 }
             }
 
             MachineOp::Shr => {
-                if let Some(dst) = self.resolve_gpr(&inst.dst) {
-                    match &inst.src2 {
-                        MachineOperand::Imm(imm) => {
-                            self.asm.shr_ri(dst, *imm as u8);
-                        }
-                        _ => {
-                            self.asm.shr_cl(dst);
-                        }
+                let dst = self.resolve_gpr(&inst.dst)?;
+                match &inst.src2 {
+                    MachineOperand::Imm(imm) => {
+                        self.asm.shr_ri(dst, *imm as u8);
+                    }
+                    _ => {
+                        self.asm.shr_cl(dst);
                     }
                 }
             }
 
             // Comparison
             MachineOp::Cmp => {
-                if let (Some(lhs), Some(rhs)) =
-                    (self.resolve_gpr(&inst.src1), self.resolve_gpr(&inst.src2))
-                {
-                    self.asm.cmp_rr(lhs, rhs);
-                } else if let (Some(lhs), MachineOperand::Imm(imm)) =
-                    (self.resolve_gpr(&inst.src1), &inst.src2)
-                {
+                let lhs = self.resolve_gpr(&inst.src1)?;
+                if let MachineOperand::Imm(imm) = &inst.src2 {
                     self.asm.cmp_ri(lhs, *imm as i32);
+                } else {
+                    let rhs = self.resolve_gpr(&inst.src2)?;
+                    self.asm.cmp_rr(lhs, rhs);
                 }
             }
 
             MachineOp::Test => {
-                if let (Some(lhs), Some(rhs)) =
-                    (self.resolve_gpr(&inst.src1), self.resolve_gpr(&inst.src2))
-                {
-                    self.asm.test_rr(lhs, rhs);
-                } else if let (Some(lhs), MachineOperand::Imm(imm)) =
-                    (self.resolve_gpr(&inst.src1), &inst.src2)
-                {
+                let lhs = self.resolve_gpr(&inst.src1)?;
+                if let MachineOperand::Imm(imm) = &inst.src2 {
                     self.asm.test_ri(lhs, *imm as i32);
+                } else {
+                    let rhs = self.resolve_gpr(&inst.src2)?;
+                    self.asm.test_rr(lhs, rhs);
                 }
             }
 
             MachineOp::Setcc => {
-                if let (Some(cc), Some(dst)) = (inst.cc, self.resolve_gpr(&inst.dst)) {
-                    self.asm.setcc(cc.to_condition(), dst);
-                    // Zero-extend to full register
-                    self.asm.movzx_rb(dst, dst);
-                }
+                let cc = inst
+                    .cc
+                    .ok_or_else(|| "SETcc missing condition code".to_string())?;
+                let dst = self.resolve_gpr(&inst.dst)?;
+                self.asm.setcc(cc.to_condition(), dst);
+                // Zero-extend to full register
+                self.asm.movzx_rb(dst, dst);
             }
 
             // Control flow
@@ -410,7 +427,11 @@ impl<'a> CodeEmitter<'a> {
                 if let MachineOperand::Label(id) = inst.dst {
                     if let Some(&label) = self.labels.get(&id) {
                         self.asm.jmp(label);
+                    } else {
+                        return Err(format!("JMP to unknown label {}", id));
                     }
+                } else {
+                    return Err(format!("JMP target must be label, got {:?}", inst.dst));
                 }
             }
 
@@ -418,7 +439,14 @@ impl<'a> CodeEmitter<'a> {
                 if let (Some(cc), MachineOperand::Label(id)) = (inst.cc, inst.dst) {
                     if let Some(&label) = self.labels.get(&id) {
                         self.asm.jcc(cc.to_condition(), label);
+                    } else {
+                        return Err(format!("JCC to unknown label {}", id));
                     }
+                } else {
+                    return Err(format!(
+                        "JCC requires condition code and label target, got cc={:?}, dst={:?}",
+                        inst.cc, inst.dst
+                    ));
                 }
             }
 
@@ -430,8 +458,13 @@ impl<'a> CodeEmitter<'a> {
                     // Call to absolute address
                     self.asm.mov_ri64(Gpr::R11, addr);
                     self.asm.call_r(Gpr::R11);
-                } else if let Some(target) = self.resolve_gpr(&inst.dst) {
+                } else if let Ok(target) = self.resolve_gpr(&inst.dst) {
                     self.asm.call_r(target);
+                } else {
+                    return Err(format!(
+                        "CALL target must be immediate or GPR, got {:?}",
+                        inst.dst
+                    ));
                 }
             }
 
@@ -462,53 +495,54 @@ impl<'a> CodeEmitter<'a> {
             }
 
             MachineOp::Ucomisd => {
-                if let (Some(lhs), Some(rhs)) =
-                    (self.resolve_xmm(&inst.src1), self.resolve_xmm(&inst.src2))
-                {
-                    self.asm.ucomisd(lhs, rhs);
-                }
+                let lhs = self.resolve_xmm(&inst.src1)?;
+                let rhs = self.resolve_xmm(&inst.src2)?;
+                self.asm.ucomisd(lhs, rhs);
             }
 
             MachineOp::Xorpd => {
-                if let Some(dst) = self.resolve_xmm(&inst.dst) {
-                    self.asm.xorpd(dst, dst);
-                }
+                let dst = self.resolve_xmm(&inst.dst)?;
+                self.asm.xorpd(dst, dst);
             }
 
             MachineOp::Cvtsi2sd => {
-                if let (Some(dst), Some(src)) =
-                    (self.resolve_xmm(&inst.dst), self.resolve_gpr(&inst.src1))
-                {
-                    self.asm.cvtsi2sd(dst, src);
-                }
+                let dst = self.resolve_xmm(&inst.dst)?;
+                let src = self.resolve_gpr(&inst.src1)?;
+                self.asm.cvtsi2sd(dst, src);
             }
 
             MachineOp::Cvttsd2si => {
-                if let (Some(dst), Some(src)) =
-                    (self.resolve_gpr(&inst.dst), self.resolve_xmm(&inst.src1))
-                {
-                    self.asm.cvttsd2si(dst, src);
-                }
+                let dst = self.resolve_gpr(&inst.dst)?;
+                let src = self.resolve_xmm(&inst.src1)?;
+                self.asm.cvttsd2si(dst, src);
             }
 
             // Spill/reload (generated during regalloc)
             MachineOp::Spill => {
-                if let (Some(src), MachineOperand::StackSlot(offset)) =
-                    (self.resolve_gpr(&inst.src1), &inst.dst)
-                {
+                let src = self.resolve_gpr(&inst.src1)?;
+                if let MachineOperand::StackSlot(offset) = &inst.dst {
                     // MOV [RBP + offset], src
                     self.asm
                         .mov_mr(&MemOperand::base_disp(Gpr::Rbp, *offset), src);
+                } else {
+                    return Err(format!(
+                        "invalid SPILL operands dst={:?}, src={:?}",
+                        inst.dst, inst.src1
+                    ));
                 }
             }
 
             MachineOp::Reload => {
-                if let (Some(dst), MachineOperand::StackSlot(offset)) =
-                    (self.resolve_gpr(&inst.dst), &inst.src1)
-                {
+                let dst = self.resolve_gpr(&inst.dst)?;
+                if let MachineOperand::StackSlot(offset) = &inst.src1 {
                     // MOV dst, [RBP + offset]
                     self.asm
                         .mov_rm(dst, &MemOperand::base_disp(Gpr::Rbp, *offset));
+                } else {
+                    return Err(format!(
+                        "invalid RELOAD operands dst={:?}, src={:?}",
+                        inst.dst, inst.src1
+                    ));
                 }
             }
 
@@ -522,7 +556,10 @@ impl<'a> CodeEmitter<'a> {
             }
 
             _ => {
-                // Not yet implemented
+                return Err(format!(
+                    "machine op {:?} is not supported by x64 emitter",
+                    inst.op
+                ));
             }
         }
 
@@ -561,11 +598,16 @@ impl<'a> CodeEmitter<'a> {
             }
             // VReg cases - these should be resolved by regalloc
             (MachineOperand::VReg(_), _) | (_, MachineOperand::VReg(_)) => {
-                // Virtual registers not yet resolved - emit placeholder
-                self.asm.nop();
+                return Err(format!(
+                    "unresolved virtual register in MOV dst={:?}, src={:?}",
+                    dst, src
+                ));
             }
             _ => {
-                // Unsupported combination
+                return Err(format!(
+                    "unsupported MOV operand combination dst={:?}, src={:?}",
+                    dst, src
+                ));
             }
         }
         Ok(())
@@ -583,7 +625,12 @@ impl<'a> CodeEmitter<'a> {
             (MachineOperand::Mem(mem), MachineOperand::PReg(PReg::Xmm(src))) => {
                 self.asm.movsd_mr(mem, *src);
             }
-            _ => {}
+            _ => {
+                return Err(format!(
+                    "unsupported MOVSD operands dst={:?}, src={:?}",
+                    inst.dst, inst.src1
+                ));
+            }
         }
         Ok(())
     }
@@ -593,12 +640,8 @@ impl<'a> CodeEmitter<'a> {
     where
         F: FnOnce(&mut Assembler, Gpr, Gpr),
     {
-        if let (Some(dst), Some(src)) = (self.resolve_gpr(&inst.dst), self.resolve_gpr(&inst.src2))
-        {
-            emit_fn(&mut self.asm, dst, src);
-        } else if let (Some(dst), MachineOperand::Imm(imm)) =
-            (self.resolve_gpr(&inst.dst), &inst.src2)
-        {
+        let dst = self.resolve_gpr(&inst.dst)?;
+        if let MachineOperand::Imm(imm) = &inst.src2 {
             // Need to handle immediate operands
             match inst.op {
                 MachineOp::Add => self.asm.add_ri(dst, *imm as i32),
@@ -606,8 +649,16 @@ impl<'a> CodeEmitter<'a> {
                 MachineOp::And => self.asm.and_ri(dst, *imm as i32),
                 MachineOp::Or => self.asm.or_ri(dst, *imm as i32),
                 MachineOp::Xor => self.asm.xor_ri(dst, *imm as i32),
-                _ => {}
+                _ => {
+                    return Err(format!(
+                        "immediate form not supported for {:?} with operand {:?}",
+                        inst.op, inst.src2
+                    ));
+                }
             }
+        } else {
+            let src = self.resolve_gpr(&inst.src2)?;
+            emit_fn(&mut self.asm, dst, src);
         }
         Ok(())
     }
@@ -617,31 +668,27 @@ impl<'a> CodeEmitter<'a> {
     where
         F: FnOnce(&mut Assembler, Xmm, Xmm),
     {
-        if let (Some(dst), Some(src)) = (self.resolve_xmm(&inst.dst), self.resolve_xmm(&inst.src2))
-        {
-            emit_fn(&mut self.asm, dst, src);
-        }
+        let dst = self.resolve_xmm(&inst.dst)?;
+        let src = self.resolve_xmm(&inst.src2)?;
+        emit_fn(&mut self.asm, dst, src);
         Ok(())
     }
 
     /// Resolve an operand to a GPR.
-    fn resolve_gpr(&self, op: &MachineOperand) -> Option<Gpr> {
+    fn resolve_gpr(&self, op: &MachineOperand) -> Result<Gpr, String> {
         match op {
-            MachineOperand::PReg(PReg::Gpr(gpr)) => Some(*gpr),
-            MachineOperand::VReg(_) => {
-                // Virtual register not resolved - this shouldn't happen after regalloc
-                // For now, use a placeholder
-                None
-            }
-            _ => None,
+            MachineOperand::PReg(PReg::Gpr(gpr)) => Ok(*gpr),
+            MachineOperand::VReg(_) => Err(format!("unresolved virtual register operand {:?}", op)),
+            _ => Err(format!("expected GPR operand, got {:?}", op)),
         }
     }
 
     /// Resolve an operand to an XMM register.
-    fn resolve_xmm(&self, op: &MachineOperand) -> Option<Xmm> {
+    fn resolve_xmm(&self, op: &MachineOperand) -> Result<Xmm, String> {
         match op {
-            MachineOperand::PReg(PReg::Xmm(xmm)) => Some(*xmm),
-            _ => None,
+            MachineOperand::PReg(PReg::Xmm(xmm)) => Ok(*xmm),
+            MachineOperand::VReg(_) => Err(format!("unresolved virtual register operand {:?}", op)),
+            _ => Err(format!("expected XMM operand, got {:?}", op)),
         }
     }
 
@@ -694,7 +741,7 @@ mod tests {
     use crate::ir::builder::{
         ArithmeticBuilder, ContainerBuilder, ControlBuilder, GraphBuilder, ObjectBuilder,
     };
-    use crate::regalloc::AllocationMap;
+    use crate::regalloc::{AllocationMap, VReg};
     use crate::tier2::lower::InstructionSelector;
 
     #[test]
@@ -766,18 +813,44 @@ mod tests {
     }
 
     #[test]
+    fn test_code_emitter_rejects_unresolved_vreg_operand() {
+        let mut mfunc = MachineFunction::new();
+        mfunc.push(MachineInst::new(
+            MachineOp::Mov,
+            MachineOperand::gpr(Gpr::Rax),
+            MachineOperand::VReg(VReg::new(0)),
+        ));
+        mfunc.push(MachineInst::nullary(MachineOp::Ret));
+
+        let err =
+            CodeEmitter::emit(&mfunc).expect_err("unresolved virtual registers must fail emission");
+        assert!(err.contains("unresolved virtual register"));
+    }
+
+    #[test]
+    fn test_code_emitter_rejects_unsupported_machine_op() {
+        let mut mfunc = MachineFunction::new();
+        mfunc.push(MachineInst::nullary(MachineOp::Vaddpd256));
+        mfunc.push(MachineInst::nullary(MachineOp::Ret));
+
+        let err = CodeEmitter::emit(&mfunc).expect_err("unsupported machine op must fail emission");
+        assert!(err.contains("not supported"));
+    }
+
+    #[test]
     fn test_full_pipeline() {
         // Build IR
-        let mut builder = GraphBuilder::new(4, 1);
-        let p0 = builder.parameter(0).unwrap();
+        let mut builder = GraphBuilder::new(4, 0);
         let const_1 = builder.const_int(1);
-        let sum = builder.int_add(p0, const_1);
+        let const_2 = builder.const_int(2);
+        let sum = builder.int_add(const_1, const_2);
         let _ret = builder.return_value(sum);
         let graph = builder.finish();
 
         // Instruction selection
         let alloc_map = AllocationMap::new();
-        let mfunc = InstructionSelector::select(&graph, &alloc_map);
+        let mfunc = InstructionSelector::select(&graph, &alloc_map)
+            .expect("instruction selection should succeed");
 
         // Code emission (will have virtual registers)
         // This is a smoke test - full regalloc integration would resolve VRegs
