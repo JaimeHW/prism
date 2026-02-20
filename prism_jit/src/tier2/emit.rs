@@ -697,8 +697,8 @@ impl<'a> CodeEmitter<'a> {
         let offset = self.asm.offset() as u32;
         self.stack_maps.push(StackMapEntry {
             code_offset: offset,
-            gc_slots: Vec::new(), // Would be filled in with actual GC roots
-            gc_regs: Vec::new(),
+            gc_slots: self.mfunc.gc_roots.stack_slots.clone(),
+            gc_regs: self.mfunc.gc_roots.regs.clone(),
         });
     }
 
@@ -810,6 +810,50 @@ mod tests {
         };
         assert_eq!(entry.gc_slots.len(), 2);
         assert_eq!(entry.gc_regs.len(), 2);
+    }
+
+    #[test]
+    fn test_call_safepoint_uses_machine_gc_roots() {
+        let mut mfunc = MachineFunction::new();
+        mfunc.gc_roots.stack_slots = vec![-24, -8];
+        mfunc.gc_roots.regs = vec![Gpr::Rbx, Gpr::R12];
+        mfunc.push(MachineInst::new(
+            MachineOp::Call,
+            MachineOperand::Imm(0x1234),
+            MachineOperand::None,
+        ));
+        mfunc.push(MachineInst::nullary(MachineOp::Ret));
+
+        let code = CodeEmitter::emit(&mfunc).expect("emission should succeed");
+        assert_eq!(code.stack_maps.len(), 1);
+        assert_eq!(code.stack_maps[0].gc_slots, vec![-24, -8]);
+        assert_eq!(code.stack_maps[0].gc_regs, vec![Gpr::Rbx, Gpr::R12]);
+    }
+
+    #[test]
+    fn test_poll_safepoint_uses_machine_gc_roots() {
+        let mut mfunc = MachineFunction::new();
+        let loop_label = mfunc.new_label();
+        mfunc.gc_roots.stack_slots = vec![-32];
+        mfunc.gc_roots.regs = vec![Gpr::R13];
+        mfunc.add_label(loop_label);
+        mfunc.push(MachineInst::nullary(MachineOp::Nop));
+        mfunc.push(MachineInst::new(
+            MachineOp::Jmp,
+            MachineOperand::Label(loop_label),
+            MachineOperand::None,
+        ));
+
+        let code = CodeEmitter::emit_with_safepoint(&mfunc, Some(0x1000))
+            .expect("safepoint-enabled emission should succeed");
+        assert!(
+            !code.stack_maps.is_empty(),
+            "loop back-edge should produce at least one safepoint poll"
+        );
+        assert!(code
+            .stack_maps
+            .iter()
+            .all(|entry| entry.gc_slots == vec![-32] && entry.gc_regs == vec![Gpr::R13]));
     }
 
     #[test]
