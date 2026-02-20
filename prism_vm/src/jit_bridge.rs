@@ -19,8 +19,9 @@
 use std::sync::Arc;
 
 use prism_compiler::bytecode::CodeObject;
-use prism_jit::ir::GraphBuilder;
+use prism_jit::ir::{Graph, GraphBuilder};
 use prism_jit::ir::builder::translator::BytecodeTranslator;
+use prism_jit::ir::operators::{ControlOp, Operator};
 use prism_jit::opt::OptPipeline;
 use prism_jit::regalloc::{AllocatorConfig, LinearScanAllocator, LivenessAnalysis};
 use prism_jit::runtime::{CodeCache, CompiledEntry, ReturnAbi, RuntimeConfig};
@@ -445,6 +446,10 @@ pub(crate) fn compile_tier2_entry(code: &Arc<CodeObject>) -> Result<CompiledEntr
     let mut pipeline = OptPipeline::new();
     let _stats = pipeline.run(&mut graph);
 
+    // Stage 2.5: Reject graphs that Tier 2 lowering cannot currently handle.
+    // This avoids silently generating incorrect machine code.
+    validate_tier2_lowering_support(&graph)?;
+
     // Stage 3: Liveness analysis
     let liveness = LivenessAnalysis::analyze(&graph);
     let intervals = liveness.into_intervals();
@@ -463,8 +468,49 @@ pub(crate) fn compile_tier2_entry(code: &Arc<CodeObject>) -> Result<CompiledEntr
     Ok(
         CompiledEntry::from_executable_buffer(code_id, compiled.code)
             .with_tier(2)
-            .with_return_abi(ReturnAbi::EncodedExitReason),
+            .with_return_abi(ReturnAbi::RawValueBits),
     )
+}
+
+fn validate_tier2_lowering_support(graph: &Graph) -> Result<(), String> {
+    for (id, node) in graph.iter() {
+        if node.is_dead() {
+            continue;
+        }
+
+        let supported = match node.op {
+            Operator::ConstInt(_)
+            | Operator::ConstFloat(_)
+            | Operator::ConstBool(_)
+            | Operator::ConstNone
+            | Operator::IntOp(_)
+            | Operator::FloatOp(_)
+            | Operator::IntCmp(_)
+            | Operator::FloatCmp(_)
+            | Operator::Bitwise(_)
+            | Operator::Parameter(_)
+            | Operator::Phi
+            | Operator::LoopPhi => true,
+            Operator::Control(
+                ControlOp::Start
+                | ControlOp::End
+                | ControlOp::Return
+                | ControlOp::If
+                | ControlOp::Region
+                | ControlOp::Loop,
+            ) => true,
+            _ => false,
+        };
+
+        if !supported {
+            return Err(format!(
+                "Tier 2 lowering does not support operator {:?} at node {:?}",
+                node.op, id
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 // =============================================================================
@@ -514,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_tier2_sets_tier_and_encoded_abi() {
+    fn test_compile_tier2_sets_tier_and_raw_value_abi() {
         use prism_compiler::bytecode::{Instruction, Opcode, Register};
 
         let mut bridge = JitBridge::new(BridgeConfig::for_testing());
@@ -529,6 +575,30 @@ mod tests {
 
         let entry = bridge.compile_tier2(&code).unwrap();
         assert_eq!(entry.tier(), 2);
-        assert_eq!(entry.return_abi(), ReturnAbi::EncodedExitReason);
+        assert_eq!(entry.return_abi(), ReturnAbi::RawValueBits);
+    }
+
+    #[test]
+    fn test_compile_tier2_rejects_unsupported_generic_arithmetic() {
+        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+        use prism_core::Value;
+
+        let mut bridge = JitBridge::new(BridgeConfig::for_testing());
+        let mut code = CodeObject::new("tier2_unsupported", "<test>");
+        code.register_count = 3;
+        code.instructions = vec![
+            Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
+            Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
+            Instruction::op_dss(Opcode::Add, Register::new(2), Register::new(0), Register::new(1)),
+            Instruction::op_d(Opcode::Return, Register::new(2)),
+        ]
+        .into_boxed_slice();
+        code.constants = vec![Value::int(10).unwrap(), Value::int(20).unwrap()].into_boxed_slice();
+        let code = Arc::new(code);
+
+        let err = bridge
+            .compile_tier2(&code)
+            .expect_err("unsupported generic arithmetic must not install tier2 code");
+        assert!(err.contains("does not support operator"));
     }
 }

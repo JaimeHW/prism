@@ -489,7 +489,7 @@ mod tests {
             .lookup(code_id)
             .expect("entry should remain present");
         assert_eq!(entry.tier(), 2);
-        assert_eq!(entry.return_abi(), ReturnAbi::EncodedExitReason);
+        assert_eq!(entry.return_abi(), ReturnAbi::RawValueBits);
 
         let (enqueued, completed, failed, _dropped) = queue.stats().snapshot();
         assert_eq!(enqueued, 1);

@@ -17,6 +17,7 @@
 //! - Stack-allocated frame state (no heap allocation)
 //! - Cold path separation for tier-up logic
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use prism_compiler::bytecode::CodeObject;
@@ -172,6 +173,8 @@ pub struct JitContext {
     /// Reusable frame state (avoid allocation on hot path).
     #[allow(dead_code)]
     frame_state: JitFrameState,
+    /// Code objects for which Tier 2 compilation failed and should not be retried.
+    failed_tier2: HashSet<u64>,
 }
 
 impl JitContext {
@@ -184,6 +187,7 @@ impl JitContext {
             config,
             stats: JitStats::default(),
             frame_state: JitFrameState::default(),
+            failed_tier2: HashSet::new(),
         }
     }
 
@@ -316,9 +320,12 @@ impl JitContext {
     /// In eager mode (for testing), compiles synchronously.
     /// Otherwise, queues for background compilation.
     fn trigger_compilation(&mut self, code: &Arc<CodeObject>, tier: u8) -> bool {
-        self.stats.compilations_triggered += 1;
-
         let code_id = Arc::as_ptr(code) as u64;
+
+        // Avoid re-attempting Tier 2 for code that consistently fails lowering.
+        if tier >= 2 && self.failed_tier2.contains(&code_id) {
+            return false;
+        }
 
         // Check if already compiled at this tier or higher
         if let Some(entry) = self.lookup(code_id) {
@@ -326,6 +333,8 @@ impl JitContext {
                 return false;
             }
         }
+
+        self.stats.compilations_triggered += 1;
 
         if self.config.eager_compilation || !self.config.background_compilation {
             // Synchronous compilation - dispatch based on tier
@@ -337,11 +346,17 @@ impl JitContext {
 
             match result {
                 Ok(entry) => {
+                    if tier >= 2 {
+                        self.failed_tier2.remove(&code_id);
+                    }
                     self.stats.compilations_completed += 1;
                     self.stats.compiled_bytes += entry.code_size() as u64;
                     true
                 }
                 Err(_e) => {
+                    if tier >= 2 {
+                        self.failed_tier2.insert(code_id);
+                    }
                     self.stats.compilations_failed += 1;
                     // Log error in debug builds
                     #[cfg(debug_assertions)]
@@ -594,6 +609,32 @@ mod tests {
         assert!(ctx.handle_tier_up(&code, TierUpDecision::Tier2));
         let entry = ctx.lookup(code_id).expect("tier2 entry should be cached");
         assert_eq!(entry.tier(), 2);
-        assert_eq!(entry.return_abi(), ReturnAbi::EncodedExitReason);
+        assert_eq!(entry.return_abi(), ReturnAbi::RawValueBits);
+    }
+
+    #[test]
+    fn test_handle_tier_up_tier2_failure_is_not_retried_for_same_code() {
+        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+        use prism_core::Value;
+
+        let mut ctx = JitContext::for_testing();
+        let mut code = CodeObject::new("jit_ctx_tier2_fail_once", "<test>");
+        code.register_count = 3;
+        code.instructions = vec![
+            Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
+            Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
+            Instruction::op_dss(Opcode::Add, Register::new(2), Register::new(0), Register::new(1)),
+            Instruction::op_d(Opcode::Return, Register::new(2)),
+        ]
+        .into_boxed_slice();
+        code.constants = vec![Value::int(1).unwrap(), Value::int(2).unwrap()].into_boxed_slice();
+        let code = Arc::new(code);
+
+        assert!(!ctx.handle_tier_up(&code, TierUpDecision::Tier2));
+        assert!(!ctx.handle_tier_up(&code, TierUpDecision::Tier2));
+
+        let stats = ctx.stats();
+        assert_eq!(stats.compilations_failed, 1);
+        assert_eq!(stats.compilations_triggered, 1);
     }
 }
