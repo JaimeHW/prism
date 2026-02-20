@@ -22,8 +22,10 @@
 //! - Protocol validation: ~2 extra cycles for state checks
 
 use crate::VirtualMachine;
+use crate::builtins::{create_exception, create_exception_with_args};
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::stdlib::exceptions::ExceptionTypeId;
 use crate::stdlib::generators::{GeneratorObject, GeneratorState as RuntimeGeneratorState};
 use crate::vm::GeneratorResumeOutcome;
 use prism_compiler::bytecode::Instruction;
@@ -89,10 +91,25 @@ pub fn send(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             vm.current_frame_mut().set_reg(dst, yielded_value);
             ControlFlow::Continue
         }
-        ResumeResult::Returned(_return_value) => {
-            // Generator completed - raise StopIteration with return value
-            // TODO: StopIteration should carry the return value in a future update
-            ControlFlow::Error(RuntimeError::stop_iteration())
+        ResumeResult::Returned(return_value) => {
+            // Generator completed: raise StopIteration with the return value payload.
+            let stop_iteration_value = if return_value.is_none() {
+                create_exception(ExceptionTypeId::StopIteration, None)
+            } else {
+                create_exception_with_args(
+                    ExceptionTypeId::StopIteration,
+                    None,
+                    vec![return_value].into_boxed_slice(),
+                )
+            };
+            vm.set_active_exception_with_type(
+                stop_iteration_value,
+                ExceptionTypeId::StopIteration as u16,
+            );
+            ControlFlow::Exception {
+                type_id: ExceptionTypeId::StopIteration as u16,
+                handler_pc: 0,
+            }
         }
         ResumeResult::Error(e) => ControlFlow::Error(e),
     }
@@ -166,7 +183,7 @@ fn resume_generator(vm: &mut VirtualMachine, gen_value: Value, send_value: Value
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builtins::create_exception;
+    use crate::builtins::ExceptionValue;
     use crate::error::RuntimeErrorKind;
     use crate::stdlib::exceptions::ExceptionTypeId;
     use crate::stdlib::generators::LivenessMap;
@@ -289,6 +306,22 @@ mod tests {
             depth: 0,
             exception_type_idx: u16::MAX,
         }]
+        .into_boxed_slice();
+
+        let generator = GeneratorObject::from_code(Arc::new(code));
+        let ptr = Box::into_raw(Box::new(generator)) as *const ();
+        Value::object_ptr(ptr)
+    }
+
+    fn runtime_return_value_generator() -> Value {
+        let mut code = CodeObject::new("runtime_return_value_generator", "<test>");
+        code.flags = CodeFlags::GENERATOR;
+        code.register_count = 8;
+        code.constants = vec![Value::int(42).unwrap()].into_boxed_slice();
+        code.instructions = vec![
+            Instruction::op_di(Opcode::LoadConst, Register::new(2), 0),
+            Instruction::op_d(Opcode::Return, Register::new(2)),
+        ]
         .into_boxed_slice();
 
         let generator = GeneratorObject::from_code(Arc::new(code));
@@ -449,8 +482,8 @@ mod tests {
         vm.current_frame_mut().set_reg(2, Value::none());
         let control = send(&mut vm, inst);
         match control {
-            ControlFlow::Error(err) => {
-                assert!(matches!(err.kind, RuntimeErrorKind::StopIteration));
+            ControlFlow::Exception { type_id, .. } => {
+                assert_eq!(type_id, ExceptionTypeId::StopIteration as u16);
             }
             other => panic!("expected StopIteration, got {other:?}"),
         }
@@ -543,11 +576,52 @@ mod tests {
         vm.current_frame_mut().set_reg(2, Value::none());
         let control = send(&mut vm, inst);
         match control {
-            ControlFlow::Error(err) => {
-                assert!(matches!(err.kind, RuntimeErrorKind::StopIteration));
+            ControlFlow::Exception { type_id, .. } => {
+                assert_eq!(type_id, ExceptionTypeId::StopIteration as u16);
             }
             other => panic!("expected StopIteration, got {other:?}"),
         }
+        assert_eq!(
+            GeneratorObject::from_value(generator)
+                .expect("generator")
+                .state(),
+            RuntimeGeneratorState::Exhausted
+        );
+    }
+
+    #[test]
+    fn test_send_sets_stop_iteration_value_from_generator_return() {
+        let mut vm = VirtualMachine::new();
+        push_caller_frame(&mut vm);
+
+        let generator = runtime_return_value_generator();
+        vm.current_frame_mut().set_reg(1, generator);
+        vm.current_frame_mut().set_reg(2, Value::none());
+        let inst = Instruction::new(Opcode::Send, 0, 1, 2);
+
+        let control = send(&mut vm, inst);
+        match control {
+            ControlFlow::Exception { type_id, .. } => {
+                assert_eq!(type_id, ExceptionTypeId::StopIteration as u16);
+            }
+            other => panic!("expected StopIteration exception flow, got {other:?}"),
+        }
+
+        let exc_value = vm
+            .get_active_exception()
+            .copied()
+            .expect("stop iteration should be active");
+        let exc = unsafe {
+            ExceptionValue::from_value(exc_value)
+                .expect("active exception should be an ExceptionValue object")
+        };
+        let args = exc
+            .args
+            .as_ref()
+            .expect("StopIteration should carry return value in args");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].as_int(), Some(42));
+
         assert_eq!(
             GeneratorObject::from_value(generator)
                 .expect("generator")
