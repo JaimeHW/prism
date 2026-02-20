@@ -349,11 +349,10 @@ impl JitExecutor {
         self.frame_state.num_registers = frame.code.register_count;
         self.frame_state.bc_offset = frame.ip;
         self.frame_state.const_pool = frame.code.constants.as_ptr() as *const u64;
-        // TODO: Update JIT closure handling for new cell-based ClosureEnv.
-        // The new ClosureEnv uses Arc<Cell> objects for shared mutation semantics.
-        // JIT code needs to be updated to handle cell indirection.
-        // For now, we pass null and let the JIT deoptimize on closure access.
-        self.frame_state.closure_env = std::ptr::null();
+        self.frame_state.closure_env = frame
+            .closure
+            .as_ref()
+            .map_or(std::ptr::null(), |closure| Arc::as_ptr(closure) as *const u64);
         // Global scope would be passed via VM reference
         self.frame_state.global_scope = std::ptr::null();
     }
@@ -525,5 +524,39 @@ mod tests {
         let recovery = DeoptRecovery::from_result(&result).unwrap();
         assert_eq!(recovery.bc_offset, 42);
         assert_eq!(recovery.reason, DeoptReason::TypeGuard);
+    }
+
+    #[test]
+    fn test_setup_frame_state_wires_closure_env_pointer() {
+        let cache = Arc::new(CodeCache::new(1024 * 1024));
+        let mut executor = JitExecutor::new(cache);
+
+        let code = Arc::new(prism_compiler::bytecode::CodeObject::new(
+            "jit_closure_pointer_test",
+            "<test>",
+        ));
+        let closure = Arc::new(crate::frame::ClosureEnv::with_unbound_cells(2));
+        let frame = Frame::with_closure(code, None, 0, Arc::clone(&closure));
+
+        executor.setup_frame_state(&frame);
+        assert_eq!(
+            executor.frame_state.closure_env,
+            Arc::as_ptr(&closure) as *const u64
+        );
+    }
+
+    #[test]
+    fn test_setup_frame_state_clears_closure_env_without_closure() {
+        let cache = Arc::new(CodeCache::new(1024 * 1024));
+        let mut executor = JitExecutor::new(cache);
+
+        let code = Arc::new(prism_compiler::bytecode::CodeObject::new(
+            "jit_no_closure_pointer_test",
+            "<test>",
+        ));
+        let frame = Frame::new(code, None, 0);
+
+        executor.setup_frame_state(&frame);
+        assert!(executor.frame_state.closure_env.is_null());
     }
 }
