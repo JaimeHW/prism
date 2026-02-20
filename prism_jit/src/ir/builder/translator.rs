@@ -1,5 +1,6 @@
 use crate::ir::builder::{
-    ArithmeticBuilder, ContainerBuilder, ControlBuilder, GraphBuilder, ObjectBuilder,
+    ArithmeticBuilder, BitwiseBuilder, ContainerBuilder, ControlBuilder, GraphBuilder,
+    ObjectBuilder,
 };
 use crate::ir::graph::Graph;
 use crate::opt::speculation::SpeculationProvider;
@@ -115,6 +116,8 @@ impl<'a> BytecodeTranslator<'a> {
         };
 
         match op {
+            Opcode::Nop => {}
+
             // Control Flow
             Opcode::Jump => {
                 let target =
@@ -131,6 +134,24 @@ impl<'a> BytecodeTranslator<'a> {
             }
             Opcode::JumpIfTrue => {
                 let cond = self.read_register(inst.dst(), offset, op)?;
+                let target =
+                    self.resolve_jump_target(offset, inst.imm16() as i16, instruction_count)?;
+                let fallthrough = offset + 1;
+                self.builder.translate_branch(cond, target, fallthrough);
+            }
+            Opcode::JumpIfNone => {
+                let value = self.read_register(inst.dst(), offset, op)?;
+                let none = self.builder.const_none();
+                let cond = self.builder.int_eq(value, none);
+                let target =
+                    self.resolve_jump_target(offset, inst.imm16() as i16, instruction_count)?;
+                let fallthrough = offset + 1;
+                self.builder.translate_branch(cond, target, fallthrough);
+            }
+            Opcode::JumpIfNotNone => {
+                let value = self.read_register(inst.dst(), offset, op)?;
+                let none = self.builder.const_none();
+                let cond = self.builder.int_ne(value, none);
                 let target =
                     self.resolve_jump_target(offset, inst.imm16() as i16, instruction_count)?;
                 let fallthrough = offset + 1;
@@ -190,6 +211,16 @@ impl<'a> BytecodeTranslator<'a> {
                 let val = self.read_register(inst.src1(), offset, op)?;
                 self.set_register(inst.dst(), val);
             }
+            Opcode::LoadLocal => {
+                let src = Register((inst.imm16() & 0xFF) as u8);
+                let val = self.read_register(src, offset, op)?;
+                self.set_register(inst.dst(), val);
+            }
+            Opcode::StoreLocal => {
+                let src = self.read_register(inst.dst(), offset, op)?;
+                let dst = Register((inst.imm16() & 0xFF) as u8);
+                self.set_register(dst, src);
+            }
 
             // Arithmetic
             Opcode::AddInt | Opcode::AddFloat | Opcode::Add => {
@@ -222,7 +253,81 @@ impl<'a> BytecodeTranslator<'a> {
                 };
                 self.set_register(inst.dst(), res);
             }
-            // ... extend other arithmetic ...
+            Opcode::FloorDivInt => {
+                let lhs = self.read_register(inst.src1(), offset, op)?;
+                let rhs = self.read_register(inst.src2(), offset, op)?;
+                let res = self.builder.int_div(lhs, rhs);
+                self.set_register(inst.dst(), res);
+            }
+            Opcode::ModInt => {
+                let lhs = self.read_register(inst.src1(), offset, op)?;
+                let rhs = self.read_register(inst.src2(), offset, op)?;
+                let res = self.builder.int_mod(lhs, rhs);
+                self.set_register(inst.dst(), res);
+            }
+            Opcode::NegInt => {
+                let src = self.read_register(inst.src1(), offset, op)?;
+                let res = self.builder.int_neg(src);
+                self.set_register(inst.dst(), res);
+            }
+            Opcode::PosInt => {
+                let src = self.read_register(inst.src1(), offset, op)?;
+                self.set_register(inst.dst(), src);
+            }
+            Opcode::DivFloat => {
+                let lhs = self.read_register(inst.src1(), offset, op)?;
+                let rhs = self.read_register(inst.src2(), offset, op)?;
+                let res = self.builder.float_div(lhs, rhs);
+                self.set_register(inst.dst(), res);
+            }
+            Opcode::FloorDivFloat | Opcode::ModFloat => {
+                return Err(format!(
+                    "unsupported opcode {:?} encountered at instruction offset {}",
+                    op, offset
+                ));
+            }
+            Opcode::NegFloat => {
+                let src = self.read_register(inst.src1(), offset, op)?;
+                let res = self.builder.float_neg(src);
+                self.set_register(inst.dst(), res);
+            }
+
+            // Bitwise / logical
+            Opcode::BitwiseAnd => {
+                let lhs = self.read_register(inst.src1(), offset, op)?;
+                let rhs = self.read_register(inst.src2(), offset, op)?;
+                let res = self.builder.bitwise_and(lhs, rhs);
+                self.set_register(inst.dst(), res);
+            }
+            Opcode::BitwiseOr => {
+                let lhs = self.read_register(inst.src1(), offset, op)?;
+                let rhs = self.read_register(inst.src2(), offset, op)?;
+                let res = self.builder.bitwise_or(lhs, rhs);
+                self.set_register(inst.dst(), res);
+            }
+            Opcode::BitwiseXor => {
+                let lhs = self.read_register(inst.src1(), offset, op)?;
+                let rhs = self.read_register(inst.src2(), offset, op)?;
+                let res = self.builder.bitwise_xor(lhs, rhs);
+                self.set_register(inst.dst(), res);
+            }
+            Opcode::BitwiseNot => {
+                let src = self.read_register(inst.src1(), offset, op)?;
+                let res = self.builder.bitwise_not(src);
+                self.set_register(inst.dst(), res);
+            }
+            Opcode::Shl => {
+                let lhs = self.read_register(inst.src1(), offset, op)?;
+                let rhs = self.read_register(inst.src2(), offset, op)?;
+                let res = self.builder.bitwise_shl(lhs, rhs);
+                self.set_register(inst.dst(), res);
+            }
+            Opcode::Shr => {
+                let lhs = self.read_register(inst.src1(), offset, op)?;
+                let rhs = self.read_register(inst.src2(), offset, op)?;
+                let res = self.builder.bitwise_shr(lhs, rhs);
+                self.set_register(inst.dst(), res);
+            }
 
             // Comparisons
             Opcode::Lt | Opcode::Le | Opcode::Eq | Opcode::Ne | Opcode::Gt | Opcode::Ge => {
@@ -408,7 +513,7 @@ impl<'a> BytecodeTranslator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::operators::{ArithOp, CallKind, Operator};
+    use crate::ir::operators::{ArithOp, BitwiseOp, CallKind, CmpOp, Operator};
     use prism_compiler::bytecode::Register;
 
     #[test]
@@ -627,5 +732,157 @@ mod tests {
         let err = translator.translate().unwrap_err();
         assert!(err.contains("uninitialized register"));
         assert!(err.contains("r2"));
+    }
+
+    #[test]
+    fn test_translate_jump_if_none_and_not_none_use_int_cmp_against_none() {
+        let mut code = CodeObject::new("jump_if_none", "<test>");
+        code.register_count = 1;
+        code.arg_count = 1;
+        code.instructions = vec![
+            Instruction::op_di(Opcode::JumpIfNone, Register::new(0), 1),
+            Instruction::op_di(Opcode::JumpIfNotNone, Register::new(0), 1),
+            Instruction::op_d(Opcode::Return, Register::new(0)),
+            Instruction::op_d(Opcode::Return, Register::new(0)),
+        ]
+        .into_boxed_slice();
+
+        let builder = GraphBuilder::new(1, 1);
+        let translator = BytecodeTranslator::new(builder, &code);
+        let graph = translator.translate().expect("translation should succeed");
+
+        assert!(
+            graph
+                .iter()
+                .any(|(_, node)| matches!(node.op, Operator::IntCmp(CmpOp::Eq))),
+            "JumpIfNone should lower through IntCmp(Eq) against ConstNone"
+        );
+        assert!(
+            graph
+                .iter()
+                .any(|(_, node)| matches!(node.op, Operator::IntCmp(CmpOp::Ne))),
+            "JumpIfNotNone should lower through IntCmp(Ne) against ConstNone"
+        );
+        assert!(
+            graph
+                .iter()
+                .any(|(_, node)| matches!(node.op, Operator::ConstNone)),
+            "None checks should materialize a ConstNone node"
+        );
+    }
+
+    #[test]
+    fn test_translate_load_store_local_updates_register_aliases() {
+        let mut code = CodeObject::new("local_alias", "<test>");
+        code.register_count = 3;
+        code.arg_count = 1;
+        code.instructions = vec![
+            Instruction::op_ds(Opcode::Move, Register::new(1), Register::new(0)),
+            // Store r1 into local/register slot 2
+            Instruction::op_di(Opcode::StoreLocal, Register::new(1), 2),
+            // Load slot 2 back into r0
+            Instruction::op_di(Opcode::LoadLocal, Register::new(0), 2),
+            Instruction::op_d(Opcode::Return, Register::new(0)),
+        ]
+        .into_boxed_slice();
+
+        let builder = GraphBuilder::new(3, 1);
+        let translator = BytecodeTranslator::new(builder, &code);
+        let graph = translator.translate().expect("translation should succeed");
+
+        let mut saw_parameter_return = false;
+        for (_, node) in graph.iter() {
+            if let Operator::Control(crate::ir::operators::ControlOp::Return) = node.op {
+                let value = node.inputs.get(1).expect("return must carry value input");
+                if matches!(graph.node(value).op, Operator::Parameter(0)) {
+                    saw_parameter_return = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_parameter_return,
+            "local load/store aliasing should preserve the underlying SSA value"
+        );
+    }
+
+    #[test]
+    fn test_translate_typed_arithmetic_and_bitwise_opcodes() {
+        let mut code = CodeObject::new("typed_ops", "<test>");
+        code.register_count = 12;
+        code.arg_count = 2;
+        code.instructions = vec![
+            Instruction::op_dss(
+                Opcode::FloorDivInt,
+                Register::new(2),
+                Register::new(0),
+                Register::new(1),
+            ),
+            Instruction::op_dss(
+                Opcode::ModInt,
+                Register::new(3),
+                Register::new(0),
+                Register::new(1),
+            ),
+            Instruction::op_ds(Opcode::NegInt, Register::new(4), Register::new(0)),
+            Instruction::op_ds(Opcode::PosInt, Register::new(5), Register::new(0)),
+            Instruction::op_dss(
+                Opcode::DivFloat,
+                Register::new(6),
+                Register::new(0),
+                Register::new(1),
+            ),
+            Instruction::op_ds(Opcode::NegFloat, Register::new(7), Register::new(0)),
+            Instruction::op_dss(
+                Opcode::BitwiseAnd,
+                Register::new(8),
+                Register::new(0),
+                Register::new(1),
+            ),
+            Instruction::op_dss(
+                Opcode::BitwiseOr,
+                Register::new(9),
+                Register::new(0),
+                Register::new(1),
+            ),
+            Instruction::op_dss(
+                Opcode::BitwiseXor,
+                Register::new(10),
+                Register::new(0),
+                Register::new(1),
+            ),
+            Instruction::op_ds(Opcode::BitwiseNot, Register::new(11), Register::new(0)),
+            Instruction::op_dss(
+                Opcode::Shl,
+                Register::new(2),
+                Register::new(2),
+                Register::new(1),
+            ),
+            Instruction::op_dss(
+                Opcode::Shr,
+                Register::new(3),
+                Register::new(3),
+                Register::new(1),
+            ),
+            Instruction::op_d(Opcode::Return, Register::new(2)),
+        ]
+        .into_boxed_slice();
+
+        let builder = GraphBuilder::new(12, 2);
+        let translator = BytecodeTranslator::new(builder, &code);
+        let graph = translator.translate().expect("typed opcode translation should succeed");
+
+        let has_op = |pred: fn(Operator) -> bool| graph.iter().any(|(_, node)| pred(node.op));
+        assert!(has_op(|op| op == Operator::IntOp(ArithOp::FloorDiv)));
+        assert!(has_op(|op| op == Operator::IntOp(ArithOp::Mod)));
+        assert!(has_op(|op| op == Operator::IntOp(ArithOp::Neg)));
+        assert!(has_op(|op| op == Operator::FloatOp(ArithOp::TrueDiv)));
+        assert!(has_op(|op| op == Operator::FloatOp(ArithOp::Neg)));
+        assert!(has_op(|op| op == Operator::Bitwise(BitwiseOp::And)));
+        assert!(has_op(|op| op == Operator::Bitwise(BitwiseOp::Or)));
+        assert!(has_op(|op| op == Operator::Bitwise(BitwiseOp::Xor)));
+        assert!(has_op(|op| op == Operator::Bitwise(BitwiseOp::Not)));
+        assert!(has_op(|op| op == Operator::Bitwise(BitwiseOp::Shl)));
+        assert!(has_op(|op| op == Operator::Bitwise(BitwiseOp::Shr)));
     }
 }
