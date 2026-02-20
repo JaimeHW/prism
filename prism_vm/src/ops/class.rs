@@ -33,9 +33,9 @@ use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
 use prism_compiler::bytecode::{CodeObject, Instruction};
 use prism_core::Value;
-use prism_core::intern::{InternedString, intern};
 #[cfg(test)]
 use prism_core::intern::interned_by_ptr;
+use prism_core::intern::{InternedString, intern};
 use prism_runtime::object::class::{ClassDict, PyClassObject};
 use prism_runtime::object::mro::ClassId;
 use prism_runtime::object::type_obj::TypeId;

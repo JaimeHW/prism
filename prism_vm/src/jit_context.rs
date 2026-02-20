@@ -623,7 +623,12 @@ mod tests {
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
-            Instruction::op_dss(Opcode::Add, Register::new(2), Register::new(0), Register::new(1)),
+            Instruction::op_dss(
+                Opcode::Add,
+                Register::new(2),
+                Register::new(0),
+                Register::new(1),
+            ),
             Instruction::op_d(Opcode::Return, Register::new(2)),
         ]
         .into_boxed_slice();

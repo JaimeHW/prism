@@ -137,11 +137,7 @@ impl DeoptStubGenerator {
     ///
     /// This should be called after all other code generation is complete.
     /// Stubs are emitted at the end of the code buffer.
-    pub fn emit_stubs(
-        self,
-        asm: &mut Assembler,
-        frame: &FrameLayout,
-    ) -> Vec<DeoptInfo> {
+    pub fn emit_stubs(self, asm: &mut Assembler, frame: &FrameLayout) -> Vec<DeoptInfo> {
         let mut deopt_infos = Vec::with_capacity(self.pending_deopts.len());
 
         for (idx, deopt) in self.pending_deopts.into_iter().enumerate() {
@@ -332,7 +328,10 @@ mod tests {
     fn test_encode_deopt_exit_layout() {
         let encoded = encode_deopt_exit(0x123456, DeoptReason::InlineCacheMiss);
         assert_eq!((encoded & 0xFF) as u8, ExitReason::Deoptimize as u8);
-        assert_eq!(((encoded >> 8) & 0xFF) as u8, DeoptReason::InlineCacheMiss as u8);
+        assert_eq!(
+            ((encoded >> 8) & 0xFF) as u8,
+            DeoptReason::InlineCacheMiss as u8
+        );
         assert_eq!(((encoded >> 16) & 0x00FF_FFFF) as u32, 0x123456);
     }
 

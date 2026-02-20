@@ -24,8 +24,8 @@
 
 use prism_compiler::bytecode::{CodeFlags, CodeObject};
 use prism_core::Value;
-use prism_gc::trace::Tracer;
 use prism_gc::Trace;
+use prism_gc::trace::Tracer;
 use prism_runtime::object::ObjectHeader;
 use prism_runtime::object::type_obj::TypeId;
 use std::fmt;
