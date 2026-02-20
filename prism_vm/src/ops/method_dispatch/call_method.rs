@@ -5,7 +5,7 @@
 //! `CallMethod dst, method_reg, argc`
 //! - `dst`: receives return value
 //! - `method_reg`: register containing method (from LoadMethod)
-//! - `method_reg+1`: contains self instance
+//! - `method_reg+1`: contains self instance or `None` marker
 //! - `argc`: number of explicit arguments (after method_reg+1)
 //!
 //! # Register Layout
@@ -13,13 +13,13 @@
 //! After LoadMethod, registers are arranged as:
 //! ```text
 //! [method_reg]:     method/function
-//! [method_reg+1]:   self instance
+//! [method_reg+1]:   self instance or `None` marker
 //! [method_reg+2..]: explicit arguments
 //! ```
 //!
 //! # Type-Specialized Dispatch
 //!
-//! - **FunctionObject**: Push frame, set self as r0
+//! - **FunctionObject**: Push frame, optionally set self as r0
 //! - **BuiltinFunction**: Inline call with args
 //! - **BoundMethod**: Extract function + instance, recurse
 //! - **Closure**: Push frame with captured variables
@@ -58,7 +58,8 @@ pub fn call_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     let argc = inst.src2().0 as usize;
 
     let method = vm.current_frame().get_reg(method_reg);
-    let self_val = vm.current_frame().get_reg(method_reg + 1);
+    let self_slot = vm.current_frame().get_reg(method_reg + 1);
+    let implicit_self = implicit_self_from_slot(self_slot);
 
     // Check if method is a callable object
     let Some(ptr) = method.as_object_ptr() else {
@@ -72,9 +73,11 @@ pub fn call_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 
     match type_id {
         TypeId::FUNCTION | TypeId::CLOSURE => {
-            call_user_function(vm, ptr, self_val, dst, method_reg, argc)
+            call_user_function(vm, ptr, implicit_self, dst, method_reg, argc)
         }
-        TypeId::BUILTIN_FUNCTION => call_builtin_function(vm, ptr, self_val, dst, method_reg, argc),
+        TypeId::BUILTIN_FUNCTION => {
+            call_builtin_function(vm, ptr, implicit_self, dst, method_reg, argc)
+        }
         TypeId::METHOD => call_bound_method(vm, ptr, dst, method_reg, argc),
         _ => ControlFlow::Error(RuntimeError::type_error(format!(
             "'{}' object is not callable",
@@ -83,22 +86,32 @@ pub fn call_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
     }
 }
 
+/// Convert LoadMethod's self slot into an optional implicit self argument.
+#[inline(always)]
+fn implicit_self_from_slot(self_slot: Value) -> Option<Value> {
+    if self_slot.is_none() {
+        None
+    } else {
+        Some(self_slot)
+    }
+}
+
 // =============================================================================
 // Type-Specific Call Paths
 // =============================================================================
 
-/// Call a user-defined function with self as first argument.
+/// Call a user-defined function with optional implicit self.
 ///
 /// # Register Layout After Push
 ///
 /// New frame:
-/// - r0: self
-/// - r1..rN: explicit arguments
+/// - With implicit self: r0=self, r1..rN=explicit args
+/// - Without implicit self: r0..rN=explicit args
 #[inline]
 fn call_user_function(
     vm: &mut VirtualMachine,
     func_ptr: *const (),
-    self_val: Value,
+    implicit_self: Option<Value>,
     dst: u8,
     method_reg: u8,
     argc: usize,
@@ -114,19 +127,22 @@ fn call_user_function(
     // Get caller frame index (now -2 since we pushed a new frame)
     let caller_frame_idx = vm.call_depth() - 2;
 
-    // Set self as first argument (r0)
-    vm.current_frame_mut().set_reg(0, self_val);
+    let mut arg_dst = 0u8;
+    if let Some(self_val) = implicit_self {
+        vm.current_frame_mut().set_reg(0, self_val);
+        arg_dst = 1;
+    }
 
-    // Copy explicit arguments (r1, r2, ...)
+    // Copy explicit arguments.
     for i in 0..argc {
         let arg = vm.frames[caller_frame_idx].get_reg(method_reg + 2 + i as u8);
-        vm.current_frame_mut().set_reg(1 + i as u8, arg);
+        vm.current_frame_mut().set_reg(arg_dst + i as u8, arg);
     }
 
     ControlFlow::Continue
 }
 
-/// Call a builtin function with self + args.
+/// Call a builtin function with optional implicit self + args.
 ///
 /// Collects all arguments into a SmallVec and invokes the builtin directly.
 /// No frame push required - builtins execute synchronously.
@@ -134,20 +150,21 @@ fn call_user_function(
 fn call_builtin_function(
     vm: &mut VirtualMachine,
     func_ptr: *const (),
-    self_val: Value,
+    implicit_self: Option<Value>,
     dst: u8,
     method_reg: u8,
     argc: usize,
 ) -> ControlFlow {
     let builtin = unsafe { &*(func_ptr as *const BuiltinFunctionObject) };
 
-    // Collect arguments: self + explicit args
+    // Collect arguments: implicit self (if present) + explicit args.
     // Use SmallVec to avoid heap allocation for typical calls (≤8 args)
     let caller_frame = &vm.frames[vm.call_depth() - 1];
-    let mut args: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc + 1);
-
-    // self is first argument
-    args.push(self_val);
+    let mut args: SmallVec<[Value; 8]> =
+        SmallVec::with_capacity(argc + implicit_self.is_some() as usize);
+    if let Some(self_val) = implicit_self {
+        args.push(self_val);
+    }
 
     // Collect explicit arguments
     for i in 0..argc {
@@ -194,35 +211,16 @@ fn call_bound_method(
     // Recurse with extracted function and instance
     match type_id {
         TypeId::FUNCTION | TypeId::CLOSURE => {
-            call_user_function(vm, func_ptr, instance, dst, method_reg, argc)
+            call_user_function(vm, func_ptr, Some(instance), dst, method_reg, argc)
         }
         TypeId::BUILTIN_FUNCTION => {
-            call_builtin_function(vm, func_ptr, instance, dst, method_reg, argc)
+            call_builtin_function(vm, func_ptr, Some(instance), dst, method_reg, argc)
         }
         _ => ControlFlow::Error(RuntimeError::type_error(format!(
             "bound method wraps non-callable '{}' object",
             type_id.name()
         ))),
     }
-}
-
-/// Call a method descriptor (MethodDescriptor object).
-///
-/// Method descriptors are typically used for classmethod and staticmethod.
-#[inline]
-fn call_method_descriptor(
-    _vm: &mut VirtualMachine,
-    _desc_ptr: *const (),
-    _self_val: Value,
-    _dst: u8,
-    _method_reg: u8,
-    _argc: usize,
-) -> ControlFlow {
-    // TODO: Implement method descriptor calls
-    // This handles @classmethod and @staticmethod
-    ControlFlow::Error(RuntimeError::internal(
-        "method descriptor calls not yet implemented",
-    ))
 }
 
 // =============================================================================
@@ -243,7 +241,44 @@ fn extract_type_id(ptr: *const ()) -> TypeId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtins::{BuiltinError, BuiltinFunctionObject};
+    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode};
+    use prism_runtime::types::function::FunctionObject;
     use prism_runtime::types::list::ListObject;
+    use std::sync::Arc;
+
+    fn push_test_frame(vm: &mut VirtualMachine, name: &str) {
+        let mut code = CodeObject::new(name, "<test>");
+        code.register_count = 16;
+        vm.push_frame(Arc::new(code), 0)
+            .expect("failed to push test frame");
+    }
+
+    fn make_test_function_value(name: &str) -> (*mut FunctionObject, Value) {
+        let mut code = CodeObject::new(name, "<test>");
+        code.register_count = 16;
+        let func = Box::new(FunctionObject::new(
+            Arc::new(code),
+            Arc::from(name),
+            None,
+            None,
+        ));
+        let ptr = Box::into_raw(func);
+        (ptr, Value::object_ptr(ptr as *const ()))
+    }
+
+    fn builtin_arg_count(args: &[Value]) -> Result<Value, BuiltinError> {
+        Ok(Value::int(args.len() as i64).expect("arg count should fit in tagged int"))
+    }
+
+    fn make_builtin_value(name: &str) -> (*mut BuiltinFunctionObject, Value) {
+        let builtin = Box::new(BuiltinFunctionObject::new(
+            Arc::from(name),
+            builtin_arg_count,
+        ));
+        let ptr = Box::into_raw(builtin);
+        (ptr, Value::object_ptr(ptr as *const ()))
+    }
 
     #[test]
     fn test_extract_type_id() {
@@ -271,6 +306,103 @@ mod tests {
 
         for _t in types {
             // Just verify these are valid TypeId values
+        }
+    }
+
+    #[test]
+    fn test_implicit_self_from_slot_none_marker() {
+        assert!(implicit_self_from_slot(Value::none()).is_none());
+        let self_value = Value::int(7).unwrap();
+        assert_eq!(implicit_self_from_slot(self_value), Some(self_value));
+    }
+
+    #[test]
+    fn test_call_method_user_function_without_implicit_self() {
+        let mut vm = VirtualMachine::new();
+        push_test_frame(&mut vm, "caller");
+
+        let (func_ptr, func_value) = make_test_function_value("callee");
+        vm.current_frame_mut().set_reg(1, func_value);
+        vm.current_frame_mut().set_reg(2, Value::none()); // None marker => no implicit self
+        vm.current_frame_mut().set_reg(3, Value::int(42).unwrap());
+
+        let inst = Instruction::new(Opcode::CallMethod, 0, 1, 1);
+        let control = call_method(&mut vm, inst);
+        assert!(matches!(control, ControlFlow::Continue));
+        assert_eq!(vm.call_depth(), 2);
+        assert_eq!(vm.current_frame().get_reg(0).as_int(), Some(42));
+        assert!(vm.current_frame().get_reg(1).is_none());
+
+        vm.clear_frames();
+        unsafe {
+            drop(Box::from_raw(func_ptr));
+        }
+    }
+
+    #[test]
+    fn test_call_method_user_function_with_implicit_self() {
+        let mut vm = VirtualMachine::new();
+        push_test_frame(&mut vm, "caller");
+
+        let (func_ptr, func_value) = make_test_function_value("callee");
+        vm.current_frame_mut().set_reg(1, func_value);
+        vm.current_frame_mut().set_reg(2, Value::int(7).unwrap());
+        vm.current_frame_mut().set_reg(3, Value::int(42).unwrap());
+
+        let inst = Instruction::new(Opcode::CallMethod, 0, 1, 1);
+        let control = call_method(&mut vm, inst);
+        assert!(matches!(control, ControlFlow::Continue));
+        assert_eq!(vm.call_depth(), 2);
+        assert_eq!(vm.current_frame().get_reg(0).as_int(), Some(7));
+        assert_eq!(vm.current_frame().get_reg(1).as_int(), Some(42));
+
+        vm.clear_frames();
+        unsafe {
+            drop(Box::from_raw(func_ptr));
+        }
+    }
+
+    #[test]
+    fn test_call_method_builtin_respects_none_marker() {
+        let mut vm = VirtualMachine::new();
+        push_test_frame(&mut vm, "caller");
+
+        let (builtin_ptr, builtin_value) = make_builtin_value("argc");
+        vm.current_frame_mut().set_reg(1, builtin_value);
+        vm.current_frame_mut().set_reg(2, Value::none()); // None marker => no implicit self
+        vm.current_frame_mut().set_reg(3, Value::int(99).unwrap());
+
+        let inst = Instruction::new(Opcode::CallMethod, 0, 1, 1);
+        let control = call_method(&mut vm, inst);
+        assert!(matches!(control, ControlFlow::Continue));
+        assert_eq!(vm.call_depth(), 1);
+        assert_eq!(vm.current_frame().get_reg(0).as_int(), Some(1));
+
+        vm.clear_frames();
+        unsafe {
+            drop(Box::from_raw(builtin_ptr));
+        }
+    }
+
+    #[test]
+    fn test_call_method_builtin_includes_implicit_self_when_present() {
+        let mut vm = VirtualMachine::new();
+        push_test_frame(&mut vm, "caller");
+
+        let (builtin_ptr, builtin_value) = make_builtin_value("argc");
+        vm.current_frame_mut().set_reg(1, builtin_value);
+        vm.current_frame_mut().set_reg(2, Value::int(1).unwrap());
+        vm.current_frame_mut().set_reg(3, Value::int(99).unwrap());
+
+        let inst = Instruction::new(Opcode::CallMethod, 0, 1, 1);
+        let control = call_method(&mut vm, inst);
+        assert!(matches!(control, ControlFlow::Continue));
+        assert_eq!(vm.call_depth(), 1);
+        assert_eq!(vm.current_frame().get_reg(0).as_int(), Some(2));
+
+        vm.clear_frames();
+        unsafe {
+            drop(Box::from_raw(builtin_ptr));
         }
     }
 }

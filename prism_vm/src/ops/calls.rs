@@ -633,10 +633,9 @@ fn create_string_key(name: &str) -> Value {
 
 /// CallMethod: dst = obj.method(args...)
 #[inline(always)]
-pub fn call_method(_vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow {
-    // TODO: Implement method calls
-    // Similar to Call but with implicit self parameter
-    ControlFlow::Error(RuntimeError::internal("CallMethod not yet implemented"))
+pub fn call_method(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    // Delegate to the optimized method-dispatch implementation used by the opcode table.
+    crate::ops::method_dispatch::call_method(vm, inst)
 }
 
 /// CallKwEx: extension instruction for CallKw.
