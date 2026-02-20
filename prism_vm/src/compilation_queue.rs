@@ -38,7 +38,7 @@ use prism_compiler::bytecode::Opcode;
 use prism_jit::runtime::{CodeCache, CompiledEntry};
 use prism_jit::tier1::codegen::TemplateCompiler;
 
-use crate::tier1_lowering::lower_code_to_templates;
+use crate::jit_bridge::{compile_tier1_entry, compile_tier2_entry};
 
 /// A request to compile a function in the background.
 struct CompilationRequest {
@@ -76,8 +76,8 @@ impl CompilationQueueStats {
 /// Background compilation queue with a dedicated worker thread.
 ///
 /// Decouples JIT compilation from the interpreter's critical path.
-/// The worker thread owns its own `TemplateCompiler` instance to avoid
-/// contention with the main thread.
+/// The worker thread owns its own `TemplateCompiler` instance for Tier 1 work
+/// and runs Tier 2 compilation directly from the optimizing pipeline.
 pub struct CompilationQueue {
     /// Channel sender for enqueuing requests.
     sender: mpsc::Sender<CompilationRequest>,
@@ -198,7 +198,7 @@ impl CompilationQueue {
         pending: Arc<AtomicUsize>,
     ) {
         // Worker owns its own compiler instance — no contention with mutator
-        let mut compiler = TemplateCompiler::new_for_testing();
+        let mut compiler = TemplateCompiler::new_runtime();
 
         loop {
             // Check shutdown flag
@@ -241,22 +241,15 @@ impl CompilationQueue {
             }
         }
 
-        // Convert bytecode to template IR
-        let instructions = match lower_code_to_templates(&request.code) {
-            Ok(instrs) => instrs,
-            Err(_e) => {
-                #[cfg(debug_assertions)]
-                eprintln!("Background compilation failed (IR): {}", _e);
-                stats.failed.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
+        // Compile at the requested tier (>=2 means optimize with Tier 2 pipeline).
+        let compiled = if request.tier >= 2 {
+            compile_tier2_entry(&request.code)
+        } else {
+            compile_tier1_entry(&request.code, compiler)
         };
 
-        // Compile
-        match compiler.compile(request.code.register_count, &instructions) {
-            Ok(compiled) => {
-                let entry = CompiledEntry::from_executable_buffer(code_id, compiled.code)
-                    .with_tier(request.tier);
+        match compiled {
+            Ok(entry) => {
                 code_cache.insert(entry);
                 stats.completed.fetch_add(1, Ordering::Relaxed);
             }
@@ -456,6 +449,8 @@ mod tests {
 
     #[test]
     fn test_compilation_queue_tier_upgrade() {
+        use prism_jit::runtime::ReturnAbi;
+
         let code_cache = Arc::new(CodeCache::new(1024 * 1024));
         let queue = CompilationQueue::new(Arc::clone(&code_cache), 16);
 
@@ -475,12 +470,30 @@ mod tests {
         let fake_entry = CompiledEntry::new(code_id, 0x10000 as *const u8, 1).with_tier(1);
         code_cache.insert(fake_entry);
 
-        // Enqueue at tier 2 — should be accepted (upgrade)
-        // Note: this will use template compiler which produces tier 1 code,
-        // but the request should be accepted and attempted
+        // Enqueue at tier 2 - should compile with the optimizing pipeline.
         assert!(queue.enqueue(Arc::clone(&code), 2));
 
-        let (enqueued, _completed, _failed, _dropped) = queue.stats().snapshot();
+        // Wait for the tier upgrade to complete.
+        let mut attempts = 0;
+        while attempts < 100 {
+            if let Some(entry) = code_cache.lookup(code_id) {
+                if entry.tier() >= 2 {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            attempts += 1;
+        }
+
+        let entry = code_cache
+            .lookup(code_id)
+            .expect("entry should remain present");
+        assert_eq!(entry.tier(), 2);
+        assert_eq!(entry.return_abi(), ReturnAbi::EncodedExitReason);
+
+        let (enqueued, completed, failed, _dropped) = queue.stats().snapshot();
         assert_eq!(enqueued, 1);
+        assert_eq!(completed, 1);
+        assert_eq!(failed, 0);
     }
 }
