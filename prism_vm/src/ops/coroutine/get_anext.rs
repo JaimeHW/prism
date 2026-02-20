@@ -21,8 +21,11 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::stdlib::generators::{GeneratorFlags, GeneratorObject};
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
+use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::type_obj::TypeId;
 
 /// GetANext: Get next awaitable from async iterator.
 ///
@@ -74,10 +77,12 @@ pub fn get_anext(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// `None` otherwise.
 #[inline(always)]
 fn try_native_anext(value: &Value) -> Option<Value> {
-    // TODO: Check if value is an async generator and get its __anext__ awaitable
-    // For native async generators, this returns an async_generator_asend object
-    let _ = value;
-    None
+    let generator = GeneratorObject::from_value(*value)?;
+    if generator.flags().contains(GeneratorFlags::IS_ASYNC) {
+        Some(*value)
+    } else {
+        None
+    }
 }
 
 /// Get the type name of a value for error messages.
@@ -91,8 +96,8 @@ fn type_name(value: &Value) -> &'static str {
         "int"
     } else if value.is_float() {
         "float"
-    } else if value.as_object_ptr().is_some() {
-        "object"
+    } else if let Some(ptr) = value.as_object_ptr() {
+        extract_type_id(ptr).name()
     } else {
         "unknown"
     }
@@ -131,6 +136,12 @@ fn call_anext_method(
     Err(RuntimeError::internal("__anext__ call not yet implemented"))
 }
 
+#[inline(always)]
+fn extract_type_id(ptr: *const ()) -> TypeId {
+    let header = ptr as *const ObjectHeader;
+    unsafe { (*header).type_id }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -138,6 +149,15 @@ fn call_anext_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_compiler::bytecode::CodeObject;
+    use std::sync::Arc;
+
+    fn generator_value(flags: GeneratorFlags) -> Value {
+        let code = Arc::new(CodeObject::new("test_get_anext", "<test>"));
+        let generator = GeneratorObject::with_flags(code, flags);
+        let ptr = Box::into_raw(Box::new(generator)) as *const ();
+        Value::object_ptr(ptr)
+    }
 
     #[test]
     fn test_none_has_no_native_anext() {
@@ -147,6 +167,18 @@ mod tests {
     #[test]
     fn test_int_has_no_native_anext() {
         let val = Value::int(42).unwrap();
+        assert!(try_native_anext(&val).is_none());
+    }
+
+    #[test]
+    fn test_async_generator_has_native_anext() {
+        let val = generator_value(GeneratorFlags::IS_ASYNC | GeneratorFlags::INLINE_STORAGE);
+        assert_eq!(try_native_anext(&val), Some(val));
+    }
+
+    #[test]
+    fn test_regular_generator_has_no_native_anext() {
+        let val = generator_value(GeneratorFlags::INLINE_STORAGE);
         assert!(try_native_anext(&val).is_none());
     }
 

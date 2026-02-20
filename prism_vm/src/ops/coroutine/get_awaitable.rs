@@ -20,8 +20,11 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::stdlib::generators::{GeneratorFlags, GeneratorObject};
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
+use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::type_obj::TypeId;
 
 /// GetAwaitable: Convert object to awaitable.
 ///
@@ -97,17 +100,10 @@ pub fn get_awaitable(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
 /// These types are inherently awaitable and need no conversion.
 #[inline(always)]
 fn is_native_awaitable(value: &Value) -> bool {
-    // Check Value tag for coroutine/async generator types
-    // For now, we check if it's an object and has the coroutine flag
-    if let Some(ptr) = value.as_object_ptr() {
-        // TODO: When we have proper TypeId, check for:
-        // - TypeId::COROUTINE
-        // - TypeId::ASYNC_GENERATOR
-        // For now, stub as false until GeneratorObject is wired up
-        let _ = ptr;
-        return false;
-    }
-    false
+    GeneratorObject::from_value(*value).is_some_and(|generator| {
+        generator.flags().contains(GeneratorFlags::IS_COROUTINE)
+            || generator.flags().contains(GeneratorFlags::IS_ASYNC)
+    })
 }
 
 /// Check if value is a generator with CO_ITERABLE_COROUTINE flag.
@@ -115,21 +111,19 @@ fn is_native_awaitable(value: &Value) -> bool {
 /// This is set by the `@types.coroutine` decorator for backward compatibility.
 #[inline(always)]
 fn is_iterable_coroutine(value: &Value) -> bool {
-    if let Some(ptr) = value.as_object_ptr() {
-        // TODO: Check GeneratorObject.code().is_iterable_coroutine()
-        let _ = ptr;
-        return false;
-    }
+    // Prism does not yet expose a distinct iterable-coroutine runtime flag.
+    // Keep this path strict until legacy coroutine decoration metadata is wired.
+    let _ = value;
     false
 }
 
 /// Check if value is an iterator (has __next__ method).
 #[inline(always)]
 fn is_iterator(value: &Value) -> bool {
-    // TODO: Check for __next__ method
-    // For now, accept any value (will be validated on iteration)
-    let _ = value;
-    true
+    let Some(ptr) = value.as_object_ptr() else {
+        return false;
+    };
+    matches!(extract_type_id(ptr), TypeId::ITERATOR | TypeId::GENERATOR)
 }
 
 /// Get the type name of a value for error messages.
@@ -143,8 +137,8 @@ fn type_name(value: &Value) -> &'static str {
         "int"
     } else if value.is_float() {
         "float"
-    } else if value.as_object_ptr().is_some() {
-        "object" // TODO: Get actual type name from object
+    } else if let Some(ptr) = value.as_object_ptr() {
+        extract_type_id(ptr).name()
     } else {
         "unknown"
     }
@@ -187,6 +181,12 @@ fn call_await_method(
     Err(RuntimeError::internal("__await__ call not yet implemented"))
 }
 
+#[inline(always)]
+fn extract_type_id(ptr: *const ()) -> TypeId {
+    let header = ptr as *const ObjectHeader;
+    unsafe { (*header).type_id }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -194,6 +194,15 @@ fn call_await_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_compiler::bytecode::CodeObject;
+    use std::sync::Arc;
+
+    fn generator_value(flags: GeneratorFlags) -> Value {
+        let code = Arc::new(CodeObject::new("test_get_awaitable", "<test>"));
+        let generator = GeneratorObject::with_flags(code, flags);
+        let ptr = Box::into_raw(Box::new(generator)) as *const ();
+        Value::object_ptr(ptr)
+    }
 
     // =========================================================================
     // Type Check Tests
@@ -220,6 +229,24 @@ mod tests {
     fn test_float_not_awaitable() {
         let val = Value::float(3.14);
         assert!(!is_native_awaitable(&val));
+    }
+
+    #[test]
+    fn test_coroutine_generator_is_native_awaitable() {
+        let value = generator_value(GeneratorFlags::IS_COROUTINE | GeneratorFlags::INLINE_STORAGE);
+        assert!(is_native_awaitable(&value));
+    }
+
+    #[test]
+    fn test_async_generator_is_native_awaitable() {
+        let value = generator_value(GeneratorFlags::IS_ASYNC | GeneratorFlags::INLINE_STORAGE);
+        assert!(is_native_awaitable(&value));
+    }
+
+    #[test]
+    fn test_regular_generator_not_native_awaitable() {
+        let value = generator_value(GeneratorFlags::INLINE_STORAGE);
+        assert!(!is_native_awaitable(&value));
     }
 
     // =========================================================================
@@ -253,9 +280,13 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_is_iterator_placeholder() {
-        // Current implementation accepts all values
-        // This will be tightened once __next__ lookup is implemented
-        assert!(is_iterator(&Value::none()));
+    fn test_is_iterator_rejects_none() {
+        assert!(!is_iterator(&Value::none()));
+    }
+
+    #[test]
+    fn test_generator_is_iterator() {
+        let value = generator_value(GeneratorFlags::INLINE_STORAGE);
+        assert!(is_iterator(&value));
     }
 }

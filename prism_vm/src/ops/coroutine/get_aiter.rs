@@ -22,8 +22,11 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::stdlib::generators::{GeneratorFlags, GeneratorObject};
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
+use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::type_obj::TypeId;
 
 /// GetAIter: Get async iterator from object.
 ///
@@ -81,17 +84,14 @@ pub fn get_aiter(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 /// Check if value is a native async iterator.
 #[inline(always)]
 fn is_async_iterator(value: &Value) -> bool {
-    // TODO: Check for async generator or custom async iterator type
-    let _ = value;
-    false
+    GeneratorObject::from_value(*value)
+        .is_some_and(|generator| generator.flags().contains(GeneratorFlags::IS_ASYNC))
 }
 
 /// Check if value has __anext__ method.
 #[inline(always)]
 fn has_anext(value: &Value) -> bool {
-    // TODO: Proper __anext__ method lookup
-    let _ = value;
-    true // Placeholder: will fail at iteration time if missing
+    is_async_iterator(value)
 }
 
 /// Get the type name of a value for error messages.
@@ -105,8 +105,8 @@ fn type_name(value: &Value) -> &'static str {
         "int"
     } else if value.is_float() {
         "float"
-    } else if value.as_object_ptr().is_some() {
-        "object"
+    } else if let Some(ptr) = value.as_object_ptr() {
+        extract_type_id(ptr).name()
     } else {
         "unknown"
     }
@@ -145,6 +145,12 @@ fn call_aiter_method(
     Err(RuntimeError::internal("__aiter__ call not yet implemented"))
 }
 
+#[inline(always)]
+fn extract_type_id(ptr: *const ()) -> TypeId {
+    let header = ptr as *const ObjectHeader;
+    unsafe { (*header).type_id }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -152,6 +158,15 @@ fn call_aiter_method(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_compiler::bytecode::CodeObject;
+    use std::sync::Arc;
+
+    fn generator_value(flags: GeneratorFlags) -> Value {
+        let code = Arc::new(CodeObject::new("test_get_aiter", "<test>"));
+        let generator = GeneratorObject::with_flags(code, flags);
+        let ptr = Box::into_raw(Box::new(generator)) as *const ();
+        Value::object_ptr(ptr)
+    }
 
     #[test]
     fn test_none_not_async_iterator() {
@@ -162,6 +177,20 @@ mod tests {
     fn test_int_not_async_iterator() {
         let val = Value::int(42).unwrap();
         assert!(!is_async_iterator(&val));
+    }
+
+    #[test]
+    fn test_async_generator_is_async_iterator() {
+        let val = generator_value(GeneratorFlags::IS_ASYNC | GeneratorFlags::INLINE_STORAGE);
+        assert!(is_async_iterator(&val));
+        assert!(has_anext(&val));
+    }
+
+    #[test]
+    fn test_regular_generator_not_async_iterator() {
+        let val = generator_value(GeneratorFlags::INLINE_STORAGE);
+        assert!(!is_async_iterator(&val));
+        assert!(!has_anext(&val));
     }
 
     #[test]

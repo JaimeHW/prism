@@ -24,8 +24,11 @@
 use crate::VirtualMachine;
 use crate::dispatch::ControlFlow;
 use crate::error::RuntimeError;
+use crate::stdlib::generators::{GeneratorObject, GeneratorState as RuntimeGeneratorState};
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
+use prism_runtime::object::ObjectHeader;
+use prism_runtime::object::type_obj::TypeId;
 
 /// Send: Send value to coroutine/generator.
 ///
@@ -116,13 +119,16 @@ enum GeneratorState {
 /// Get the current state of a generator/coroutine.
 #[inline]
 fn get_generator_state(value: &Value) -> GeneratorState {
-    // TODO: Check if value is a GeneratorObject and return its state
-    // - Created: ip == 0, not running
-    // - Suspended: ip > 0, has saved frame
-    // - Running: is_running flag set
-    // - Closed: is_exhausted flag set
-    let _ = value;
-    GeneratorState::NotAGenerator
+    let Some(generator) = GeneratorObject::from_value(*value) else {
+        return GeneratorState::NotAGenerator;
+    };
+
+    match generator.state() {
+        RuntimeGeneratorState::Created => GeneratorState::Created,
+        RuntimeGeneratorState::Suspended => GeneratorState::Suspended,
+        RuntimeGeneratorState::Running => GeneratorState::Running,
+        RuntimeGeneratorState::Exhausted => GeneratorState::Closed,
+    }
 }
 
 /// Get the type name of a value for error messages.
@@ -136,8 +142,8 @@ fn type_name(value: &Value) -> &'static str {
         "int"
     } else if value.is_float() {
         "float"
-    } else if value.as_object_ptr().is_some() {
-        "object"
+    } else if let Some(ptr) = value.as_object_ptr() {
+        extract_type_id(ptr).name()
     } else {
         "unknown"
     }
@@ -160,13 +166,21 @@ enum ResumeResult {
 /// Resume a generator with a sent value.
 #[inline]
 fn resume_generator(_vm: &mut VirtualMachine, _gen: Value, _value: Value) -> ResumeResult {
-    // TODO: Implement generator resumption
-    // 1. Set generator state to Running
-    // 2. Store sent value in generator's receive slot
-    // 3. Resume execution from saved instruction pointer
-    // 4. On yield: save state and return Yielded
-    // 5. On return: set state to Closed and return Returned
-    ResumeResult::Error(RuntimeError::internal("generator send not yet implemented"))
+    if GeneratorObject::from_value(_gen).is_none() {
+        return ResumeResult::Error(RuntimeError::type_error(
+            "send target is not a generator object",
+        ));
+    }
+
+    ResumeResult::Error(RuntimeError::internal(
+        "generator send/resume execution is not integrated yet",
+    ))
+}
+
+#[inline(always)]
+fn extract_type_id(ptr: *const ()) -> TypeId {
+    let header = ptr as *const ObjectHeader;
+    unsafe { (*header).type_id }
 }
 
 // =============================================================================
@@ -176,6 +190,34 @@ fn resume_generator(_vm: &mut VirtualMachine, _gen: Value, _value: Value) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_compiler::bytecode::CodeObject;
+    use crate::stdlib::generators::LivenessMap;
+    use std::sync::Arc;
+
+    fn generator_value_for_state(state: GeneratorState) -> Value {
+        let code = Arc::new(CodeObject::new("test_send", "<test>"));
+        let mut generator = GeneratorObject::new(code);
+        let regs = [Value::none(); 256];
+
+        match state {
+            GeneratorState::Created => {}
+            GeneratorState::Suspended => {
+                generator.try_start();
+                generator.suspend(10, 1, &regs, LivenessMap::from_bits(0b1));
+            }
+            GeneratorState::Running => {
+                generator.try_start();
+            }
+            GeneratorState::Closed => {
+                generator.try_start();
+                generator.exhaust();
+            }
+            GeneratorState::NotAGenerator => {}
+        }
+
+        let ptr = Box::into_raw(Box::new(generator)) as *const ();
+        Value::object_ptr(ptr)
+    }
 
     // =========================================================================
     // Generator State Tests
@@ -209,6 +251,42 @@ mod tests {
         assert_eq!(get_generator_state(&val), GeneratorState::NotAGenerator);
     }
 
+    #[test]
+    fn test_generator_created_state_detected() {
+        let generator_value = generator_value_for_state(GeneratorState::Created);
+        assert_eq!(
+            get_generator_state(&generator_value),
+            GeneratorState::Created
+        );
+    }
+
+    #[test]
+    fn test_generator_suspended_state_detected() {
+        let generator_value = generator_value_for_state(GeneratorState::Suspended);
+        assert_eq!(
+            get_generator_state(&generator_value),
+            GeneratorState::Suspended
+        );
+    }
+
+    #[test]
+    fn test_generator_running_state_detected() {
+        let generator_value = generator_value_for_state(GeneratorState::Running);
+        assert_eq!(
+            get_generator_state(&generator_value),
+            GeneratorState::Running
+        );
+    }
+
+    #[test]
+    fn test_generator_closed_state_detected() {
+        let generator_value = generator_value_for_state(GeneratorState::Closed);
+        assert_eq!(
+            get_generator_state(&generator_value),
+            GeneratorState::Closed
+        );
+    }
+
     // =========================================================================
     // Type Name Tests
     // =========================================================================
@@ -233,6 +311,12 @@ mod tests {
     fn test_type_name_float() {
         let val = Value::float(3.14);
         assert_eq!(type_name(&val), "float");
+    }
+
+    #[test]
+    fn test_type_name_generator() {
+        let generator_value = generator_value_for_state(GeneratorState::Created);
+        assert_eq!(type_name(&generator_value), "generator");
     }
 
     // =========================================================================

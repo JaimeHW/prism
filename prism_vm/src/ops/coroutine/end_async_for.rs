@@ -22,8 +22,9 @@
 //! - StopAsyncIteration: ~8 cycles (exception check + jump)
 
 use crate::VirtualMachine;
+use crate::builtins::ExceptionValue;
 use crate::dispatch::ControlFlow;
-use crate::error::RuntimeError;
+use crate::stdlib::exceptions::ExceptionTypeId;
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
 
@@ -68,12 +69,15 @@ pub fn end_async_for(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
         return ControlFlow::Continue;
     }
 
-    // Otherwise, we have a different exception - re-raise it
-    // TODO: This requires proper exception propagation infrastructure
-    // For now, return a runtime error for unhandled exceptions
-    ControlFlow::Error(RuntimeError::internal(
-        "EndAsyncFor: exception propagation not yet implemented",
-    ))
+    if let Some(type_id) = exception_type_id(&exc_value) {
+        return ControlFlow::Exception {
+            type_id,
+            handler_pc: 0,
+        };
+    }
+
+    // Non-exception sentinel values are ignored.
+    ControlFlow::Continue
 }
 
 // =============================================================================
@@ -91,13 +95,15 @@ pub fn end_async_for(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow 
 /// fully integrated.
 #[inline(always)]
 fn is_stop_async_iteration(exc: &Value) -> bool {
-    // TODO: Check if the exception is an instance of StopAsyncIteration
-    // This requires:
-    // 1. Checking if exc is an object
-    // 2. Getting its type
-    // 3. Comparing against the built-in StopAsyncIteration type
-    let _ = exc;
-    false // Placeholder: implement when exception hierarchy is ready
+    matches!(
+        unsafe { ExceptionValue::from_value(*exc) },
+        Some(value) if value.type_id() == ExceptionTypeId::StopAsyncIteration
+    )
+}
+
+#[inline(always)]
+fn exception_type_id(exc: &Value) -> Option<u16> {
+    unsafe { ExceptionValue::from_value(*exc) }.map(|value| value.type_id() as u16)
 }
 
 // =============================================================================
@@ -107,6 +113,7 @@ fn is_stop_async_iteration(exc: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtins::create_exception;
 
     #[test]
     fn test_none_not_stop_async_iteration() {
@@ -130,5 +137,25 @@ mod tests {
     fn test_float_not_stop_async_iteration() {
         let val = Value::float(3.14);
         assert!(!is_stop_async_iteration(&val));
+    }
+
+    #[test]
+    fn test_stop_async_iteration_detected() {
+        let exc = create_exception(ExceptionTypeId::StopAsyncIteration, None);
+        assert!(is_stop_async_iteration(&exc));
+        assert_eq!(
+            exception_type_id(&exc),
+            Some(ExceptionTypeId::StopAsyncIteration as u16)
+        );
+    }
+
+    #[test]
+    fn test_stop_iteration_not_stop_async_iteration() {
+        let exc = create_exception(ExceptionTypeId::StopIteration, None);
+        assert!(!is_stop_async_iteration(&exc));
+        assert_eq!(
+            exception_type_id(&exc),
+            Some(ExceptionTypeId::StopIteration as u16)
+        );
     }
 }
