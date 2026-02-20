@@ -109,37 +109,26 @@ pub fn jump_if_not_none(vm: &mut VirtualMachine, inst: Instruction) -> ControlFl
 
 /// PopExceptHandler: pop exception handler from stack
 #[inline(always)]
-pub fn pop_except_handler(vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow {
-    // TODO: Implement exception handling
-    ControlFlow::Continue
+pub fn pop_except_handler(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    crate::ops::exception::pop_except_handler(vm, inst)
 }
 
 /// Raise: raise exception from register
 #[inline(always)]
 pub fn raise(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
-    let frame = vm.current_frame();
-    let _value = frame.get_reg(inst.dst().0);
-
-    // TODO: Implement exception raising
-    ControlFlow::Error(crate::error::RuntimeError::internal(
-        "Exception handling not yet implemented",
-    ))
+    crate::ops::exception::raise(vm, inst)
 }
 
 /// Reraise: re-raise current exception
 #[inline(always)]
-pub fn reraise(_vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow {
-    // TODO: Implement exception re-raising
-    ControlFlow::Error(crate::error::RuntimeError::internal(
-        "Exception handling not yet implemented",
-    ))
+pub fn reraise(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    crate::ops::exception::reraise(vm, inst)
 }
 
 /// EndFinally: end finally block
 #[inline(always)]
-pub fn end_finally(_vm: &mut VirtualMachine, _inst: Instruction) -> ControlFlow {
-    // TODO: Implement finally handling
-    ControlFlow::Continue
+pub fn end_finally(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
+    crate::ops::exception::end_finally(vm, inst)
 }
 
 // =============================================================================
@@ -211,9 +200,45 @@ pub fn yield_from(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
 }
 
 #[cfg(test)]
-#[allow(unused)]
 mod tests {
     use super::*;
+    use prism_compiler::bytecode::{CodeObject, Instruction, Opcode, Register};
+    use std::sync::Arc;
 
-    // Control flow tests require full VM setup
+    fn push_test_frame(vm: &mut VirtualMachine) {
+        let mut code = CodeObject::new("control_test", "<test>");
+        code.register_count = 4;
+        vm.push_frame(Arc::new(code), 0)
+            .expect("failed to push test frame");
+    }
+
+    #[test]
+    fn test_raise_delegates_to_exception_handler() {
+        let mut vm = VirtualMachine::new();
+        push_test_frame(&mut vm);
+        vm.current_frame_mut().set_reg(
+            0,
+            crate::builtins::create_exception(
+                crate::stdlib::exceptions::ExceptionTypeId::ValueError,
+                None,
+            ),
+        );
+
+        let inst = Instruction::op_di(Opcode::Raise, Register::new(0), 0xFFFF);
+        let control = raise(&mut vm, inst);
+        assert!(matches!(
+            control,
+            ControlFlow::Exception { handler_pc: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn test_reraise_delegates_to_exception_handler() {
+        let mut vm = VirtualMachine::new();
+        push_test_frame(&mut vm);
+
+        let inst = Instruction::op(Opcode::Reraise);
+        let control = reraise(&mut vm, inst);
+        assert!(matches!(control, ControlFlow::Error(_)));
+    }
 }
