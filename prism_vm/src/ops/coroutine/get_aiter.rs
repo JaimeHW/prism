@@ -25,8 +25,8 @@ use crate::error::RuntimeError;
 use crate::stdlib::generators::{GeneratorFlags, GeneratorObject};
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
-use prism_runtime::object::ObjectHeader;
-use prism_runtime::object::type_obj::TypeId;
+
+use super::protocol::{call_unary_magic_method, lookup_magic_method, type_name};
 
 /// GetAIter: Get async iterator from object.
 ///
@@ -58,7 +58,7 @@ pub fn get_aiter(vm: &mut VirtualMachine, inst: Instruction) -> ControlFlow {
             match call_aiter_method(vm, aiter_method, obj) {
                 Ok(async_iterator) => {
                     // Verify result has __anext__ method
-                    if !has_anext(&async_iterator) {
+                    if !has_anext_method(vm, &async_iterator) {
                         return ControlFlow::Error(RuntimeError::type_error(
                             "'async for' requires an object with __anext__ method",
                         ));
@@ -94,22 +94,14 @@ fn has_anext(value: &Value) -> bool {
     is_async_iterator(value)
 }
 
-/// Get the type name of a value for error messages.
+/// Check if value has __anext__ method, including custom async iterators.
 #[inline]
-fn type_name(value: &Value) -> &'static str {
-    if value.is_none() {
-        "NoneType"
-    } else if value.is_bool() {
-        "bool"
-    } else if value.is_int() {
-        "int"
-    } else if value.is_float() {
-        "float"
-    } else if let Some(ptr) = value.as_object_ptr() {
-        extract_type_id(ptr).name()
-    } else {
-        "unknown"
-    }
+fn has_anext_method(vm: &VirtualMachine, value: &Value) -> bool {
+    has_anext(value)
+        || lookup_magic_method(vm, *value, "__anext__")
+            .ok()
+            .and_then(|m| m)
+            .is_some()
 }
 
 // =============================================================================
@@ -128,27 +120,22 @@ enum AIterLookup {
 
 /// Look up the __aiter__ method on an object's type.
 #[inline]
-fn lookup_aiter_method(_vm: &VirtualMachine, obj: Value) -> AIterLookup {
-    // TODO: Implement proper __aiter__ lookup via type's method table
-    let _ = obj;
-    AIterLookup::NotFound
+fn lookup_aiter_method(vm: &VirtualMachine, obj: Value) -> AIterLookup {
+    match lookup_magic_method(vm, obj, "__aiter__") {
+        Ok(Some(method)) => AIterLookup::Found(method),
+        Ok(None) => AIterLookup::NotFound,
+        Err(e) => AIterLookup::Error(e),
+    }
 }
 
 /// Call the __aiter__ method on an object.
 #[inline]
 fn call_aiter_method(
-    _vm: &mut VirtualMachine,
-    _method: Value,
-    _obj: Value,
+    vm: &mut VirtualMachine,
+    method: Value,
+    obj: Value,
 ) -> Result<Value, RuntimeError> {
-    // TODO: Implement method call
-    Err(RuntimeError::internal("__aiter__ call not yet implemented"))
-}
-
-#[inline(always)]
-fn extract_type_id(ptr: *const ()) -> TypeId {
-    let header = ptr as *const ObjectHeader;
-    unsafe { (*header).type_id }
+    call_unary_magic_method(vm, method, obj, "__aiter__")
 }
 
 // =============================================================================

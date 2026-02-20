@@ -40,6 +40,7 @@ mod end_async_for;
 mod get_aiter;
 mod get_anext;
 mod get_awaitable;
+mod protocol;
 mod send;
 
 #[cfg(test)]

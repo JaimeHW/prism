@@ -23,8 +23,8 @@ use crate::error::RuntimeError;
 use crate::stdlib::generators::{GeneratorFlags, GeneratorObject};
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
-use prism_runtime::object::ObjectHeader;
-use prism_runtime::object::type_obj::TypeId;
+
+use super::protocol::{call_unary_magic_method, is_iterator, lookup_magic_method, type_name};
 
 /// GetAwaitable: Convert object to awaitable.
 ///
@@ -118,36 +118,6 @@ fn is_iterable_coroutine(value: &Value) -> bool {
 }
 
 /// Check if value is an iterator (has __next__ method).
-#[inline(always)]
-fn is_iterator(value: &Value) -> bool {
-    let Some(ptr) = value.as_object_ptr() else {
-        return false;
-    };
-    matches!(extract_type_id(ptr), TypeId::ITERATOR | TypeId::GENERATOR)
-}
-
-/// Get the type name of a value for error messages.
-#[inline]
-fn type_name(value: &Value) -> &'static str {
-    if value.is_none() {
-        "NoneType"
-    } else if value.is_bool() {
-        "bool"
-    } else if value.is_int() {
-        "int"
-    } else if value.is_float() {
-        "float"
-    } else if let Some(ptr) = value.as_object_ptr() {
-        extract_type_id(ptr).name()
-    } else {
-        "unknown"
-    }
-}
-
-// =============================================================================
-// __await__ Method Lookup
-// =============================================================================
-
 /// Result of looking up __await__ method.
 enum AwaitLookup {
     /// Method found, ready to call.
@@ -160,31 +130,22 @@ enum AwaitLookup {
 
 /// Look up the __await__ method on an object's type.
 #[inline]
-fn lookup_await_method(_vm: &VirtualMachine, obj: Value) -> AwaitLookup {
-    // TODO: Implement proper __await__ lookup via type's method table
-    // This should use the method cache for performance
-    //
-    // For now, return NotFound for non-coroutine types
-    let _ = obj;
-    AwaitLookup::NotFound
+fn lookup_await_method(vm: &VirtualMachine, obj: Value) -> AwaitLookup {
+    match lookup_magic_method(vm, obj, "__await__") {
+        Ok(Some(method)) => AwaitLookup::Found(method),
+        Ok(None) => AwaitLookup::NotFound,
+        Err(e) => AwaitLookup::Error(e),
+    }
 }
 
 /// Call the __await__ method on an object.
 #[inline]
 fn call_await_method(
-    _vm: &mut VirtualMachine,
-    _method: Value,
-    _obj: Value,
+    vm: &mut VirtualMachine,
+    method: Value,
+    obj: Value,
 ) -> Result<Value, RuntimeError> {
-    // TODO: Implement method call
-    // This should call method(obj) with no additional arguments
-    Err(RuntimeError::internal("__await__ call not yet implemented"))
-}
-
-#[inline(always)]
-fn extract_type_id(ptr: *const ()) -> TypeId {
-    let header = ptr as *const ObjectHeader;
-    unsafe { (*header).type_id }
+    call_unary_magic_method(vm, method, obj, "__await__")
 }
 
 // =============================================================================

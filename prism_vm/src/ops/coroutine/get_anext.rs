@@ -24,8 +24,8 @@ use crate::error::RuntimeError;
 use crate::stdlib::generators::{GeneratorFlags, GeneratorObject};
 use prism_compiler::bytecode::Instruction;
 use prism_core::Value;
-use prism_runtime::object::ObjectHeader;
-use prism_runtime::object::type_obj::TypeId;
+
+use super::protocol::{call_unary_magic_method, lookup_magic_method, type_name};
 
 /// GetANext: Get next awaitable from async iterator.
 ///
@@ -85,28 +85,6 @@ fn try_native_anext(value: &Value) -> Option<Value> {
     }
 }
 
-/// Get the type name of a value for error messages.
-#[inline]
-fn type_name(value: &Value) -> &'static str {
-    if value.is_none() {
-        "NoneType"
-    } else if value.is_bool() {
-        "bool"
-    } else if value.is_int() {
-        "int"
-    } else if value.is_float() {
-        "float"
-    } else if let Some(ptr) = value.as_object_ptr() {
-        extract_type_id(ptr).name()
-    } else {
-        "unknown"
-    }
-}
-
-// =============================================================================
-// __anext__ Method Lookup
-// =============================================================================
-
 /// Result of looking up __anext__ method.
 enum ANextLookup {
     /// Method found, ready to call.
@@ -119,27 +97,22 @@ enum ANextLookup {
 
 /// Look up the __anext__ method on an object's type.
 #[inline]
-fn lookup_anext_method(_vm: &VirtualMachine, obj: Value) -> ANextLookup {
-    // TODO: Implement proper __anext__ lookup via type's method table
-    let _ = obj;
-    ANextLookup::NotFound
+fn lookup_anext_method(vm: &VirtualMachine, obj: Value) -> ANextLookup {
+    match lookup_magic_method(vm, obj, "__anext__") {
+        Ok(Some(method)) => ANextLookup::Found(method),
+        Ok(None) => ANextLookup::NotFound,
+        Err(e) => ANextLookup::Error(e),
+    }
 }
 
 /// Call the __anext__ method on an async iterator.
 #[inline]
 fn call_anext_method(
-    _vm: &mut VirtualMachine,
-    _method: Value,
-    _obj: Value,
+    vm: &mut VirtualMachine,
+    method: Value,
+    obj: Value,
 ) -> Result<Value, RuntimeError> {
-    // TODO: Implement method call
-    Err(RuntimeError::internal("__anext__ call not yet implemented"))
-}
-
-#[inline(always)]
-fn extract_type_id(ptr: *const ()) -> TypeId {
-    let header = ptr as *const ObjectHeader;
-    unsafe { (*header).type_id }
+    call_unary_magic_method(vm, method, obj, "__anext__")
 }
 
 // =============================================================================
