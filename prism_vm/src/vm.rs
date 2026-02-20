@@ -204,6 +204,13 @@ impl VirtualMachine {
         }
     }
 
+    /// Switch active frame and invalidate frame-local handler lookup cache.
+    #[inline(always)]
+    fn set_current_frame_idx(&mut self, idx: usize) {
+        self.current_frame_idx = idx;
+        self.handler_cache.invalidate();
+    }
+
     // =========================================================================
     // Execution
     // =========================================================================
@@ -302,8 +309,7 @@ impl VirtualMachine {
                                 .into());
                             }
 
-                            self.frames.pop();
-                            self.current_frame_idx = self.frames.len() - 1;
+                            self.pop_top_frame_for_unwind();
 
                             // Try to find handler in caller
                             if let Some(handler_entry) = self.find_exception_handler(type_id) {
@@ -351,8 +357,7 @@ impl VirtualMachine {
                                 .into());
                             }
 
-                            self.frames.pop();
-                            self.current_frame_idx = self.frames.len() - 1;
+                            self.pop_top_frame_for_unwind();
 
                             if let Some(handler_entry) = self.find_exception_handler(type_id) {
                                 let frame = &mut self.frames[self.current_frame_idx];
@@ -384,7 +389,7 @@ impl VirtualMachine {
 
                 ControlFlow::ExitHandler => {
                     // Handler completed, resume normal execution
-                    // TODO: Pop handler from handler stack
+                    self.pop_exception_handler();
                 }
 
                 // =========================================================
@@ -450,8 +455,7 @@ impl VirtualMachine {
                                 return Err(err.into());
                             }
 
-                            self.frames.pop();
-                            self.current_frame_idx = self.frames.len() - 1;
+                            self.pop_top_frame_for_unwind();
 
                             if let Some(handler_entry) = self.find_exception_handler(type_id) {
                                 let frame = &mut self.frames[self.current_frame_idx];
@@ -542,8 +546,7 @@ impl VirtualMachine {
         }
 
         while self.frames.len() > caller_depth {
-            self.frames.pop();
-            self.current_frame_idx = self.frames.len() - 1;
+            self.pop_top_frame_for_unwind();
 
             if self.frames.len() <= caller_depth {
                 return false;
@@ -619,7 +622,7 @@ impl VirtualMachine {
         }
 
         self.frames.push(frame);
-        self.current_frame_idx = self.frames.len() - 1;
+        self.set_current_frame_idx(self.frames.len() - 1);
         let generator_frame_idx = self.current_frame_idx;
 
         let mut outcome: Option<GeneratorResumeOutcome> = None;
@@ -760,16 +763,16 @@ impl VirtualMachine {
                     frame.ip = finally_pc;
                 }
                 ControlFlow::ExitHandler => {
-                    // Handler stack updates are currently no-ops in the main loop as well.
+                    self.pop_exception_handler();
                 }
             }
         }
 
         // Always restore caller-visible frame stack state.
-        if self.frames.len() > caller_depth {
-            self.frames.truncate(caller_depth);
+        while self.frames.len() > caller_depth {
+            self.pop_top_frame_for_unwind();
         }
-        self.current_frame_idx = caller_idx;
+        self.set_current_frame_idx(caller_idx);
         self.frames[caller_idx].set_reg(255, caller_scratch_255);
 
         if let Some(err) = failure {
@@ -868,7 +871,7 @@ impl VirtualMachine {
                             jit.handle_deopt(code_ptr_id, reason);
                             jit_frame.ip = bc_offset;
                             self.frames.push(jit_frame);
-                            self.current_frame_idx = self.frames.len() - 1;
+                            self.set_current_frame_idx(self.frames.len() - 1);
                             return Ok(());
                         }
                         Some(ExecutionResult::Exception(err)) => {
@@ -902,25 +905,39 @@ impl VirtualMachine {
             None => Frame::new(code, return_frame, return_reg),
         };
         self.frames.push(frame);
-        self.current_frame_idx = self.frames.len() - 1;
+        self.set_current_frame_idx(self.frames.len() - 1);
 
         Ok(())
+    }
+
+    /// Pop the top frame during exception/generator unwinding.
+    ///
+    /// Keeps handler stack entries for the popped frame in sync.
+    #[inline]
+    fn pop_top_frame_for_unwind(&mut self) {
+        let top_idx = self.frames.len() - 1;
+        self.handler_stack.pop_frame_handlers(top_idx as u32);
+        self.frames.pop();
+        self.set_current_frame_idx(self.frames.len().saturating_sub(1));
     }
 
     /// Pop the current frame and return to caller.
     /// Returns Some(value) if this was the last frame, None otherwise.
     pub fn pop_frame(&mut self, return_value: Value) -> VmResult<Option<Value>> {
+        let top_idx = self.frames.len() - 1;
+        self.handler_stack.pop_frame_handlers(top_idx as u32);
         let frame = self.frames.pop().expect("no frame to pop");
 
         if self.frames.is_empty() {
             // This was the last frame - return final value
+            self.set_current_frame_idx(0);
             Ok(Some(return_value))
         } else {
             // Store return value in caller's register
             let return_frame_idx = frame.return_frame.unwrap_or(0) as usize;
             let return_reg = frame.return_reg;
 
-            self.current_frame_idx = return_frame_idx;
+            self.set_current_frame_idx(return_frame_idx);
             self.frames[return_frame_idx].set_reg(return_reg, return_value);
 
             Ok(None)
@@ -958,17 +975,27 @@ impl VirtualMachine {
     /// Reset VM state for reuse.
     pub fn reset(&mut self) {
         self.frames.clear();
-        self.current_frame_idx = 0;
+        self.set_current_frame_idx(0);
         self.function_closures.clear();
         self.globals = GlobalScope::new();
         self.inline_caches = InlineCacheStore::default();
+        self.exc_state = ExceptionState::default();
+        self.handler_stack.clear();
+        self.active_exception = None;
+        self.active_exception_type_id = None;
+        self.exc_info_stack.clear();
     }
 
     /// Clear only the frame stack (keep globals).
     pub fn clear_frames(&mut self) {
         self.frames.clear();
-        self.current_frame_idx = 0;
+        self.set_current_frame_idx(0);
         self.function_closures.clear();
+        self.handler_stack.clear();
+        self.active_exception = None;
+        self.active_exception_type_id = None;
+        self.exc_info_stack.clear();
+        self.exc_state = ExceptionState::Normal;
     }
 
     /// Register captured closure environment for a function object.
@@ -1175,21 +1202,49 @@ impl VirtualMachine {
     /// Exception tables are typically small (<10 entries) and sorted by start_pc.
     /// Linear scan with early termination is optimal for this size.
     #[inline]
-    pub fn find_exception_handler(&self, type_id: u16) -> Option<u32> {
-        let frame = &self.frames[self.current_frame_idx];
-        let pc = frame.ip.saturating_sub(1); // PC is post-increment, so -1 for current instruction
+    pub fn find_exception_handler(&mut self, _type_id: u16) -> Option<u32> {
+        let pc = {
+            let frame = &self.frames[self.current_frame_idx];
+            frame.ip.saturating_sub(1) // PC is post-increment, so -1 for current instruction
+        };
 
-        // Search exception table for matching handler
-        // The handler bytecode itself uses ExceptionMatch opcode to do type matching,
-        // so we just need to find any handler covering this PC range.
-        for entry in frame.code.exception_table.iter() {
-            // Check if PC is in range
-            if pc >= entry.start_pc && pc < entry.end_pc {
-                // Jump to handler - handler bytecode will do type matching via ExceptionMatch
+        // Fast path: cached handler for this PC.
+        if let Some(cached_idx) = self.lookup_cached_handler(pc) {
+            if let Some(entry) = self.frames[self.current_frame_idx]
+                .code
+                .exception_table
+                .get(cached_idx as usize)
+                && pc >= entry.start_pc
+                && pc < entry.end_pc
+            {
                 return Some(entry.handler_pc);
             }
+            self.handler_cache.invalidate();
         }
 
+        // Slow path: linear scan (tables are small and sorted by start_pc).
+        let matched = {
+            let frame = &self.frames[self.current_frame_idx];
+            let mut matched: Option<(u16, u32)> = None;
+            for (idx, entry) in frame.code.exception_table.iter().enumerate() {
+                if pc >= entry.start_pc && pc < entry.end_pc {
+                    matched = Some((idx as u16, entry.handler_pc));
+                    break;
+                }
+
+                if pc < entry.start_pc {
+                    break;
+                }
+            }
+            matched
+        };
+
+        if let Some((handler_idx, handler_pc)) = matched {
+            self.cache_handler(pc, handler_idx);
+            return Some(handler_pc);
+        }
+
+        self.handler_cache.record_miss(pc);
         None
     }
 
@@ -1227,9 +1282,11 @@ impl VirtualMachine {
         if let Some(entry) = self.exc_info_stack.pop() {
             if entry.is_active() {
                 self.active_exception = entry.value_cloned();
+                self.active_exception_type_id = Some(entry.type_id());
                 self.exc_state = ExceptionState::Propagating;
             } else {
                 self.active_exception = None;
+                self.active_exception_type_id = None;
                 self.exc_state = ExceptionState::Normal;
             }
             true
@@ -1260,6 +1317,69 @@ impl Default for VirtualMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exception::HandlerFrame;
+    use prism_compiler::bytecode::{CodeFlags, CodeObject, ExceptionEntry};
+    use std::sync::Arc;
+
+    fn empty_code(name: &str) -> Arc<CodeObject> {
+        Arc::new(CodeObject {
+            name: Arc::from(name),
+            register_count: 1,
+            arg_count: 0,
+            posonlyarg_count: 0,
+            kwonlyarg_count: 0,
+            instructions: Box::new([]),
+            constants: Box::new([]),
+            names: Box::new([]),
+            locals: Box::new([]),
+            freevars: Box::new([]),
+            cellvars: Box::new([]),
+            line_table: Box::new([]),
+            exception_table: Box::new([]),
+            filename: Arc::from("<test>"),
+            qualname: Arc::from(name),
+            flags: CodeFlags::NONE,
+            first_lineno: 1,
+            nested_code_objects: Box::new([]),
+        })
+    }
+
+    fn code_with_exception_entries(
+        name: &str,
+        exception_table: Vec<ExceptionEntry>,
+    ) -> Arc<CodeObject> {
+        Arc::new(CodeObject {
+            name: Arc::from(name),
+            register_count: 1,
+            arg_count: 0,
+            posonlyarg_count: 0,
+            kwonlyarg_count: 0,
+            instructions: Box::new([]),
+            constants: Box::new([]),
+            names: Box::new([]),
+            locals: Box::new([]),
+            freevars: Box::new([]),
+            cellvars: Box::new([]),
+            line_table: Box::new([]),
+            exception_table: exception_table.into_boxed_slice(),
+            filename: Arc::from("<test>"),
+            qualname: Arc::from(name),
+            flags: CodeFlags::NONE,
+            first_lineno: 1,
+            nested_code_objects: Box::new([]),
+        })
+    }
+
+    fn catch_all_entry(start_pc: u32, end_pc: u32, handler_pc: u32) -> ExceptionEntry {
+        ExceptionEntry {
+            start_pc,
+            end_pc,
+            handler_pc,
+            finally_pc: u32::MAX,
+            depth: 0,
+            exception_type_idx: u16::MAX,
+        }
+    }
 
     #[test]
     fn test_vm_creation() {
@@ -1283,5 +1403,220 @@ mod tests {
         assert!(vm.builtins.get("None").is_some());
         assert!(vm.builtins.get("True").is_some());
         assert!(vm.builtins.get("False").is_some());
+    }
+
+    #[test]
+    fn test_pop_exc_info_restores_exception_type_and_value() {
+        let mut vm = VirtualMachine::new();
+        vm.set_active_exception_with_type(Value::int(123).unwrap(), 24);
+        assert!(vm.push_exc_info());
+
+        vm.set_active_exception_with_type(Value::int(999).unwrap(), 5);
+        assert!(vm.pop_exc_info());
+
+        assert_eq!(vm.get_active_exception_type_id(), Some(24));
+        assert_eq!(vm.get_active_exception().and_then(Value::as_int), Some(123));
+        assert_eq!(vm.exception_state(), ExceptionState::Propagating);
+    }
+
+    #[test]
+    fn test_pop_exc_info_restores_empty_state() {
+        let mut vm = VirtualMachine::new();
+        assert!(vm.push_exc_info());
+
+        vm.set_active_exception_with_type(Value::int(1).unwrap(), 24);
+        assert!(vm.pop_exc_info());
+
+        assert!(vm.get_active_exception().is_none());
+        assert_eq!(vm.get_active_exception_type_id(), None);
+        assert_eq!(vm.exception_state(), ExceptionState::Normal);
+    }
+
+    #[test]
+    fn test_pop_exc_info_empty_stack_noop() {
+        let mut vm = VirtualMachine::new();
+        vm.set_active_exception_with_type(Value::int(7).unwrap(), 24);
+
+        assert!(!vm.pop_exc_info());
+        assert_eq!(vm.get_active_exception_type_id(), Some(24));
+        assert_eq!(vm.get_active_exception().and_then(Value::as_int), Some(7));
+    }
+
+    #[test]
+    fn test_pop_frame_cleans_handlers_for_popped_frame() {
+        let mut vm = VirtualMachine::new();
+        let code = empty_code("f");
+
+        vm.push_frame(Arc::clone(&code), 0).unwrap();
+        assert!(vm.push_exception_handler(HandlerFrame::new(10, 0, 0)));
+
+        vm.push_frame(code, 0).unwrap();
+        assert!(vm.push_exception_handler(HandlerFrame::new(20, 0, 1)));
+        assert_eq!(vm.handler_stack_depth(), 2);
+
+        let popped = vm.pop_frame(Value::none()).unwrap();
+        assert!(popped.is_none());
+        assert_eq!(vm.call_depth(), 1);
+        assert_eq!(vm.handler_stack_depth(), 1);
+
+        let remaining = vm.pop_exception_handler().expect("missing root handler");
+        assert_eq!(remaining.frame_id, 0);
+        assert_eq!(remaining.handler_idx, 10);
+    }
+
+    #[test]
+    fn test_pop_frame_cleans_handlers_for_last_frame() {
+        let mut vm = VirtualMachine::new();
+        let code = empty_code("root");
+        vm.push_frame(code, 0).unwrap();
+        assert!(vm.push_exception_handler(HandlerFrame::new(1, 0, 0)));
+
+        let popped = vm.pop_frame(Value::none()).unwrap();
+        assert!(popped.is_some());
+        assert_eq!(vm.call_depth(), 0);
+        assert_eq!(vm.handler_stack_depth(), 0);
+    }
+
+    #[test]
+    fn test_propagate_exception_unwinds_and_cleans_generator_handlers() {
+        let mut vm = VirtualMachine::new();
+        let code = empty_code("g");
+
+        vm.push_frame(Arc::clone(&code), 0).unwrap();
+        assert!(vm.push_exception_handler(HandlerFrame::new(1, 0, 0)));
+        vm.push_frame(code, 0).unwrap();
+        assert!(vm.push_exception_handler(HandlerFrame::new(2, 0, 1)));
+
+        let handled = vm.propagate_exception_within_generator_frames(24, 1);
+        assert!(!handled);
+        assert_eq!(vm.call_depth(), 1);
+        assert_eq!(vm.handler_stack_depth(), 1);
+        assert_eq!(vm.current_frame_id(), 0);
+    }
+
+    #[test]
+    fn test_reset_clears_exception_and_handler_state() {
+        let mut vm = VirtualMachine::new();
+        let code = empty_code("r");
+        vm.push_frame(code, 0).unwrap();
+        assert!(vm.push_exception_handler(HandlerFrame::new(3, 0, 0)));
+        vm.set_active_exception_with_type(Value::int(1).unwrap(), 24);
+        assert!(vm.push_exc_info());
+
+        vm.reset();
+        assert_eq!(vm.call_depth(), 0);
+        assert_eq!(vm.handler_stack_depth(), 0);
+        assert_eq!(vm.get_active_exception_type_id(), None);
+        assert!(!vm.has_exc_info());
+        assert_eq!(vm.exception_state(), ExceptionState::Normal);
+    }
+
+    #[test]
+    fn test_clear_frames_keeps_globals_but_clears_exception_and_handler_state() {
+        let mut vm = VirtualMachine::new();
+        vm.globals.set("x".into(), Value::int(42).unwrap());
+        let code = empty_code("c");
+        vm.push_frame(code, 0).unwrap();
+        assert!(vm.push_exception_handler(HandlerFrame::new(4, 0, 0)));
+        vm.set_active_exception_with_type(Value::int(9).unwrap(), 24);
+        assert!(vm.push_exc_info());
+
+        vm.clear_frames();
+        assert_eq!(vm.call_depth(), 0);
+        assert_eq!(vm.handler_stack_depth(), 0);
+        assert_eq!(vm.get_active_exception_type_id(), None);
+        assert!(!vm.has_exc_info());
+        assert_eq!(vm.exception_state(), ExceptionState::Normal);
+        assert_eq!(vm.globals.get("x").and_then(|v| v.as_int()), Some(42));
+    }
+
+    #[test]
+    fn test_find_exception_handler_populates_cache_and_hits_fast_path() {
+        let mut vm = VirtualMachine::new();
+        let code = code_with_exception_entries(
+            "eh",
+            vec![ExceptionEntry {
+                start_pc: 0,
+                end_pc: 10,
+                handler_pc: 77,
+                finally_pc: u32::MAX,
+                depth: 0,
+                exception_type_idx: u16::MAX,
+            }],
+        );
+
+        vm.push_frame(code, 0).unwrap();
+        vm.current_frame_mut().ip = 5;
+
+        assert_eq!(vm.find_exception_handler(24), Some(77));
+        assert!(vm.handler_cache.is_valid());
+        assert_eq!(vm.handler_cache.cached_handler(), Some(0));
+
+        assert_eq!(vm.find_exception_handler(24), Some(77));
+        assert!(vm.handler_cache.hit_count() >= 1);
+    }
+
+    #[test]
+    fn test_find_exception_handler_records_cache_miss() {
+        let mut vm = VirtualMachine::new();
+        let code = code_with_exception_entries("eh_miss", vec![catch_all_entry(10, 20, 99)]);
+
+        vm.push_frame(code, 0).unwrap();
+        vm.current_frame_mut().ip = 3;
+
+        assert_eq!(vm.find_exception_handler(24), None);
+        assert!(vm.handler_cache.is_empty() || vm.handler_cache.cached_handler().is_none());
+        assert_eq!(vm.handler_cache.cached_pc(), Some(2));
+    }
+
+    #[test]
+    fn test_handler_cache_invalidated_on_push_frame_switch() {
+        let mut vm = VirtualMachine::new();
+        let frame_a = code_with_exception_entries(
+            "frame_a",
+            vec![catch_all_entry(0, 4, 10), catch_all_entry(0, 10, 11)],
+        );
+        let frame_b = code_with_exception_entries(
+            "frame_b",
+            vec![catch_all_entry(0, 10, 21), catch_all_entry(0, 10, 22)],
+        );
+
+        vm.push_frame(frame_a, 0).unwrap();
+        vm.current_frame_mut().ip = 5;
+        assert_eq!(vm.find_exception_handler(24), Some(11));
+        assert_eq!(vm.handler_cache.cached_handler(), Some(1));
+
+        vm.push_frame(frame_b, 0).unwrap();
+        assert!(vm.handler_cache.is_empty());
+        vm.current_frame_mut().ip = 5;
+        assert_eq!(vm.find_exception_handler(24), Some(21));
+    }
+
+    #[test]
+    fn test_handler_cache_invalidated_on_pop_frame_switch() {
+        let mut vm = VirtualMachine::new();
+        let caller = code_with_exception_entries(
+            "caller",
+            vec![catch_all_entry(0, 10, 31), catch_all_entry(0, 10, 32)],
+        );
+        let callee = code_with_exception_entries(
+            "callee",
+            vec![catch_all_entry(0, 4, 40), catch_all_entry(0, 10, 41)],
+        );
+
+        vm.push_frame(caller, 0).unwrap();
+        vm.current_frame_mut().ip = 5;
+        assert_eq!(vm.find_exception_handler(24), Some(31));
+
+        vm.push_frame(callee, 0).unwrap();
+        vm.current_frame_mut().ip = 5;
+        assert_eq!(vm.find_exception_handler(24), Some(41));
+        assert_eq!(vm.handler_cache.cached_handler(), Some(1));
+
+        let popped = vm.pop_frame(Value::none()).unwrap();
+        assert!(popped.is_none());
+        assert!(vm.handler_cache.is_empty());
+        vm.current_frame_mut().ip = 5;
+        assert_eq!(vm.find_exception_handler(24), Some(31));
     }
 }
