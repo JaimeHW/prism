@@ -19,13 +19,17 @@
 use std::sync::Arc;
 
 use prism_compiler::bytecode::CodeObject;
+use prism_jit::backend::x64::registers::Gpr;
+use prism_jit::gc::stackmap::StackMapRef;
+use prism_jit::gc::{SafePoint, StackMap, StackMapRegistry};
 use prism_jit::ir::builder::translator::BytecodeTranslator;
 use prism_jit::ir::operators::{ControlOp, Operator};
 use prism_jit::ir::{Graph, GraphBuilder};
 use prism_jit::opt::OptPipeline;
 use prism_jit::regalloc::{AllocatorConfig, LinearScanAllocator, LivenessAnalysis};
-use prism_jit::runtime::{CodeCache, CompiledEntry, ReturnAbi, RuntimeConfig};
+use prism_jit::runtime::{CodeCache, CompiledEntry, DeoptSite, ReturnAbi, RuntimeConfig};
 use prism_jit::tier1::codegen::TemplateCompiler;
+use prism_jit::tier2::emit::StackMapEntry as Tier2StackMapEntry;
 use prism_jit::tier2::{CodeEmitter, InstructionSelector};
 
 use crate::compilation_queue::CompilationQueue;
@@ -408,6 +412,16 @@ impl JitBridge {
     pub fn executor_mut(&mut self) -> &mut JitExecutor {
         &mut self.executor
     }
+
+    /// Lookup precise stack map metadata for an instruction pointer.
+    pub fn lookup_stack_map(&self, ip: usize) -> Option<StackMapRef> {
+        self.code_cache.lookup_stack_map(ip)
+    }
+
+    /// Access the stack map registry synchronized with the code cache.
+    pub fn stack_map_registry(&self) -> &StackMapRegistry {
+        self.code_cache.stack_map_registry()
+    }
 }
 
 // =============================================================================
@@ -465,12 +479,114 @@ pub(crate) fn compile_tier2_entry(code: &Arc<CodeObject>) -> Result<CompiledEntr
     // Stage 6: Code emission
     let compiled =
         CodeEmitter::emit(&mfunc).map_err(|e| format!("Tier 2 code emission failed: {}", e))?;
+    let prism_jit::tier2::emit::CompiledCode {
+        code: emitted_code,
+        stack_maps,
+        frame_size,
+    } = compiled;
 
-    Ok(
-        CompiledEntry::from_executable_buffer(code_id, compiled.code)
-            .with_tier(2)
-            .with_return_abi(ReturnAbi::RawValueBits),
-    )
+    let mut entry = CompiledEntry::from_executable_buffer(code_id, emitted_code)
+        .with_tier(2)
+        .with_return_abi(ReturnAbi::RawValueBits);
+
+    if let Some(stack_map) =
+        build_stack_map_for_entry(entry.code_ptr() as usize, entry.code_size(), frame_size, &stack_maps)?
+    {
+        entry = entry.with_stack_map(stack_map);
+    }
+
+    let deopt_sites = collect_deopt_sites(&stack_maps);
+    if !deopt_sites.is_empty() {
+        entry = entry.with_deopt_sites(deopt_sites);
+    }
+
+    Ok(entry)
+}
+
+fn build_stack_map_for_entry(
+    code_start: usize,
+    code_size: usize,
+    frame_size: u32,
+    entries: &[Tier2StackMapEntry],
+) -> Result<Option<StackMap>, String> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    let code_size = u32::try_from(code_size)
+        .map_err(|_| format!("Tier 2 code size {code_size} exceeds StackMap u32 limit"))?;
+
+    let mut safepoints = Vec::with_capacity(entries.len());
+    for entry in entries {
+        safepoints.push(SafePoint::new(
+            entry.code_offset,
+            gc_register_bitmap(&entry.gc_regs),
+            gc_stack_bitmap(&entry.gc_slots)?,
+        ));
+    }
+
+    Ok(Some(StackMap::new(
+        code_start,
+        code_size,
+        frame_size,
+        safepoints,
+    )))
+}
+
+#[inline]
+fn gc_register_bitmap(regs: &[Gpr]) -> u16 {
+    let mut bitmap = 0u16;
+    for reg in regs {
+        bitmap |= 1u16 << reg.encoding();
+    }
+    bitmap
+}
+
+fn gc_stack_bitmap(slots: &[i32]) -> Result<u64, String> {
+    let mut bitmap = 0u64;
+    for &offset in slots {
+        if offset >= 0 {
+            return Err(format!(
+                "unsupported non-negative GC stack slot offset {offset}; expected RBP-relative negative offset"
+            ));
+        }
+        if offset % 8 != 0 {
+            return Err(format!(
+                "unaligned GC stack slot offset {offset}; expected 8-byte alignment"
+            ));
+        }
+        let abs = offset
+            .checked_neg()
+            .ok_or_else(|| format!("invalid GC stack slot offset {offset}"))?;
+        if abs < 8 {
+            return Err(format!(
+                "invalid GC stack slot offset {offset}; expected at least -8"
+            ));
+        }
+        let slot_index = (abs / 8) - 1;
+        if slot_index >= 64 {
+            return Err(format!(
+                "GC stack slot offset {offset} exceeds 64-slot bitmap capacity"
+            ));
+        }
+        bitmap |= 1u64 << (slot_index as u32);
+    }
+    Ok(bitmap)
+}
+
+fn collect_deopt_sites(entries: &[Tier2StackMapEntry]) -> Vec<DeoptSite> {
+    let mut sites = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(bc_offset) = entry.bc_offset {
+            sites.push(DeoptSite {
+                code_offset: entry.code_offset,
+                bc_offset,
+            });
+        }
+    }
+    sites.sort_by_key(|site| (site.code_offset, site.bc_offset));
+    sites.dedup();
+    sites
 }
 
 fn validate_tier2_lowering_support(graph: &Graph) -> Result<(), String> {
@@ -677,5 +793,65 @@ mod tests {
             .compile_tier2(&code)
             .expect_err("uninitialized register reads should fail translation");
         assert!(err.contains("uninitialized register"));
+    }
+
+    #[test]
+    fn test_gc_stack_bitmap_encodes_rbp_relative_slots() {
+        let bitmap = gc_stack_bitmap(&[-8, -24, -8]).expect("valid aligned slots should encode");
+        assert_eq!(bitmap, 0b101);
+    }
+
+    #[test]
+    fn test_gc_stack_bitmap_rejects_non_negative_and_unaligned_slots() {
+        let err = gc_stack_bitmap(&[8]).expect_err("positive offsets are not RBP-relative locals");
+        assert!(err.contains("non-negative"));
+
+        let err = gc_stack_bitmap(&[-10]).expect_err("unaligned offsets must be rejected");
+        assert!(err.contains("unaligned"));
+    }
+
+    #[test]
+    fn test_build_stack_map_for_entry_and_collect_deopt_sites() {
+        let entries = vec![
+            Tier2StackMapEntry {
+                code_offset: 0x10,
+                bc_offset: Some(3),
+                gc_slots: vec![-8, -24],
+                gc_regs: vec![Gpr::Rbx, Gpr::R12],
+            },
+            Tier2StackMapEntry {
+                code_offset: 0x20,
+                bc_offset: None,
+                gc_slots: vec![-16],
+                gc_regs: vec![Gpr::R13],
+            },
+            Tier2StackMapEntry {
+                code_offset: 0x10,
+                bc_offset: Some(3),
+                gc_slots: vec![-8, -24],
+                gc_regs: vec![Gpr::Rbx, Gpr::R12],
+            },
+        ];
+
+        let map = build_stack_map_for_entry(0x1000, 0x80, 48, &entries)
+            .expect("stack map conversion should succeed")
+            .expect("non-empty stack map entries should produce metadata");
+        assert_eq!(map.code_start, 0x1000);
+        assert_eq!(map.code_size, 0x80);
+        assert_eq!(map.frame_size, 48);
+        assert_eq!(map.safepoint_count(), 3);
+
+        let sp = map.lookup_offset(0x10).expect("safepoint should be present");
+        assert_eq!(sp.register_bitmap, (1 << Gpr::Rbx.encoding()) | (1 << Gpr::R12.encoding()));
+        assert_eq!(sp.stack_bitmap, 0b101);
+
+        let deopt_sites = collect_deopt_sites(&entries);
+        assert_eq!(
+            deopt_sites,
+            vec![DeoptSite {
+                code_offset: 0x10,
+                bc_offset: 3
+            }]
+        );
     }
 }

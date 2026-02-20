@@ -240,7 +240,7 @@ impl JitExecutor {
                 self.restore_frame_state(frame);
                 let reason =
                     DeoptReason::from_u8((data & 0xFF) as u8).unwrap_or(DeoptReason::UncommonTrap);
-                let bc_offset = (data >> 8) & 0xFFFFFF;
+                let bc_offset = self.decode_deopt_offset(entry, frame, data);
                 ExecutionResult::Deopt { bc_offset, reason }
             }
             ExitReason::Exception => {
@@ -329,7 +329,7 @@ impl JitExecutor {
                 self.restore_frame_state(frame);
                 let reason =
                     DeoptReason::from_u8((data & 0xFF) as u8).unwrap_or(DeoptReason::UncommonTrap);
-                let bc_offset = (data >> 8) & 0xFFFFFF;
+                let bc_offset = self.decode_deopt_offset(entry, frame, data);
                 ExecutionResult::Deopt { bc_offset, reason }
             }
             _ => {
@@ -376,6 +376,18 @@ impl JitExecutor {
             let raw = *self.frame_state.frame_base;
             Value::from_bits(raw)
         }
+    }
+
+    /// Decode deopt offset and fall back to deopt-site metadata when needed.
+    #[inline]
+    fn decode_deopt_offset(&self, entry: &CompiledEntry, frame: &Frame, data: u32) -> u32 {
+        let encoded = (data >> 8) & 0xFFFFFF;
+        if encoded < frame.code.instructions.len() as u32 {
+            return encoded;
+        }
+        entry
+            .lookup_deopt_bc_offset_by_index(encoded)
+            .unwrap_or(encoded)
     }
 
     /// Get code cache reference.
@@ -426,6 +438,7 @@ impl DeoptRecovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prism_jit::runtime::DeoptSite;
 
     unsafe extern "C" fn jit_stub_return_int30_bits(_state: *mut JitFrameState) -> u64 {
         Value::int(30).unwrap().to_bits()
@@ -433,6 +446,14 @@ mod tests {
 
     unsafe extern "C" fn jit_stub_return_exit_return(_state: *mut JitFrameState) -> u64 {
         ExitReason::Return as u64
+    }
+
+    unsafe extern "C" fn jit_stub_return_deopt_site_index_1(_state: *mut JitFrameState) -> u64 {
+        let exit = ExitReason::Deoptimize as u64;
+        let deopt_index = 1u64; // Use deopt-site index fallback path.
+        let reason = DeoptReason::TypeGuard as u64;
+        let data = (deopt_index << 8) | reason;
+        exit | (data << 8)
     }
 
     #[test]
@@ -524,6 +545,39 @@ mod tests {
         let recovery = DeoptRecovery::from_result(&result).unwrap();
         assert_eq!(recovery.bc_offset, 42);
         assert_eq!(recovery.reason, DeoptReason::TypeGuard);
+    }
+
+    #[test]
+    fn test_execute_deopt_uses_site_index_fallback_when_offset_out_of_range() {
+        let cache = Arc::new(CodeCache::new(1024 * 1024));
+        let mut executor = JitExecutor::new(cache);
+
+        let code = Arc::new(prism_compiler::bytecode::CodeObject::new(
+            "jit_deopt_site_index_fallback",
+            "<test>",
+        ));
+        let mut frame = Frame::new(code, None, 0);
+
+        let entry = CompiledEntry::new(3, jit_stub_return_deopt_site_index_1 as *const u8, 1)
+            .with_return_abi(ReturnAbi::EncodedExitReason)
+            .with_deopt_sites(vec![
+                DeoptSite {
+                    code_offset: 10,
+                    bc_offset: 7,
+                },
+                DeoptSite {
+                    code_offset: 20,
+                    bc_offset: 41,
+                },
+            ]);
+
+        match executor.execute(&entry, &mut frame) {
+            ExecutionResult::Deopt { bc_offset, reason } => {
+                assert_eq!(reason, DeoptReason::TypeGuard);
+                assert_eq!(bc_offset, 41);
+            }
+            other => panic!("unexpected execution result: {:?}", other),
+        }
     }
 
     #[test]
