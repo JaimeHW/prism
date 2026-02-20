@@ -488,9 +488,11 @@ fn validate_tier2_lowering_support(graph: &Graph) -> Result<(), String> {
             | Operator::IntCmp(_)
             | Operator::FloatCmp(_)
             | Operator::Bitwise(_)
-            | Operator::Parameter(_)
             | Operator::Phi
             | Operator::LoopPhi => true,
+            // Tier 2 currently does not materialize parameter nodes from JitFrameState.
+            // Reject them explicitly to avoid generating undefined reads.
+            Operator::Parameter(_) => false,
             Operator::Control(
                 ControlOp::Start
                 | ControlOp::End
@@ -600,5 +602,42 @@ mod tests {
             .compile_tier2(&code)
             .expect_err("unsupported generic arithmetic must not install tier2 code");
         assert!(err.contains("does not support operator"));
+    }
+
+    #[test]
+    fn test_compile_tier2_rejects_parameter_nodes_until_materialized() {
+        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+
+        let mut bridge = JitBridge::new(BridgeConfig::for_testing());
+        let mut code = CodeObject::new("tier2_param", "<test>");
+        code.register_count = 1;
+        code.arg_count = 1;
+        code.instructions = vec![Instruction::op_d(Opcode::Return, Register::new(0))].into_boxed_slice();
+        let code = Arc::new(code);
+
+        let err = bridge
+            .compile_tier2(&code)
+            .expect_err("parameterized code should fail until tier2 loads parameters from frame state");
+        assert!(err.contains("Parameter"));
+    }
+
+    #[test]
+    fn test_compile_tier2_rejects_uninitialized_register_reads() {
+        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+
+        let mut bridge = JitBridge::new(BridgeConfig::for_testing());
+        let mut code = CodeObject::new("tier2_uninit", "<test>");
+        code.register_count = 3;
+        code.instructions = vec![
+            Instruction::op_dss(Opcode::Add, Register::new(2), Register::new(0), Register::new(1)),
+            Instruction::op_d(Opcode::Return, Register::new(2)),
+        ]
+        .into_boxed_slice();
+        let code = Arc::new(code);
+
+        let err = bridge
+            .compile_tier2(&code)
+            .expect_err("uninitialized register reads should fail translation");
+        assert!(err.contains("uninitialized register"));
     }
 }
