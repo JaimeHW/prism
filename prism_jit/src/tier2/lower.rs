@@ -779,34 +779,162 @@ pub struct InstructionSelector<'a> {
     next_vreg: u32,
 }
 
+/// Byte size of one VM register slot in the frame array.
+const VM_REGISTER_SLOT_SIZE: i32 = 8;
+/// Dedicated scratch register holding the frame-base pointer in Tier2 code.
+const FRAME_BASE_SCRATCH_GPR: Gpr = Gpr::R11;
+/// Temporary scratch register used for stack-slot parameter materialization.
+const PARAM_STACK_TEMP_GPR: Gpr = Gpr::Rax;
+
 impl<'a> InstructionSelector<'a> {
+    /// Match liveness behavior: all non-control nodes produce allocatable values.
+    #[inline]
+    fn node_produces_value(op: Operator) -> bool {
+        !matches!(op, Operator::Control(_))
+    }
+
     /// Create a new instruction selector.
     pub fn new(graph: &'a Graph, alloc_map: &'a AllocationMap) -> Self {
+        let spill_frame_size = alloc_map.spill_slot_count().saturating_mul(8);
+        let mut node_to_vreg = HashMap::new();
+        let mut next_vreg = 0u32;
+
+        // Pre-seed vreg mapping to match liveness numbering exactly.
+        for (id, node) in graph.iter() {
+            if node.is_dead() || !Self::node_produces_value(node.op) {
+                continue;
+            }
+            node_to_vreg.insert(id, VReg::new(next_vreg));
+            next_vreg += 1;
+        }
+
         InstructionSelector {
             graph,
             alloc_map,
-            mfunc: MachineFunction::new(),
-            node_to_vreg: HashMap::new(),
-            next_vreg: 0,
+            mfunc: MachineFunction {
+                frame_size: spill_frame_size,
+                ..MachineFunction::new()
+            },
+            node_to_vreg,
+            next_vreg,
         }
     }
 
     /// Select instructions for the entire graph.
-    pub fn select(graph: &'a Graph, alloc_map: &'a AllocationMap) -> MachineFunction {
+    pub fn select(
+        graph: &'a Graph,
+        alloc_map: &'a AllocationMap,
+    ) -> Result<MachineFunction, String> {
         let mut selector = InstructionSelector::new(graph, alloc_map);
-        selector.select_all();
-        selector.mfunc
+        selector.select_all()?;
+        Ok(selector.mfunc)
     }
 
     /// Select instructions for all nodes.
-    fn select_all(&mut self) {
+    fn select_all(&mut self) -> Result<(), String> {
+        self.materialize_parameters()?;
+
         // Process nodes in order (simplified - real impl uses RPO)
         for (id, node) in self.graph.iter() {
             if node.is_dead() {
                 continue;
             }
-            self.select_node(id);
+            self.select_node(id)?;
         }
+        Ok(())
+    }
+
+    /// Materialize parameter nodes from the VM frame into machine operands.
+    ///
+    /// Parameters are loaded from `frame_base[index]`, where `frame_base` is
+    /// preloaded into `FRAME_BASE_SCRATCH_GPR` by the Tier2 prologue.
+    fn materialize_parameters(&mut self) -> Result<(), String> {
+        let mut stacked = Vec::new();
+        let mut direct = Vec::new();
+
+        for (id, node) in self.graph.iter() {
+            if node.is_dead() {
+                continue;
+            }
+            let Operator::Parameter(index) = node.op else {
+                continue;
+            };
+
+            let dst = self.operand_for_node(id);
+            match dst {
+                MachineOperand::StackSlot(_) => stacked.push((id, index, dst)),
+                MachineOperand::PReg(PReg::Gpr(gpr)) if gpr == FRAME_BASE_SCRATCH_GPR => {
+                    return Err(format!(
+                        "parameter node {:?} uses reserved scratch register {:?}",
+                        id, FRAME_BASE_SCRATCH_GPR
+                    ));
+                }
+                MachineOperand::PReg(PReg::Gpr(_)) | MachineOperand::VReg(_) => {
+                    direct.push((id, index, dst));
+                }
+                _ => {
+                    return Err(format!(
+                        "parameter node {:?} lowered to unsupported destination operand {:?}",
+                        id, dst
+                    ));
+                }
+            }
+        }
+
+        // Handle spilled parameters first so the temporary register cannot clobber
+        // already-materialized parameter values.
+        stacked.sort_by_key(|(_, index, _)| *index);
+        direct.sort_by_key(|(_, index, _)| *index);
+
+        for (id, index, dst) in stacked.into_iter().chain(direct.into_iter()) {
+            self.emit_parameter_materialization(id, index, dst)?;
+        }
+
+        Ok(())
+    }
+
+    fn emit_parameter_materialization(
+        &mut self,
+        node_id: NodeId,
+        index: u16,
+        dst: MachineOperand,
+    ) -> Result<(), String> {
+        let byte_offset = i32::from(index)
+            .checked_mul(VM_REGISTER_SLOT_SIZE)
+            .ok_or_else(|| {
+                format!(
+                    "parameter index {} overflow while lowering node {:?}",
+                    index, node_id
+                )
+            })?;
+        let src = MachineOperand::Mem(MemOperand::base_disp(FRAME_BASE_SCRATCH_GPR, byte_offset));
+
+        match dst {
+            MachineOperand::StackSlot(offset) => {
+                self.mfunc.push(
+                    MachineInst::new(
+                        MachineOp::Mov,
+                        MachineOperand::gpr(PARAM_STACK_TEMP_GPR),
+                        src,
+                    )
+                    .with_origin(node_id),
+                );
+                self.mfunc.push(
+                    MachineInst::new(
+                        MachineOp::Mov,
+                        MachineOperand::StackSlot(offset),
+                        MachineOperand::gpr(PARAM_STACK_TEMP_GPR),
+                    )
+                    .with_origin(node_id),
+                );
+            }
+            _ => {
+                self.mfunc
+                    .push(MachineInst::new(MachineOp::Mov, dst, src).with_origin(node_id));
+            }
+        }
+
+        Ok(())
     }
 
     /// Get or create a VReg for a node.
@@ -844,8 +972,24 @@ impl<'a> InstructionSelector<'a> {
             .map(|inp| self.operand_for_node(inp))
     }
 
+    /// Get required operand for an input at index.
+    fn required_input_operand(
+        &mut self,
+        node_id: NodeId,
+        index: usize,
+    ) -> Result<MachineOperand, String> {
+        self.operand_for_input(node_id, index).ok_or_else(|| {
+            format!(
+                "missing input {} for node {:?} ({:?}) during instruction selection",
+                index,
+                node_id,
+                self.graph.node(node_id).op
+            )
+        })
+    }
+
     /// Select instructions for a single node.
-    fn select_node(&mut self, node_id: NodeId) {
+    fn select_node(&mut self, node_id: NodeId) -> Result<(), String> {
         let node = self.graph.node(node_id);
         let op = node.op;
 
@@ -857,6 +1001,7 @@ impl<'a> InstructionSelector<'a> {
                     MachineInst::new(MachineOp::Mov, dst, MachineOperand::Imm(value))
                         .with_origin(node_id),
                 );
+                Ok(())
             }
 
             Operator::ConstFloat(bits) => {
@@ -866,6 +1011,7 @@ impl<'a> InstructionSelector<'a> {
                     MachineInst::new(MachineOp::Mov, dst, MachineOperand::Imm(bits as i64))
                         .with_origin(node_id),
                 );
+                Ok(())
             }
 
             Operator::ConstBool(value) => {
@@ -878,6 +1024,7 @@ impl<'a> InstructionSelector<'a> {
                     )
                     .with_origin(node_id),
                 );
+                Ok(())
             }
 
             Operator::ConstNone => {
@@ -887,343 +1034,501 @@ impl<'a> InstructionSelector<'a> {
                     MachineInst::new(MachineOp::Mov, dst, MachineOperand::Imm(0))
                         .with_origin(node_id),
                 );
+                Ok(())
             }
 
             // Arithmetic operations (note: IntOp, FloatOp, not IntArith/FloatArith)
-            Operator::IntOp(arith_op) => {
-                self.select_int_arith(node_id, arith_op);
-            }
+            Operator::IntOp(arith_op) => self.select_int_arith(node_id, arith_op),
 
-            Operator::FloatOp(arith_op) => {
-                self.select_float_arith(node_id, arith_op);
-            }
+            Operator::FloatOp(arith_op) => self.select_float_arith(node_id, arith_op),
 
             // Comparisons
-            Operator::IntCmp(cmp_op) => {
-                self.select_int_cmp(node_id, cmp_op);
-            }
+            Operator::IntCmp(cmp_op) => self.select_int_cmp(node_id, cmp_op),
 
-            Operator::FloatCmp(cmp_op) => {
-                self.select_float_cmp(node_id, cmp_op);
-            }
+            Operator::FloatCmp(cmp_op) => self.select_float_cmp(node_id, cmp_op),
 
             // Bitwise operations
-            Operator::Bitwise(bitwise_op) => {
-                self.select_bitwise(node_id, bitwise_op);
-            }
+            Operator::Bitwise(bitwise_op) => self.select_bitwise(node_id, bitwise_op),
 
             // Control flow
-            Operator::Control(ctrl_op) => {
-                self.select_control(node_id, ctrl_op);
-            }
+            Operator::Control(ctrl_op) => self.select_control(node_id, ctrl_op),
 
             // Parameters and Phi are handled specially
-            Operator::Parameter(_) | Operator::Phi | Operator::LoopPhi => {
+            Operator::Phi | Operator::LoopPhi => {
                 // These don't generate code directly
+                Ok(())
             }
+            Operator::Parameter(_) => {
+                // Parameter nodes are materialized in a dedicated pre-pass.
+                Ok(())
+            }
+            Operator::Projection(index) => self.select_projection(node_id, index),
 
             // Other operators
-            _ => {
-                // Not yet implemented - would be runtime calls
-            }
+            _ => Err(format!(
+                "Tier2 instruction selection does not support operator {:?} at node {:?}",
+                op, node_id
+            )),
         }
     }
+
+    fn select_projection(&mut self, node_id: NodeId, index: u8) -> Result<(), String> {
+        if index > 1 {
+            return Err(format!(
+                "Tier2 lowering only supports control projections 0/1, got Projection({}) at node {:?}",
+                index, node_id
+            ));
+        }
+
+        let if_node = self.get_input(node_id, 0).ok_or_else(|| {
+            format!(
+                "projection node {:?} is missing its If input during instruction selection",
+                node_id
+            )
+        })?;
+        if !matches!(
+            self.graph.node(if_node).op,
+            Operator::Control(ControlOp::If)
+        ) {
+            return Err(format!(
+                "Tier2 lowering only supports projections from If nodes, but projection {:?} input is {:?}",
+                node_id,
+                self.graph.node(if_node).op
+            ));
+        }
+
+        // Projection nodes are pure control tokens; their target blocks carry labels.
+        Ok(())
+    }
     /// Select instructions for integer arithmetic.
-    fn select_int_arith(&mut self, node_id: NodeId, op: ArithOp) {
+    fn select_int_arith(&mut self, node_id: NodeId, op: ArithOp) -> Result<(), String> {
         let dst = self.operand_for_node(node_id);
 
         match op {
             ArithOp::Add => {
-                if let (Some(lhs), Some(rhs)) = (
-                    self.operand_for_input(node_id, 0),
-                    self.operand_for_input(node_id, 1),
-                ) {
-                    self.emit_binary(MachineOp::Add, dst, lhs, rhs, node_id);
-                }
+                let lhs = self.required_input_operand(node_id, 0)?;
+                let rhs = self.required_input_operand(node_id, 1)?;
+                self.emit_binary(MachineOp::Add, dst, lhs, rhs, node_id);
+                Ok(())
             }
 
             ArithOp::Sub => {
-                if let (Some(lhs), Some(rhs)) = (
-                    self.operand_for_input(node_id, 0),
-                    self.operand_for_input(node_id, 1),
-                ) {
-                    self.emit_binary(MachineOp::Sub, dst, lhs, rhs, node_id);
-                }
+                let lhs = self.required_input_operand(node_id, 0)?;
+                let rhs = self.required_input_operand(node_id, 1)?;
+                self.emit_binary(MachineOp::Sub, dst, lhs, rhs, node_id);
+                Ok(())
             }
 
             ArithOp::Mul => {
-                if let (Some(lhs), Some(rhs)) = (
-                    self.operand_for_input(node_id, 0),
-                    self.operand_for_input(node_id, 1),
-                ) {
-                    self.emit_binary(MachineOp::Imul, dst, lhs, rhs, node_id);
-                }
+                let lhs = self.required_input_operand(node_id, 0)?;
+                let rhs = self.required_input_operand(node_id, 1)?;
+                self.emit_binary(MachineOp::Imul, dst, lhs, rhs, node_id);
+                Ok(())
             }
 
             ArithOp::TrueDiv | ArithOp::FloorDiv => {
                 // Division is complex: RDX:RAX / divisor
-                if let (Some(lhs), Some(rhs)) = (
-                    self.operand_for_input(node_id, 0),
-                    self.operand_for_input(node_id, 1),
-                ) {
-                    // Move dividend to RAX
+                let lhs = self.required_input_operand(node_id, 0)?;
+                let rhs = self.required_input_operand(node_id, 1)?;
+                // Move dividend to RAX
+                self.mfunc.push(MachineInst::new(
+                    MachineOp::Mov,
+                    MachineOperand::gpr(Gpr::Rax),
+                    lhs,
+                ));
+
+                // Sign extend to RDX:RAX
+                self.mfunc.push(MachineInst::nullary(MachineOp::Cqo));
+
+                // Divide
+                self.mfunc.push(
+                    MachineInst::new(MachineOp::Idiv, MachineOperand::gpr(Gpr::Rax), rhs)
+                        .with_origin(node_id),
+                );
+
+                // Move result from RAX to destination
+                if dst != MachineOperand::gpr(Gpr::Rax) {
                     self.mfunc.push(MachineInst::new(
                         MachineOp::Mov,
+                        dst,
                         MachineOperand::gpr(Gpr::Rax),
-                        lhs,
                     ));
-
-                    // Sign extend to RDX:RAX
-                    self.mfunc.push(MachineInst::nullary(MachineOp::Cqo));
-
-                    // Divide
-                    self.mfunc.push(
-                        MachineInst::new(MachineOp::Idiv, MachineOperand::gpr(Gpr::Rax), rhs)
-                            .with_origin(node_id),
-                    );
-
-                    // Move result from RAX to destination
-                    if dst != MachineOperand::gpr(Gpr::Rax) {
-                        self.mfunc.push(MachineInst::new(
-                            MachineOp::Mov,
-                            dst,
-                            MachineOperand::gpr(Gpr::Rax),
-                        ));
-                    }
                 }
+                Ok(())
             }
 
             ArithOp::Mod => {
                 // Modulo: remainder is in RDX after IDIV
-                if let (Some(lhs), Some(rhs)) = (
-                    self.operand_for_input(node_id, 0),
-                    self.operand_for_input(node_id, 1),
-                ) {
+                let lhs = self.required_input_operand(node_id, 0)?;
+                let rhs = self.required_input_operand(node_id, 1)?;
+                self.mfunc.push(MachineInst::new(
+                    MachineOp::Mov,
+                    MachineOperand::gpr(Gpr::Rax),
+                    lhs,
+                ));
+                self.mfunc.push(MachineInst::nullary(MachineOp::Cqo));
+                self.mfunc.push(
+                    MachineInst::new(MachineOp::Idiv, MachineOperand::gpr(Gpr::Rax), rhs)
+                        .with_origin(node_id),
+                );
+
+                // Remainder is in RDX
+                if dst != MachineOperand::gpr(Gpr::Rdx) {
                     self.mfunc.push(MachineInst::new(
                         MachineOp::Mov,
-                        MachineOperand::gpr(Gpr::Rax),
-                        lhs,
+                        dst,
+                        MachineOperand::gpr(Gpr::Rdx),
                     ));
-                    self.mfunc.push(MachineInst::nullary(MachineOp::Cqo));
-                    self.mfunc.push(
-                        MachineInst::new(MachineOp::Idiv, MachineOperand::gpr(Gpr::Rax), rhs)
-                            .with_origin(node_id),
-                    );
-
-                    // Remainder is in RDX
-                    if dst != MachineOperand::gpr(Gpr::Rdx) {
-                        self.mfunc.push(MachineInst::new(
-                            MachineOp::Mov,
-                            dst,
-                            MachineOperand::gpr(Gpr::Rdx),
-                        ));
-                    }
                 }
+                Ok(())
             }
 
             ArithOp::Neg => {
-                if let Some(src) = self.operand_for_input(node_id, 0) {
-                    // NEG is unary: dst = -dst
-                    if dst != src {
-                        self.mfunc.push(MachineInst::new(MachineOp::Mov, dst, src));
-                    }
-                    self.mfunc
-                        .push(MachineInst::new(MachineOp::Neg, dst, dst).with_origin(node_id));
+                let src = self.required_input_operand(node_id, 0)?;
+                // NEG is unary: dst = -dst
+                if dst != src {
+                    self.mfunc.push(MachineInst::new(MachineOp::Mov, dst, src));
                 }
+                self.mfunc
+                    .push(MachineInst::new(MachineOp::Neg, dst, dst).with_origin(node_id));
+                Ok(())
             }
 
-            _ => {
-                // Other ops (Pow, MatMul, etc.) not yet implemented
-            }
+            _ => Err(format!(
+                "Tier2 integer lowering does not support {:?} at node {:?}",
+                op, node_id
+            )),
         }
     }
 
     /// Select instructions for floating-point arithmetic.
-    fn select_float_arith(&mut self, node_id: NodeId, op: ArithOp) {
+    fn select_float_arith(&mut self, node_id: NodeId, op: ArithOp) -> Result<(), String> {
         let dst = self.operand_for_node(node_id);
 
-        if let (Some(lhs), Some(rhs)) = (
-            self.operand_for_input(node_id, 0),
-            self.operand_for_input(node_id, 1),
-        ) {
-            let machine_op = match op {
-                ArithOp::Add => MachineOp::Addsd,
-                ArithOp::Sub => MachineOp::Subsd,
-                ArithOp::Mul => MachineOp::Mulsd,
-                ArithOp::TrueDiv => MachineOp::Divsd,
-                _ => return, // Not supported
-            };
+        let lhs = self.required_input_operand(node_id, 0)?;
+        let rhs = self.required_input_operand(node_id, 1)?;
+        let machine_op = match op {
+            ArithOp::Add => MachineOp::Addsd,
+            ArithOp::Sub => MachineOp::Subsd,
+            ArithOp::Mul => MachineOp::Mulsd,
+            ArithOp::TrueDiv => MachineOp::Divsd,
+            _ => {
+                return Err(format!(
+                    "Tier2 float lowering does not support {:?} at node {:?}",
+                    op, node_id
+                ));
+            }
+        };
 
-            self.emit_binary(machine_op, dst, lhs, rhs, node_id);
-        }
+        self.emit_binary(machine_op, dst, lhs, rhs, node_id);
+        Ok(())
     }
 
     /// Select instructions for integer comparison.
-    fn select_int_cmp(&mut self, node_id: NodeId, cmp_op: CmpOp) {
+    fn select_int_cmp(&mut self, node_id: NodeId, cmp_op: CmpOp) -> Result<(), String> {
         let dst = self.operand_for_node(node_id);
 
-        if let (Some(lhs), Some(rhs)) = (
-            self.operand_for_input(node_id, 0),
-            self.operand_for_input(node_id, 1),
-        ) {
-            // Emit compare
-            self.mfunc.push(
-                MachineInst::binary(MachineOp::Cmp, MachineOperand::None, lhs, rhs)
-                    .with_origin(node_id),
-            );
+        let lhs = self.required_input_operand(node_id, 0)?;
+        let rhs = self.required_input_operand(node_id, 1)?;
+        // Emit compare
+        self.mfunc.push(
+            MachineInst::binary(MachineOp::Cmp, MachineOperand::None, lhs, rhs)
+                .with_origin(node_id),
+        );
 
-            // Emit setcc to get boolean result
-            let cc = CondCode::from_cmp_op(cmp_op, true);
-            self.mfunc.push(MachineInst {
-                op: MachineOp::Setcc,
-                dst,
-                src1: MachineOperand::None,
-                src2: MachineOperand::None,
-                cc: Some(cc),
-                origin: Some(node_id),
-            });
-        }
+        // Emit setcc to get boolean result
+        let cc = CondCode::from_cmp_op(cmp_op, true);
+        self.mfunc.push(MachineInst {
+            op: MachineOp::Setcc,
+            dst,
+            src1: MachineOperand::None,
+            src2: MachineOperand::None,
+            cc: Some(cc),
+            origin: Some(node_id),
+        });
+        Ok(())
     }
 
     /// Select instructions for floating-point comparison.
-    fn select_float_cmp(&mut self, node_id: NodeId, cmp_op: CmpOp) {
+    fn select_float_cmp(&mut self, node_id: NodeId, cmp_op: CmpOp) -> Result<(), String> {
         let dst = self.operand_for_node(node_id);
 
-        if let (Some(lhs), Some(rhs)) = (
-            self.operand_for_input(node_id, 0),
-            self.operand_for_input(node_id, 1),
-        ) {
-            // Use UCOMISD for float comparison
-            self.mfunc.push(
-                MachineInst::binary(MachineOp::Ucomisd, MachineOperand::None, lhs, rhs)
-                    .with_origin(node_id),
-            );
+        let lhs = self.required_input_operand(node_id, 0)?;
+        let rhs = self.required_input_operand(node_id, 1)?;
+        // Use UCOMISD for float comparison
+        self.mfunc.push(
+            MachineInst::binary(MachineOp::Ucomisd, MachineOperand::None, lhs, rhs)
+                .with_origin(node_id),
+        );
 
-            // Use unsigned compare codes for floats
-            let cc = CondCode::from_cmp_op(cmp_op, false);
-            self.mfunc.push(MachineInst {
-                op: MachineOp::Setcc,
-                dst,
-                src1: MachineOperand::None,
-                src2: MachineOperand::None,
-                cc: Some(cc),
-                origin: Some(node_id),
-            });
-        }
+        // Use unsigned compare codes for floats
+        let cc = CondCode::from_cmp_op(cmp_op, false);
+        self.mfunc.push(MachineInst {
+            op: MachineOp::Setcc,
+            dst,
+            src1: MachineOperand::None,
+            src2: MachineOperand::None,
+            cc: Some(cc),
+            origin: Some(node_id),
+        });
+        Ok(())
     }
 
     /// Select instructions for bitwise operations.
-    fn select_bitwise(&mut self, node_id: NodeId, op: BitwiseOp) {
+    fn select_bitwise(&mut self, node_id: NodeId, op: BitwiseOp) -> Result<(), String> {
         let dst = self.operand_for_node(node_id);
 
         match op {
             BitwiseOp::And => {
-                if let (Some(lhs), Some(rhs)) = (
-                    self.operand_for_input(node_id, 0),
-                    self.operand_for_input(node_id, 1),
-                ) {
-                    self.emit_binary(MachineOp::And, dst, lhs, rhs, node_id);
-                }
+                let lhs = self.required_input_operand(node_id, 0)?;
+                let rhs = self.required_input_operand(node_id, 1)?;
+                self.emit_binary(MachineOp::And, dst, lhs, rhs, node_id);
+                Ok(())
             }
 
             BitwiseOp::Or => {
-                if let (Some(lhs), Some(rhs)) = (
-                    self.operand_for_input(node_id, 0),
-                    self.operand_for_input(node_id, 1),
-                ) {
-                    self.emit_binary(MachineOp::Or, dst, lhs, rhs, node_id);
-                }
+                let lhs = self.required_input_operand(node_id, 0)?;
+                let rhs = self.required_input_operand(node_id, 1)?;
+                self.emit_binary(MachineOp::Or, dst, lhs, rhs, node_id);
+                Ok(())
             }
 
             BitwiseOp::Xor => {
-                if let (Some(lhs), Some(rhs)) = (
-                    self.operand_for_input(node_id, 0),
-                    self.operand_for_input(node_id, 1),
-                ) {
-                    self.emit_binary(MachineOp::Xor, dst, lhs, rhs, node_id);
-                }
+                let lhs = self.required_input_operand(node_id, 0)?;
+                let rhs = self.required_input_operand(node_id, 1)?;
+                self.emit_binary(MachineOp::Xor, dst, lhs, rhs, node_id);
+                Ok(())
             }
 
             BitwiseOp::Not => {
-                if let Some(src) = self.operand_for_input(node_id, 0) {
-                    if dst != src {
-                        self.mfunc.push(MachineInst::new(MachineOp::Mov, dst, src));
-                    }
-                    self.mfunc
-                        .push(MachineInst::new(MachineOp::Not, dst, dst).with_origin(node_id));
+                let src = self.required_input_operand(node_id, 0)?;
+                if dst != src {
+                    self.mfunc.push(MachineInst::new(MachineOp::Mov, dst, src));
                 }
+                self.mfunc
+                    .push(MachineInst::new(MachineOp::Not, dst, dst).with_origin(node_id));
+                Ok(())
             }
 
             BitwiseOp::Shl => {
-                if let (Some(lhs), Some(rhs)) = (
-                    self.operand_for_input(node_id, 0),
-                    self.operand_for_input(node_id, 1),
-                ) {
-                    // Shift count must be in CL for variable shifts
-                    self.emit_shift(MachineOp::Shl, dst, lhs, rhs, node_id);
-                }
+                let lhs = self.required_input_operand(node_id, 0)?;
+                let rhs = self.required_input_operand(node_id, 1)?;
+                // Shift count must be in CL for variable shifts
+                self.emit_shift(MachineOp::Shl, dst, lhs, rhs, node_id);
+                Ok(())
             }
 
             BitwiseOp::Shr => {
-                if let (Some(lhs), Some(rhs)) = (
-                    self.operand_for_input(node_id, 0),
-                    self.operand_for_input(node_id, 1),
-                ) {
-                    self.emit_shift(MachineOp::Sar, dst, lhs, rhs, node_id);
-                }
+                let lhs = self.required_input_operand(node_id, 0)?;
+                let rhs = self.required_input_operand(node_id, 1)?;
+                self.emit_shift(MachineOp::Sar, dst, lhs, rhs, node_id);
+                Ok(())
             }
         }
     }
     /// Select instructions for control flow.
-    fn select_control(&mut self, node_id: NodeId, op: ControlOp) {
+    fn select_control(&mut self, node_id: NodeId, op: ControlOp) -> Result<(), String> {
+        if !matches!(op, ControlOp::Start | ControlOp::End) {
+            let label = self.mfunc.get_or_create_label(node_id.index());
+            self.mfunc.add_label(label);
+        }
+
         match op {
             ControlOp::Start => {
                 // Function entry - nothing to emit
+                Ok(())
             }
 
             ControlOp::End => {
                 // Function exit - nothing to emit
+                Ok(())
             }
 
             ControlOp::Return => {
                 // Return value should already be in RAX
                 // inputs[0] is control, inputs[1] is return value
-                if let Some(ret_val) = self.operand_for_input(node_id, 1) {
-                    self.mfunc.push(MachineInst::new(
-                        MachineOp::Mov,
-                        MachineOperand::gpr(Gpr::Rax),
-                        ret_val,
-                    ));
-                }
+                let ret_val = self.required_input_operand(node_id, 1)?;
+                self.mfunc.push(MachineInst::new(
+                    MachineOp::Mov,
+                    MachineOperand::gpr(Gpr::Rax),
+                    ret_val,
+                ));
                 self.mfunc
                     .push(MachineInst::nullary(MachineOp::Ret).with_origin(node_id));
+                Ok(())
             }
 
             ControlOp::If => {
-                // Conditional branch (if-then-else)
                 // inputs[0]: control, inputs[1]: condition
-                if let Some(cond) = self.operand_for_input(node_id, 1) {
-                    // Test condition
-                    self.mfunc.push(MachineInst::binary(
+                let cond = self.required_input_operand(node_id, 1)?;
+                let cond_for_test = match cond {
+                    MachineOperand::PReg(PReg::Gpr(_)) | MachineOperand::VReg(_) => cond,
+                    MachineOperand::StackSlot(offset) => {
+                        let scratch = MachineOperand::gpr(FRAME_BASE_SCRATCH_GPR);
+                        self.mfunc.push(
+                            MachineInst::new(
+                                MachineOp::Mov,
+                                scratch,
+                                MachineOperand::StackSlot(offset),
+                            )
+                            .with_origin(node_id),
+                        );
+                        scratch
+                    }
+                    MachineOperand::Imm(imm) => {
+                        let scratch = MachineOperand::gpr(FRAME_BASE_SCRATCH_GPR);
+                        self.mfunc.push(
+                            MachineInst::new(MachineOp::Mov, scratch, MachineOperand::Imm(imm))
+                                .with_origin(node_id),
+                        );
+                        scratch
+                    }
+                    other => {
+                        return Err(format!(
+                            "Tier2 branch condition at node {:?} must lower to GPR/stack/immediate, got {:?}",
+                            node_id, other
+                        ));
+                    }
+                };
+
+                let mut true_proj = None;
+                let mut false_proj = None;
+                for &user in self.graph.uses(node_id) {
+                    let user_node = self.graph.node(user);
+                    if user_node.is_dead() {
+                        continue;
+                    }
+                    match user_node.op {
+                        Operator::Projection(0) => {
+                            if true_proj.replace(user).is_some() {
+                                return Err(format!(
+                                    "If node {:?} has multiple live Projection(0) users",
+                                    node_id
+                                ));
+                            }
+                        }
+                        Operator::Projection(1) => {
+                            if false_proj.replace(user).is_some() {
+                                return Err(format!(
+                                    "If node {:?} has multiple live Projection(1) users",
+                                    node_id
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let mut true_target = None;
+                if let Some(true_proj) = true_proj {
+                    for &user in self.graph.uses(true_proj) {
+                        let user_node = self.graph.node(user);
+                        if user_node.is_dead() || !matches!(user_node.op, Operator::Control(_)) {
+                            continue;
+                        }
+                        if true_target.replace(user).is_some() {
+                            return Err(format!(
+                                "Projection(0) node {:?} has multiple live control users",
+                                true_proj
+                            ));
+                        }
+                    }
+                    if true_target.is_none() {
+                        return Err(format!(
+                            "Projection(0) node {:?} has no live control target for If {:?}",
+                            true_proj, node_id
+                        ));
+                    }
+                }
+
+                let mut false_target = None;
+                if let Some(false_proj) = false_proj {
+                    for &user in self.graph.uses(false_proj) {
+                        let user_node = self.graph.node(user);
+                        if user_node.is_dead() || !matches!(user_node.op, Operator::Control(_)) {
+                            continue;
+                        }
+                        if false_target.replace(user).is_some() {
+                            return Err(format!(
+                                "Projection(1) node {:?} has multiple live control users",
+                                false_proj
+                            ));
+                        }
+                    }
+                    if false_target.is_none() {
+                        return Err(format!(
+                            "Projection(1) node {:?} has no live control target for If {:?}",
+                            false_proj, node_id
+                        ));
+                    }
+                }
+
+                if true_target.is_none() && false_target.is_none() {
+                    return Err(format!(
+                        "If node {:?} has no live projection-based control targets",
+                        node_id
+                    ));
+                }
+
+                self.mfunc.push(
+                    MachineInst::binary(
                         MachineOp::Test,
                         MachineOperand::None,
-                        cond,
-                        cond,
-                    ));
+                        cond_for_test,
+                        cond_for_test,
+                    )
+                    .with_origin(node_id),
+                );
 
-                    // Conditional jumps would be resolved later based on graph structure
+                match (true_target, false_target) {
+                    (Some(true_target), Some(false_target)) => {
+                        let true_label = self.mfunc.get_or_create_label(true_target.index());
+                        let false_label = self.mfunc.get_or_create_label(false_target.index());
+                        self.mfunc
+                            .push(MachineInst::jcc(CondCode::Ne, true_label).with_origin(node_id));
+                        self.mfunc.push(
+                            MachineInst::new(
+                                MachineOp::Jmp,
+                                MachineOperand::Label(false_label),
+                                MachineOperand::None,
+                            )
+                            .with_origin(node_id),
+                        );
+                    }
+                    (Some(true_target), None) => {
+                        let true_label = self.mfunc.get_or_create_label(true_target.index());
+                        self.mfunc
+                            .push(MachineInst::jcc(CondCode::Ne, true_label).with_origin(node_id));
+                    }
+                    (None, Some(false_target)) => {
+                        let continue_label = self.mfunc.new_label();
+                        let false_label = self.mfunc.get_or_create_label(false_target.index());
+                        self.mfunc.push(
+                            MachineInst::jcc(CondCode::Ne, continue_label).with_origin(node_id),
+                        );
+                        self.mfunc.push(
+                            MachineInst::new(
+                                MachineOp::Jmp,
+                                MachineOperand::Label(false_label),
+                                MachineOperand::None,
+                            )
+                            .with_origin(node_id),
+                        );
+                        self.mfunc.add_label(continue_label);
+                    }
+                    (None, None) => unreachable!(),
                 }
+                Ok(())
             }
 
             ControlOp::Region | ControlOp::Loop => {
-                // Merge point - emit a label
-                let label = self.mfunc.get_or_create_label(node_id.index());
-                self.mfunc.add_label(label);
+                // Merge points are block labels only.
+                Ok(())
             }
 
-            _ => {
-                // Other control ops not yet implemented (Throw, Deopt)
-            }
+            _ => Err(format!(
+                "Tier2 control lowering does not support {:?} at node {:?}",
+                op, node_id
+            )),
         }
     }
 
@@ -1289,6 +1594,7 @@ mod tests {
     use crate::ir::builder::{
         ArithmeticBuilder, ContainerBuilder, ControlBuilder, GraphBuilder, ObjectBuilder,
     };
+    use crate::ir::node::InputList;
 
     #[test]
     fn test_condition_code_inverse() {
@@ -1319,18 +1625,196 @@ mod tests {
 
     #[test]
     fn test_instruction_selection_simple() {
-        let mut builder = GraphBuilder::new(4, 1);
-        let p0 = builder.parameter(0).unwrap();
+        let mut builder = GraphBuilder::new(4, 0);
         let const_1 = builder.const_int(1);
-        let sum = builder.int_add(p0, const_1);
+        let const_2 = builder.const_int(2);
+        let sum = builder.int_add(const_1, const_2);
         let _ret = builder.return_value(sum);
         let graph = builder.finish();
 
         let alloc_map = AllocationMap::new();
-        let mfunc = InstructionSelector::select(&graph, &alloc_map);
+        let mfunc = InstructionSelector::select(&graph, &alloc_map)
+            .expect("instruction selection should succeed");
 
         // Should have generated some instructions
         assert!(!mfunc.insts.is_empty());
+    }
+
+    #[test]
+    fn test_instruction_selection_materializes_parameters_from_frame_base() {
+        let mut builder = GraphBuilder::new(2, 2);
+        let p0 = builder.parameter(0).expect("parameter 0 should exist");
+        let p1 = builder.parameter(1).expect("parameter 1 should exist");
+        let _ret = builder.return_value(p1);
+        let graph = builder.finish();
+
+        let alloc_map = AllocationMap::new();
+        let mfunc = InstructionSelector::select(&graph, &alloc_map)
+            .expect("instruction selection should materialize parameters");
+
+        let expected_p0_src = MachineOperand::Mem(MemOperand::base_disp(FRAME_BASE_SCRATCH_GPR, 0));
+        let expected_p1_src = MachineOperand::Mem(MemOperand::base_disp(
+            FRAME_BASE_SCRATCH_GPR,
+            VM_REGISTER_SLOT_SIZE,
+        ));
+
+        assert!(mfunc.insts.iter().any(|inst| inst.origin == Some(p0)
+            && inst.op == MachineOp::Mov
+            && inst.src1 == expected_p0_src));
+        assert!(mfunc.insts.iter().any(|inst| inst.origin == Some(p1)
+            && inst.op == MachineOp::Mov
+            && inst.src1 == expected_p1_src));
+    }
+
+    #[test]
+    fn test_instruction_selection_materializes_spilled_parameters_before_direct_regs() {
+        let mut builder = GraphBuilder::new(2, 2);
+        let p0 = builder.parameter(0).expect("parameter 0 should exist");
+        let p1 = builder.parameter(1).expect("parameter 1 should exist");
+        let _ret = builder.return_value(p1);
+        let graph = builder.finish();
+
+        let mut alloc_map = AllocationMap::new();
+        let spill = alloc_map.alloc_spill_slot();
+        alloc_map.set(VReg::new(0), Allocation::Spill(spill));
+        alloc_map.set(VReg::new(1), Allocation::Register(PReg::Gpr(Gpr::Rcx)));
+
+        let mfunc = InstructionSelector::select(&graph, &alloc_map)
+            .expect("instruction selection should materialize spilled parameters");
+
+        let first_p0_inst = mfunc
+            .insts
+            .iter()
+            .position(|inst| inst.origin == Some(p0))
+            .expect("parameter 0 materialization should emit instructions");
+        let first_p1_inst = mfunc
+            .insts
+            .iter()
+            .position(|inst| inst.origin == Some(p1))
+            .expect("parameter 1 materialization should emit instructions");
+        assert!(
+            first_p0_inst < first_p1_inst,
+            "spilled parameters must be materialized before direct-register parameters"
+        );
+
+        assert!(mfunc.insts.iter().any(|inst| {
+            inst.origin == Some(p0)
+                && inst.op == MachineOp::Mov
+                && inst.dst == MachineOperand::gpr(PARAM_STACK_TEMP_GPR)
+                && inst.src1
+                    == MachineOperand::Mem(MemOperand::base_disp(FRAME_BASE_SCRATCH_GPR, 0))
+        }));
+        assert!(mfunc.insts.iter().any(|inst| {
+            inst.origin == Some(p0)
+                && inst.op == MachineOp::Mov
+                && inst.dst == MachineOperand::StackSlot(spill.offset())
+                && inst.src1 == MachineOperand::gpr(PARAM_STACK_TEMP_GPR)
+        }));
+    }
+
+    #[test]
+    fn test_instruction_selection_rejects_unsupported_int_pow() {
+        let mut graph = Graph::new();
+        let c1 = graph.add_node(Operator::ConstInt(2), InputList::Single(graph.start));
+        let c2 = graph.add_node(Operator::ConstInt(3), InputList::Single(graph.start));
+        let pow = graph.add_node(
+            Operator::IntOp(ArithOp::Pow),
+            InputList::from_slice(&[c1, c2]),
+        );
+        let _ret = graph.add_node(
+            Operator::Control(ControlOp::Return),
+            InputList::from_slice(&[graph.start, pow]),
+        );
+
+        let alloc_map = AllocationMap::new();
+        let err = InstructionSelector::select(&graph, &alloc_map)
+            .expect_err("unsupported Pow lowering should return error");
+        assert!(err.contains("does not support"));
+    }
+
+    #[test]
+    fn test_instruction_selection_lowers_if_with_projection_targets() {
+        let mut graph = Graph::new();
+        let cond = graph.add_node(Operator::ConstBool(true), InputList::Single(graph.start));
+        let if_node = graph.add_node(
+            Operator::Control(ControlOp::If),
+            InputList::from_slice(&[graph.start, cond]),
+        );
+        let true_proj = graph.add_node(Operator::Projection(0), InputList::Single(if_node));
+        let false_proj = graph.add_node(Operator::Projection(1), InputList::Single(if_node));
+        let true_val = graph.add_node(Operator::ConstInt(1), InputList::Empty);
+        let false_val = graph.add_node(Operator::ConstInt(0), InputList::Empty);
+        let true_ret = graph.add_node(
+            Operator::Control(ControlOp::Return),
+            InputList::from_slice(&[true_proj, true_val]),
+        );
+        let false_ret = graph.add_node(
+            Operator::Control(ControlOp::Return),
+            InputList::from_slice(&[false_proj, false_val]),
+        );
+
+        let alloc_map = AllocationMap::new();
+        let mfunc = InstructionSelector::select(&graph, &alloc_map)
+            .expect("If control with projections should lower to machine branches");
+
+        assert!(mfunc.insts.iter().any(|inst| {
+            inst.op == MachineOp::Test && inst.origin == Some(if_node) && inst.src1 == inst.src2
+        }));
+        assert!(mfunc.insts.iter().any(|inst| {
+            inst.op == MachineOp::Jcc
+                && inst.origin == Some(if_node)
+                && inst.cc == Some(CondCode::Ne)
+        }));
+        assert!(mfunc.insts.iter().any(|inst| {
+            inst.op == MachineOp::Jmp
+                && inst.origin == Some(if_node)
+                && matches!(inst.dst, MachineOperand::Label(_))
+        }));
+        assert!(
+            mfunc
+                .insts
+                .iter()
+                .any(|inst| inst.op == MachineOp::Label && inst.origin.is_none()),
+            "branch targets should be materialized as labels",
+        );
+        assert!(
+            mfunc
+                .insts
+                .iter()
+                .any(|inst| inst.op == MachineOp::Ret && inst.origin == Some(true_ret))
+        );
+        assert!(
+            mfunc
+                .insts
+                .iter()
+                .any(|inst| inst.op == MachineOp::Ret && inst.origin == Some(false_ret))
+        );
+    }
+
+    #[test]
+    fn test_instruction_selection_rejects_projection_not_from_if() {
+        let mut graph = Graph::new();
+        let _bad_proj = graph.add_node(Operator::Projection(0), InputList::Single(graph.start));
+
+        let alloc_map = AllocationMap::new();
+        let err = InstructionSelector::select(&graph, &alloc_map)
+            .expect_err("projection not sourced from If must fail lowering");
+        assert!(err.contains("projections from If"));
+    }
+
+    #[test]
+    fn test_instruction_selection_rejects_if_without_projection_edges() {
+        let mut graph = Graph::new();
+        let cond = graph.add_node(Operator::ConstBool(true), InputList::Single(graph.start));
+        let _if_node = graph.add_node(
+            Operator::Control(ControlOp::If),
+            InputList::from_slice(&[graph.start, cond]),
+        );
+
+        let alloc_map = AllocationMap::new();
+        let err = InstructionSelector::select(&graph, &alloc_map)
+            .expect_err("If lowering must fail without any live projection targets");
+        assert!(err.contains("projection-based control targets"));
     }
 
     #[test]

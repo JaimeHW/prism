@@ -19,9 +19,9 @@
 use std::sync::Arc;
 
 use prism_compiler::bytecode::CodeObject;
-use prism_jit::ir::{Graph, GraphBuilder};
 use prism_jit::ir::builder::translator::BytecodeTranslator;
 use prism_jit::ir::operators::{ControlOp, Operator};
+use prism_jit::ir::{Graph, GraphBuilder};
 use prism_jit::opt::OptPipeline;
 use prism_jit::regalloc::{AllocatorConfig, LinearScanAllocator, LivenessAnalysis};
 use prism_jit::runtime::{CodeCache, CompiledEntry, ReturnAbi, RuntimeConfig};
@@ -459,7 +459,8 @@ pub(crate) fn compile_tier2_entry(code: &Arc<CodeObject>) -> Result<CompiledEntr
     let (alloc_map, _alloc_stats) = allocator.allocate(intervals);
 
     // Stage 5: Instruction selection
-    let mfunc = InstructionSelector::select(&graph, &alloc_map);
+    let mfunc = InstructionSelector::select(&graph, &alloc_map)
+        .map_err(|e| format!("Tier 2 instruction selection failed: {}", e))?;
 
     // Stage 6: Code emission
     let compiled =
@@ -488,16 +489,16 @@ fn validate_tier2_lowering_support(graph: &Graph) -> Result<(), String> {
             | Operator::IntCmp(_)
             | Operator::FloatCmp(_)
             | Operator::Bitwise(_)
+            | Operator::Parameter(_)
             | Operator::Phi
-            | Operator::LoopPhi => true,
-            // Tier 2 currently does not materialize parameter nodes from JitFrameState.
-            // Reject them explicitly to avoid generating undefined reads.
-            Operator::Parameter(_) => false,
+            | Operator::LoopPhi
+            | Operator::Projection(0)
+            | Operator::Projection(1) => true,
             Operator::Control(
                 ControlOp::Start
                 | ControlOp::End
-                | ControlOp::Return
                 | ControlOp::If
+                | ControlOp::Return
                 | ControlOp::Region
                 | ControlOp::Loop,
             ) => true,
@@ -591,7 +592,12 @@ mod tests {
         code.instructions = vec![
             Instruction::op_di(Opcode::LoadConst, Register::new(0), 0),
             Instruction::op_di(Opcode::LoadConst, Register::new(1), 1),
-            Instruction::op_dss(Opcode::Add, Register::new(2), Register::new(0), Register::new(1)),
+            Instruction::op_dss(
+                Opcode::Add,
+                Register::new(2),
+                Register::new(0),
+                Register::new(1),
+            ),
             Instruction::op_d(Opcode::Return, Register::new(2)),
         ]
         .into_boxed_slice();
@@ -605,20 +611,47 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_tier2_rejects_parameter_nodes_until_materialized() {
+    fn test_compile_tier2_accepts_parameterized_graphs() {
         use prism_compiler::bytecode::{Instruction, Opcode, Register};
 
         let mut bridge = JitBridge::new(BridgeConfig::for_testing());
         let mut code = CodeObject::new("tier2_param", "<test>");
         code.register_count = 1;
         code.arg_count = 1;
-        code.instructions = vec![Instruction::op_d(Opcode::Return, Register::new(0))].into_boxed_slice();
+        code.instructions =
+            vec![Instruction::op_d(Opcode::Return, Register::new(0))].into_boxed_slice();
         let code = Arc::new(code);
 
-        let err = bridge
+        let entry = bridge.compile_tier2(&code).expect(
+            "parameterized code should compile once parameters are materialized from frame state",
+        );
+        assert_eq!(entry.tier(), 2);
+        assert_eq!(entry.return_abi(), ReturnAbi::RawValueBits);
+    }
+
+    #[test]
+    fn test_compile_tier2_accepts_branching_control_flow() {
+        use prism_compiler::bytecode::{Instruction, Opcode, Register};
+
+        let mut bridge = JitBridge::new(BridgeConfig::for_testing());
+        let mut code = CodeObject::new("tier2_branch", "<test>");
+        code.register_count = 1;
+        code.arg_count = 1;
+        code.instructions = vec![
+            // if not r0: jump to offset 2
+            Instruction::op_di(Opcode::JumpIfFalse, Register::new(0), 1),
+            Instruction::op_d(Opcode::Return, Register::new(0)),
+            Instruction::op_d(Opcode::LoadNone, Register::new(0)),
+            Instruction::op_d(Opcode::Return, Register::new(0)),
+        ]
+        .into_boxed_slice();
+        let code = Arc::new(code);
+
+        let entry = bridge
             .compile_tier2(&code)
-            .expect_err("parameterized code should fail until tier2 loads parameters from frame state");
-        assert!(err.contains("Parameter"));
+            .expect("branching code should lower through If/Projection Tier2 support");
+        assert_eq!(entry.tier(), 2);
+        assert_eq!(entry.return_abi(), ReturnAbi::RawValueBits);
     }
 
     #[test]
@@ -629,7 +662,12 @@ mod tests {
         let mut code = CodeObject::new("tier2_uninit", "<test>");
         code.register_count = 3;
         code.instructions = vec![
-            Instruction::op_dss(Opcode::Add, Register::new(2), Register::new(0), Register::new(1)),
+            Instruction::op_dss(
+                Opcode::Add,
+                Register::new(2),
+                Register::new(0),
+                Register::new(1),
+            ),
             Instruction::op_d(Opcode::Return, Register::new(2)),
         ]
         .into_boxed_slice();
